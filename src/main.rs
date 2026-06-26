@@ -27,12 +27,7 @@ const SERVICE: &str = "fiducia-node";
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    fiducia_telemetry::init(SERVICE);
 
     // Bootstrap this node. Single-node by default; FIDUCIA_PEERS / shard count
     // come from the environment (see consensus::NodeConfig).
