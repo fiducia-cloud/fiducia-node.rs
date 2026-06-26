@@ -1,0 +1,85 @@
+//! fiducia-node — the Raft-replicated coordination engine.
+//!
+//! A node hosts replicas of many shards (each an independent Raft group),
+//! leading some and following others, and exposes the coordination API over
+//! HTTP: config KV with watches, a leader-election API, and service discovery.
+//!
+//! This is a **skeleton**: the routing, consensus, and state-machine shapes are
+//! in place; the per-command logic, replication, watches, and TTL expiry are
+//! marked with `TODO`s in the respective modules.
+
+mod consensus;
+mod discovery;
+mod election;
+mod kv;
+mod state;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::{routing::get, Json, Router};
+use serde_json::{json, Value};
+use tower_http::trace::TraceLayer;
+
+use consensus::{Node, NodeConfig};
+
+const SERVICE: &str = "fiducia-node";
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    // Bootstrap this node. Single-node by default; FIDUCIA_PEERS / shard count
+    // come from the environment (see consensus::NodeConfig).
+    let config = NodeConfig::default();
+    tracing::info!(
+        "{SERVICE} bootstrapping node_id={} shards={} peers={:?}",
+        config.node_id,
+        config.shard_count,
+        config.peers
+    );
+    let node = Arc::new(Node::bootstrap(config));
+
+    let v1 = Router::new()
+        .route("/status", get(status))
+        .nest("/kv", kv::router())
+        .nest("/elections", election::router())
+        .nest("/services", discovery::router());
+
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(health))
+        .nest("/v1", v1)
+        .with_state(node)
+        .layer(TraceLayer::new_for_http());
+
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8090);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    tracing::info!("{SERVICE} listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok", "service": SERVICE }))
+}
+
+/// `GET /v1/status` — per-shard consensus status for this node.
+async fn status(
+    axum::extract::State(node): axum::extract::State<Arc<Node>>,
+) -> Json<Value> {
+    Json(json!({
+        "service": SERVICE,
+        "version": env!("CARGO_PKG_VERSION"),
+        "consensus": node.status().await,
+    }))
+}

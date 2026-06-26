@@ -1,0 +1,111 @@
+//! Service discovery (skeleton handlers).
+//!
+//! A registry of live service instances with TTL-based health: instances
+//! register an address, heartbeat to stay listed, and silently drop out when
+//! their lease expires (crash-safe — no stale endpoints). Mutations are proposed
+//! to the shard owning the service name; reads go through [`Node::query`]. A
+//! service's instances all route to one shard, so listing a service is a
+//! single-shard read.
+//!
+//! Routes (mounted under `/v1/services`):
+//!   * `GET    /v1/services`                                  — list services
+//!   * `GET    /v1/services/{service}`                        — list live instances
+//!   * `PUT    /v1/services/{service}/instances/{id}`         — register `{ "address", "ttl_ms" }`
+//!   * `POST   /v1/services/{service}/instances/{id}/heartbeat` — renew lease
+//!   * `DELETE /v1/services/{service}/instances/{id}`         — deregister
+//!   * `GET    /v1/services/{service}/watch`                  — SSE of instance changes
+
+use std::sync::Arc;
+
+use axum::{
+    extract::{Path, State},
+    routing::{get, put},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::consensus::{propose_json, Node, ReadRequest, ReadResponse};
+use crate::state::Command;
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterBody {
+    pub address: String,
+    pub ttl_ms: u64,
+}
+
+pub fn router() -> Router<Arc<Node>> {
+    Router::new()
+        .route("/", get(list_services))
+        .route("/:service", get(list_instances))
+        .route("/:service/watch", get(watch))
+        .route("/:service/instances/:id", put(register).delete(deregister))
+        .route("/:service/instances/:id/heartbeat", axum::routing::post(heartbeat))
+}
+
+/// `GET /v1/services` — list known service names.
+async fn list_services(State(_node): State<Arc<Node>>) -> Json<Value> {
+    // TODO: services span shards, so this fans out across shards and merges.
+    Json(json!({ "error": "not_implemented", "op": "discovery.list_services" }))
+}
+
+/// `GET /v1/services/{service}` — list live (unexpired) instances.
+async fn list_instances(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Json<Value> {
+    match node.query(ReadRequest::Service { service: service.clone() }).await {
+        Some(ReadResponse::Service(instances)) => {
+            Json(json!({ "service": service, "instances": instances }))
+        }
+        _ => Json(json!({ "error": "unavailable" })),
+    }
+}
+
+/// `PUT /v1/services/{service}/instances/{id}` — register/refresh an instance.
+async fn register(
+    State(node): State<Arc<Node>>,
+    Path((service, id)): Path<(String, String)>,
+    Json(body): Json<RegisterBody>,
+) -> Json<Value> {
+    let result = node
+        .propose(Command::ServiceRegister {
+            service,
+            instance_id: id,
+            address: body.address,
+            ttl_ms: body.ttl_ms,
+        })
+        .await;
+    Json(propose_json(result))
+}
+
+/// `POST /v1/services/{service}/instances/{id}/heartbeat` — renew the lease.
+async fn heartbeat(
+    State(node): State<Arc<Node>>,
+    Path((service, id)): Path<(String, String)>,
+) -> Json<Value> {
+    let result = node
+        .propose(Command::ServiceHeartbeat {
+            service,
+            instance_id: id,
+        })
+        .await;
+    Json(propose_json(result))
+}
+
+/// `DELETE /v1/services/{service}/instances/{id}` — deregister an instance.
+async fn deregister(
+    State(node): State<Arc<Node>>,
+    Path((service, id)): Path<(String, String)>,
+) -> Json<Value> {
+    let result = node
+        .propose(Command::ServiceDeregister {
+            service,
+            instance_id: id,
+        })
+        .await;
+    Json(propose_json(result))
+}
+
+/// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
+async fn watch(State(_node): State<Arc<Node>>, Path(_service): Path<String>) -> Json<Value> {
+    // TODO: SSE subscribed to this service's instance-change events.
+    Json(json!({ "error": "not_implemented", "op": "discovery.watch" }))
+}
