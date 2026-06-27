@@ -93,6 +93,7 @@ pub struct LoopbackRegistry {
     nodes: Arc<Mutex<HashMap<String, HashMap<ShardId, mpsc::Sender<ShardMsg>>>>>,
 }
 
+#[allow(dead_code)] // the loopback registry is the in-process test harness
 impl LoopbackRegistry {
     pub fn new() -> Self {
         Self::default()
