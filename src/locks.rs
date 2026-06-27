@@ -1,108 +1,148 @@
-//! Locks, semaphores, and reader-writer locks (skeleton handlers).
+//! Mutual-exclusion locks.
 //!
-//! The flagship coordination primitive. Writes are proposed to the owning shard's
-//! Raft group via [`Node::propose`] (so a follower redirects to the leader via the
-//! 421 + `x-fiducia-leader` contract). `max == 1` is a mutex; `max > 1` a counting
-//! semaphore. `wait` selects blocking (long-poll until granted) vs try-lock.
-//!
-//! Routes:
-//!   * `POST /v1/locks/{key}/acquire`  — `{ ttl_ms?, wait?, max? }` (mutex/semaphore)
-//!   * `POST /v1/locks/{key}/release`  — `{ lock_id }`
-//!   * `GET  /v1/locks/{key}`          — current holders + queue depth (info)
-//!   * `POST /v1/rw/{key}/read|write`  — reader-writer acquire (+ `/end`)
+//! Routes (mounted under `/v1/locks`):
+//!   * `POST /v1/locks/acquire`       — advertised body-key acquire endpoint
+//!   * `GET  /v1/locks/{key}`         — inspect holder, fencing token, lease, queue
+//!   * `POST /v1/locks/{key}/acquire` — try or queue for the lock
+//!   * `POST /v1/locks/{key}/release` — release with holder + fencing token
+//!   * `GET  /v1/locks/{key}/watch`   — SSE placeholder for lock changes
 
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    response::Response,
+    http::Uri,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_response, Node};
+use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
-
-const DEFAULT_TTL_MS: u64 = 30_000;
 
 #[derive(Debug, Deserialize)]
 pub struct AcquireBody {
-    #[serde(default)]
-    pub holder: String,
+    pub holder: Option<String>,
     pub ttl_ms: Option<u64>,
-    #[serde(default)]
-    pub wait: bool,
-    pub max: Option<u32>,
+    pub wait: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcquireWithKeyBody {
+    pub key: String,
+    pub holder: Option<String>,
+    pub ttl_ms: Option<u64>,
+    pub wait: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ReleaseBody {
-    pub lock_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RwBody {
-    #[serde(default)]
     pub holder: String,
-    pub ttl_ms: Option<u64>,
-    #[serde(default)]
-    pub wait: bool,
+    pub fencing_token: u64,
 }
 
 pub fn router() -> Router<Arc<Node>> {
     Router::new()
-        .route("/:key", get(info))
+        .route("/acquire", post(acquire_with_body_key))
+        .route("/:key", get(get_lock))
         .route("/:key/acquire", post(acquire))
         .route("/:key/release", post(release))
+        .route("/:key/watch", get(watch))
 }
 
-pub fn rw_router() -> Router<Arc<Node>> {
-    Router::new()
-        .route("/:key/read", post(acquire_read))
-        .route("/:key/read/end", post(end_read))
-        .route("/:key/write", post(acquire_write))
-        .route("/:key/write/end", post(end_write))
+/// `GET /v1/locks/{key}` — inspect lock state and FIFO wait queue.
+async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
+    match node.query(ReadRequest::Lock { key: key.clone() }).await {
+        Ok(ReadResponse::Lock(lock)) => Json(json!({ "key": key, "lock": lock })).into_response(),
+        Err(err) => read_error_response(err, &uri),
+        _ => Json(json!({ "error": "unavailable" })).into_response(),
+    }
 }
 
-/// `POST /v1/locks/{key}/acquire` — mutex (max=1) or semaphore (max>1).
-async fn acquire(State(node): State<Arc<Node>>, Path(key): Path<String>, Json(body): Json<AcquireBody>) -> Response {
-    // TODO: honor `wait` — block (long-poll) until granted vs try-lock now.
-    let _ = body.wait;
+/// `POST /v1/locks/{key}/acquire` — acquire immediately or join FIFO queue.
+async fn acquire(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Path(key): Path<String>,
+    Json(body): Json<AcquireBody>,
+) -> Response {
+    acquire_key(
+        node,
+        uri,
+        key,
+        body.holder,
+        body.ttl_ms,
+        body.wait.unwrap_or(false),
+    )
+    .await
+}
+
+/// `POST /v1/locks/acquire` — compatibility route with key in JSON.
+async fn acquire_with_body_key(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<AcquireWithKeyBody>,
+) -> Response {
+    acquire_key(
+        node,
+        uri,
+        body.key,
+        body.holder,
+        body.ttl_ms,
+        body.wait.unwrap_or(false),
+    )
+    .await
+}
+
+async fn acquire_key(
+    node: Arc<Node>,
+    uri: Uri,
+    key: String,
+    holder: Option<String>,
+    ttl_ms: Option<u64>,
+    wait: bool,
+) -> Response {
     let result = node
         .propose(Command::LockAcquire {
             key,
-            holder: body.holder,
-            ttl_ms: body.ttl_ms.unwrap_or(DEFAULT_TTL_MS),
-            max: body.max.unwrap_or(1),
+            holder: holder.unwrap_or_else(|| "anonymous".to_string()),
+            ttl_ms: ttl_ms.unwrap_or(30_000),
+            wait,
         })
         .await;
-    propose_response(result)
+    propose_response(result, &uri)
 }
 
-/// `POST /v1/locks/{key}/release` — release by the lock id from acquire.
-async fn release(State(node): State<Arc<Node>>, Path(key): Path<String>, Json(body): Json<ReleaseBody>) -> Response {
-    propose_response(node.propose(Command::LockRelease { key, lock_id: body.lock_id }).await)
+/// `POST /v1/locks/{key}/release` — release only with the current fencing token.
+async fn release(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Path(key): Path<String>,
+    Json(body): Json<ReleaseBody>,
+) -> Response {
+    let result = node
+        .propose(Command::LockRelease {
+            key,
+            holder: body.holder,
+            fencing_token: body.fencing_token,
+        })
+        .await;
+    propose_response(result, &uri)
 }
 
-/// `GET /v1/locks/{key}` — holders + queue depth.
-async fn info(State(_node): State<Arc<Node>>, Path(_key): Path<String>) -> Json<Value> {
-    // TODO: query the shard for holders/queue (needs a Lock ReadRequest variant).
-    Json(json!({ "error": "not_implemented", "op": "lock.info" }))
+/// `GET /v1/locks/{key}/watch` — SSE stream of lock changes.
+async fn watch(State(_node): State<Arc<Node>>, Path(_key): Path<String>) -> Json<Value> {
+    Json(json!({ "error": "not_implemented", "op": "locks.watch" }))
 }
 
-async fn acquire_read(State(node): State<Arc<Node>>, Path(key): Path<String>, Json(b): Json<RwBody>) -> Response {
-    let _ = b.wait;
-    propose_response(node.propose(Command::RwAcquireRead { key, holder: b.holder, ttl_ms: b.ttl_ms.unwrap_or(DEFAULT_TTL_MS) }).await)
-}
-async fn end_read(State(node): State<Arc<Node>>, Path(key): Path<String>, Json(b): Json<ReleaseBody>) -> Response {
-    propose_response(node.propose(Command::RwEndRead { key, lock_id: b.lock_id }).await)
-}
-async fn acquire_write(State(node): State<Arc<Node>>, Path(key): Path<String>, Json(b): Json<RwBody>) -> Response {
-    let _ = b.wait;
-    propose_response(node.propose(Command::RwAcquireWrite { key, holder: b.holder, ttl_ms: b.ttl_ms.unwrap_or(DEFAULT_TTL_MS) }).await)
-}
-async fn end_write(State(node): State<Arc<Node>>, Path(key): Path<String>, Json(b): Json<ReleaseBody>) -> Response {
-    propose_response(node.propose(Command::RwEndWrite { key, lock_id: b.lock_id }).await)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_builds_with_advertised_alias_and_keyed_routes() {
+        let _ = router();
+    }
 }

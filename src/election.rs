@@ -21,15 +21,15 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
+    http::Uri,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use axum::response::Response;
-
-use crate::consensus::{propose_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +56,7 @@ pub fn router() -> Router<Arc<Node>> {
 /// `POST /v1/elections/{name}/campaign` — try to become leader.
 async fn campaign(
     State(node): State<Arc<Node>>,
+    uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<CampaignBody>,
 ) -> Response {
@@ -66,12 +67,13 @@ async fn campaign(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    propose_response(result)
+    propose_response(result, &uri)
 }
 
 /// `POST /v1/elections/{name}/renew` — extend the lease (must hold the token).
 async fn renew(
     State(node): State<Arc<Node>>,
+    uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
 ) -> Response {
@@ -82,12 +84,13 @@ async fn renew(
             fencing_token: body.fencing_token,
         })
         .await;
-    propose_response(result)
+    propose_response(result, &uri)
 }
 
 /// `POST /v1/elections/{name}/resign` — give up leadership.
 async fn resign(
     State(node): State<Arc<Node>>,
+    uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
 ) -> Response {
@@ -98,15 +101,23 @@ async fn resign(
             fencing_token: body.fencing_token,
         })
         .await;
-    propose_response(result)
+    propose_response(result, &uri)
 }
 
 /// `GET /v1/elections/{name}` — observe the current leader.
-async fn observe(State(node): State<Arc<Node>>, Path(name): Path<String>) -> Json<Value> {
-    match node.query(ReadRequest::Election { name: name.clone() }).await {
-        Some(ReadResponse::Election(Some(l))) => Json(json!({ "name": name, "held": true, "leadership": l })),
-        Some(ReadResponse::Election(None)) => Json(json!({ "name": name, "held": false })),
-        _ => Json(json!({ "error": "unavailable" })),
+async fn observe(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<String>) -> Response {
+    match node
+        .query(ReadRequest::Election { name: name.clone() })
+        .await
+    {
+        Ok(ReadResponse::Election(Some(l))) => {
+            Json(json!({ "name": name, "held": true, "leadership": l })).into_response()
+        }
+        Ok(ReadResponse::Election(None)) => {
+            Json(json!({ "name": name, "held": false })).into_response()
+        }
+        Err(err) => read_error_response(err, &uri),
+        _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
