@@ -94,9 +94,46 @@ async fn list(State(_node): State<Arc<Node>>) -> Json<Value> {
     Json(json!({ "error": "not_implemented", "op": "kv.list" }))
 }
 
-/// `GET /v1/kv/{key}/watch` — SSE stream of change events for a key or prefix.
-async fn watch(State(_node): State<Arc<Node>>, Path(_key): Path<String>) -> Json<Value> {
-    // TODO: return axum::response::sse::Sse subscribed to this shard's change
-    // broadcast, filtered to the key/prefix, replaying from `?start_revision`.
-    Json(json!({ "error": "not_implemented", "op": "kv.watch" }))
+#[derive(Debug, Deserialize)]
+pub struct WatchQuery {
+    /// When `true`, stream changes for every key that *starts with* `{key}`
+    /// (best-effort: only keys on the same shard as the prefix are observed).
+    pub prefix: Option<bool>,
+}
+
+/// `GET /v1/kv/{key}/watch` — SSE stream of change events for a key (or prefix).
+///
+/// Subscribes to the owning shard's change broadcast and pushes one SSE event per
+/// committed put/delete that matches. The connection is long-lived (no request
+/// timeout layer) with periodic keep-alive comments.
+async fn watch(
+    State(node): State<Arc<Node>>,
+    Path(key): Path<String>,
+    Query(q): Query<WatchQuery>,
+) -> Response {
+    let Some(rx) = node.watch(&key).await else {
+        return Json(json!({ "error": "unavailable", "op": "kv.watch", "key": key }))
+            .into_response();
+    };
+    let prefix = q.prefix.unwrap_or(false);
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let event = item.ok()?; // drop lag/closed notifications
+        let matches = if prefix {
+            event.key.starts_with(&key)
+        } else {
+            event.key == key
+        };
+        if !matches {
+            return None;
+        }
+        Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(event.kind)
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
