@@ -826,11 +826,14 @@ impl Store {
         ttl_ms: u64,
         wait: bool,
     ) -> Value {
-        let sem = self.semaphores.entry(key.clone()).or_insert_with(|| Semaphore {
-            limit: limit.max(1),
-            holders: Vec::new(),
-            queue: VecDeque::new(),
-        });
+        let sem = self
+            .semaphores
+            .entry(key.clone())
+            .or_insert_with(|| Semaphore {
+                limit: limit.max(1),
+                holders: Vec::new(),
+                queue: VecDeque::new(),
+            });
         // Let callers re-tune the cap; shrinking just stops new grants until it
         // drains back under the new limit.
         sem.limit = limit.max(1);
@@ -915,7 +918,9 @@ impl Store {
     fn semaphore_promote(&mut self, key: &str, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
         loop {
-            let Some(sem) = self.semaphores.get(key) else { break };
+            let Some(sem) = self.semaphores.get(key) else {
+                break;
+            };
             if (sem.holders.len() as u32) >= sem.limit || sem.queue.is_empty() {
                 break;
             }
@@ -1327,7 +1332,10 @@ mod tests {
         assert_eq!(promoted["holder"], "worker-b");
         assert!(promoted["fencing_token"].as_u64().unwrap() > token);
         // ...and now holds the key.
-        assert_eq!(sm.lock_get("orders/checkout").holder.as_deref(), Some("worker-b"));
+        assert_eq!(
+            sm.lock_get("orders/checkout").holder.as_deref(),
+            Some("worker-b")
+        );
     }
 
     #[test]

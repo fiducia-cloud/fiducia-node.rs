@@ -316,7 +316,11 @@ impl ShardActor {
             commit_index: 0,
             last_applied: 0,
             votes: HashSet::new(),
-            leader: if single { Some(LeaderState::default()) } else { None },
+            leader: if single {
+                Some(LeaderState::default())
+            } else {
+                None
+            },
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
             rng: Rng::seeded(&node_id, shard_id),
@@ -606,7 +610,10 @@ impl ShardActor {
             } else {
                 // Log mismatch: rewind and retry from an earlier index.
                 let cur = ls.next_index.get(&from).copied().unwrap_or(1);
-                let backoff = resp.match_index.saturating_add(1).min(cur.saturating_sub(1));
+                let backoff = resp
+                    .match_index
+                    .saturating_add(1)
+                    .min(cur.saturating_sub(1));
                 ls.next_index.insert(from.clone(), backoff.max(1));
                 more = true;
             }
@@ -664,7 +671,9 @@ impl ShardActor {
                 term: self.current_term,
                 success: false,
                 // Hint: how far we *do* match, so the leader can rewind quickly.
-                match_index: self.last_log_index().min(req.prev_log_index.saturating_sub(1)),
+                match_index: self
+                    .last_log_index()
+                    .min(req.prev_log_index.saturating_sub(1)),
             };
         }
 
@@ -1341,7 +1350,12 @@ mod tests {
         let out = n.propose(put("flags/x", "on")).await.expect("commit");
         assert!(out.output["ok"].as_bool().unwrap());
 
-        match n.query(ReadRequest::Kv { key: "flags/x".to_string() }).await {
+        match n
+            .query(ReadRequest::Kv {
+                key: "flags/x".to_string(),
+            })
+            .await
+        {
             Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "on"),
             other => panic!("unexpected read: {other:?}"),
         }
