@@ -572,17 +572,30 @@ impl Store {
                 .map(|expires| expires > now)
                 .unwrap_or(true)
         });
-        for lock in self.locks.values_mut() {
-            if lock
-                .lease_expires_ms
-                .map(|expires| expires <= now)
-                .unwrap_or(false)
-            {
-                lock.holder = None;
-                lock.fencing_token = None;
-                lock.lease_expires_ms = None;
+        // Expire any union-lock grants whose lease lapsed, freeing their member
+        // keys, then promote whatever the freed keys now unblock.
+        let expired: Vec<u64> = self
+            .locks
+            .grants
+            .iter()
+            .filter(|(_, g)| g.lease_expires_ms <= now)
+            .map(|(token, _)| *token)
+            .collect();
+        if !expired.is_empty() {
+            for token in expired {
+                self.release_grant(token);
+            }
+            self.lock_promote(now);
+        }
+        // Expire semaphore permits, then admit whoever was waiting.
+        for sem in self.semaphores.values_mut() {
+            let before = sem.holders.len();
+            sem.holders.retain(|slot| slot.lease_expires_ms > now);
+            if sem.holders.len() != before {
+                // A slot freed up; admit FIFO waiters up to the limit below.
             }
         }
+        self.semaphores_promote(now);
         self.elections
             .retain(|_, leadership| leadership.lease_expires_ms > now);
         for instances in self.services.values_mut() {
