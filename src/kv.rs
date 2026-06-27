@@ -105,27 +105,25 @@ async fn list(State(_node): State<Arc<Node>>) -> Json<Value> {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WatchQuery {
-    /// When `true`, stream changes for every key that *starts with* `{key}`
-    /// (best-effort: only keys on the same shard as the prefix are observed).
+pub struct GetQuery {
+    /// Stream changes as Server-Sent Events instead of returning the current value.
+    pub watch: Option<bool>,
+    /// With `watch`, match every key that *starts with* `{key}` (best-effort:
+    /// only keys on the same shard as the prefix are observed).
     pub prefix: Option<bool>,
 }
 
-/// `GET /v1/kv/{key}/watch` — SSE stream of change events for a key (or prefix).
+/// `GET /v1/kv/{key}?watch=true` — SSE stream of change events for a key (or, with
+/// `&prefix=true`, a prefix).
 ///
 /// Subscribes to the owning shard's change broadcast and pushes one SSE event per
 /// committed put/delete that matches. The connection is long-lived (no request
 /// timeout layer) with periodic keep-alive comments.
-async fn watch(
-    State(node): State<Arc<Node>>,
-    Path(key): Path<String>,
-    Query(q): Query<WatchQuery>,
-) -> Response {
+async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
     let Some(rx) = node.watch(&key).await else {
         return Json(json!({ "error": "unavailable", "op": "kv.watch", "key": key }))
             .into_response();
     };
-    let prefix = q.prefix.unwrap_or(false);
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
         let matches = if prefix {
