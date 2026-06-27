@@ -198,35 +198,96 @@ pub struct KvEntry {
     pub expires_at_ms: Option<u64>,
 }
 
-/// Current lock state for a key.
+/// Read view of one lock **member key**: who holds it, the whole set held with it
+/// (the acquired union), and who is queued behind it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LockState {
     pub key: String,
     pub holder: Option<String>,
     pub fencing_token: Option<u64>,
     pub lease_expires_ms: Option<u64>,
+    /// Every member key held together by the current holder (the union grant).
+    pub held_keys: Vec<String>,
+    /// Holders queued on a set that includes this key, in FIFO order.
     pub wait_queue: Vec<LockWaiter>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LockWaiter {
     pub holder: String,
+    /// The full key set this waiter is trying to acquire.
+    pub keys: Vec<String>,
     pub requested_ms: u64,
 }
 
+/// One held union-lock acquisition.
 #[derive(Debug, Clone)]
-struct QueuedLockWaiter {
+struct LockGrant {
     holder: String,
-    requested_ms: u64,
+    keys: Vec<String>,
+    fencing_token: u64,
+    lease_expires_ms: u64,
+}
+
+/// One queued union-lock request awaiting its whole key set.
+#[derive(Debug, Clone)]
+struct QueuedLock {
+    holder: String,
+    keys: Vec<String>,
     ttl_ms: u64,
+    requested_ms: u64,
+}
+
+/// The multi-key lock table: which member key is held by which grant, the grants
+/// themselves, and the FIFO wait queue of whole requests.
+#[derive(Default)]
+struct LockManager {
+    /// member key → owning grant's fencing token.
+    held: HashMap<String, u64>,
+    /// fencing token → grant.
+    grants: HashMap<u64, LockGrant>,
+    /// FIFO queue of requests waiting for their full union to be free.
+    queue: VecDeque<QueuedLock>,
+}
+
+/// Read view of a counting semaphore.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemaphoreState {
+    pub key: String,
+    pub limit: u32,
+    pub holders: Vec<SemaphoreHolder>,
+    /// Free permits right now (`limit - holders`, floored at 0).
+    pub available: u32,
+    pub wait_queue: Vec<LockWaiter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemaphoreHolder {
+    pub holder: String,
+    pub fencing_token: u64,
+    pub lease_expires_ms: u64,
 }
 
 #[derive(Debug, Clone)]
-struct LockRecord {
-    holder: Option<String>,
-    fencing_token: Option<u64>,
-    lease_expires_ms: Option<u64>,
-    wait_queue: VecDeque<QueuedLockWaiter>,
+struct SemaphoreSlot {
+    holder: String,
+    fencing_token: u64,
+    lease_expires_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedPermit {
+    holder: String,
+    ttl_ms: u64,
+    requested_ms: u64,
+}
+
+/// A counting semaphore: up to `limit` permits, plus a FIFO queue for the rest.
+#[derive(Debug, Clone)]
+struct Semaphore {
+    limit: u32,
+    holders: Vec<SemaphoreSlot>,
+    queue: VecDeque<QueuedPermit>,
 }
 
 /// Distributed rate-limit snapshot.
