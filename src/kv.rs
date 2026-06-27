@@ -72,9 +72,9 @@ async fn put_key(
 }
 
 /// `DELETE /v1/kv/{key}` — remove a key.
-async fn delete_key(State(node): State<Arc<Node>>, Path(key): Path<String>) -> Json<Value> {
+async fn delete_key(State(node): State<Arc<Node>>, Path(key): Path<String>) -> Response {
     let result = node.propose(Command::KvDelete { key }).await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `GET /v1/kv?prefix=...` — list keys under a prefix.
