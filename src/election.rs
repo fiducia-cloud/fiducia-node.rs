@@ -90,7 +90,7 @@ async fn resign(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ElectionResign {
             name,
@@ -98,7 +98,7 @@ async fn resign(
             fencing_token: body.fencing_token,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `GET /v1/elections/{name}` — observe the current leader.
