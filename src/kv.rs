@@ -45,14 +45,24 @@ pub struct PutBody {
 }
 
 pub fn router() -> Router<Arc<Node>> {
+    // `/*key` is a catch-all so keys may contain slashes (`flags/checkout`,
+    // `orders/42/lock`). `watch` is a query flag on GET rather than a `/{key}/watch`
+    // suffix, because a catch-all can't be followed by another path segment.
     Router::new()
         .route("/", get(list))
-        .route("/:key", get(get_key).put(put_key).delete(delete_key))
-        .route("/:key/watch", get(watch))
+        .route("/*key", get(get_or_watch).put(put_key).delete(delete_key))
 }
 
-/// `GET /v1/kv/{key}` — read one key.
-async fn get_key(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
+/// `GET /v1/kv/{key}` — read one key, or (with `?watch=true`) stream its changes.
+async fn get_or_watch(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Path(key): Path<String>,
+    Query(q): Query<GetQuery>,
+) -> Response {
+    if q.watch.unwrap_or(false) {
+        return watch(node, key, q.prefix.unwrap_or(false)).await;
+    }
     match node.query(ReadRequest::Kv { key: key.clone() }).await {
         Ok(ReadResponse::Kv(Some(entry))) => {
             Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
