@@ -96,14 +96,14 @@ async fn heartbeat(
 async fn deregister(
     State(node): State<Arc<Node>>,
     Path((service, id)): Path<(String, String)>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ServiceDeregister {
             service,
             instance_id: id,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
