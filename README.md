@@ -13,7 +13,7 @@ Six coordination primitives, all over HTTP (`/v1`):
 | Primitive            | Routes                              | What it is                                                      |
 |----------------------|-------------------------------------|----------------------------------------------------------------|
 | **Config KV + watches** | `/v1/kv/*`                       | Linearizable, versioned key/value with live `watch` streams (etcd/znode). |
-| **Mutual-exclusion locks** | `/v1/locks/*`                | TTL leases, fencing tokens, blocking/try acquire, FIFO waiters. |
+| **Locks + semaphores** | `/v1/locks/*`, `/v1/semaphores/*` | TTL leases, fencing tokens, multi-key union locks, capped semaphores, FIFO waiters. |
 | **Rate limiting**    | `/v1/rate-limit/*`                  | Token-bucket and sliding-window decisions committed per shard.  |
 | **Cron / scheduling** | `/v1/cron/*`                       | Recurring and one-shot schedules with durable run history.      |
 | **Leader election**     | `/v1/elections/*`                | Clients campaign for a named leadership with TTL leases + fencing tokens. |
@@ -66,6 +66,26 @@ Shard **placement, rebalancing, scale up/down, node-failure handling, and
 leader redistribution** are not a node's job — they belong to the control
 plane, **`fiducia-brain`**, which tells nodes which shards to host and moves
 leadership/replicas around.
+
+### Locks and semaphores
+
+Locks are the highest-value coordination primitive, so the skeleton favors
+correctness over maximum partitioning here. Single-key locks, semaphores, and
+multi-key locks all route through the same lock-coordination shard. That keeps a
+single-key acquire on `B` from bypassing an active composite lock on `[A, B]`.
+
+- **Mutex:** `POST /v1/locks/{key}/acquire` with default `max=1`.
+- **Semaphore:** same acquire path with `max > 1`, or the
+  `/v1/semaphores/{key}/acquire` alias. Up to `max` holders can hold the key at
+  once; every holder gets its own fencing token.
+- **Multi-key union lock:** `POST /v1/locks/acquire-many` with `keys`. The keys
+  are sorted/deduped, capped at five, and acquired atomically: either every key
+  is held under one `lock_id`, or none are. The grant returns a per-key
+  `fencing_tokens` map. Composite locks are exclusive on every member key and
+  conflict with single-key locks and semaphores on any overlap.
+- **Release:** single-key holders release with `{holder, fencing_token}`;
+  composite holders release the whole union with `/v1/locks/release-many` and
+  the returned `lock_id`.
 
 ### Storage backing
 

@@ -48,7 +48,7 @@ Recommended column-family layout:
 | `raft_log` | Per-shard log entries keyed by `{shard_id, index}`. |
 | `raft_meta` | Per-shard hard state, conf state, current term, vote, commit index, and applied index. |
 | `state_kv` | Applied config KV entries keyed by `{shard_id, key}` with revision and optional expiry. |
-| `state_locks` | Applied lock/semaphore/election lease state and fencing-token counters. |
+| `state_locks` | Applied mutex, semaphore, multi-key lock, election lease state, and fencing-token counters. |
 | `state_limits` | Applied rate-limit buckets/windows keyed by `{shard_id, tenant, key}`. |
 | `state_schedules` | Schedule definitions, run history, retry state, and exactly-once fire IDs. |
 | `state_services` | Service-discovery registrations and heartbeat leases. |
@@ -69,6 +69,12 @@ The response can be acknowledged only after the command is durably committed by
 a quorum. The local RocksDB write makes one replica crash-safe; the Raft quorum
 makes the operation fleet-safe.
 
+Lock writes include single-key mutexes, capped semaphores, and bounded
+multi-key union locks. A multi-key grant stores the same `lock_id` under every
+member key and stores a distinct fencing token per key. Release by `lock_id`
+removes the holder from all members in one committed command, so there is no
+partial release window.
+
 ## Recovery
 
 On restart, a node opens RocksDB, loads `raft_meta`, restores the newest
@@ -85,8 +91,10 @@ per-primitive:
 - KV values: keep the latest live value and revision; compact old revisions
   after watch retention expires.
 - Watches: keep enough recent revisions for reconnect and resume.
-- Locks/elections/service discovery: keep live leases plus audit/diagnostic
-  events according to operator retention.
+- Locks/semaphores/elections/service discovery: keep live leases plus
+  audit/diagnostic events according to operator retention. Composite lock
+  snapshots must preserve every member key, the shared `lock_id`, and each
+  per-key fencing token.
 - Schedules: keep run history according to plan limits and customer retention.
 - Rate limits: keep only live bucket/window state unless analytics export is
   enabled.

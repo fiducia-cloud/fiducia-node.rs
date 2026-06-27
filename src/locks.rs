@@ -2,10 +2,15 @@
 //!
 //! Routes (mounted under `/v1/locks`):
 //!   * `POST /v1/locks/acquire`       — advertised body-key acquire endpoint
+//!   * `POST /v1/locks/acquire-many`  — atomic union lock across several keys
+//!   * `POST /v1/locks/release-many`  — release a composite lock by lock id
 //!   * `GET  /v1/locks/{key}`         — inspect holder, fencing token, lease, queue
 //!   * `POST /v1/locks/{key}/acquire` — try or queue for the lock
 //!   * `POST /v1/locks/{key}/release` — release with holder + fencing token
 //!   * `GET  /v1/locks/{key}/watch`   — SSE placeholder for lock changes
+//!
+//! Semaphores use the same state machine: pass `max > 1` on acquire, or use the
+//! `/v1/semaphores/{key}/...` aliases mounted from [`semaphore_router`].
 
 use std::sync::Arc;
 
@@ -27,11 +32,21 @@ pub struct AcquireBody {
     pub holder: Option<String>,
     pub ttl_ms: Option<u64>,
     pub wait: Option<bool>,
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AcquireWithKeyBody {
     pub key: String,
+    pub holder: Option<String>,
+    pub ttl_ms: Option<u64>,
+    pub wait: Option<bool>,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcquireManyBody {
+    pub keys: Vec<String>,
     pub holder: Option<String>,
     pub ttl_ms: Option<u64>,
     pub wait: Option<bool>,
@@ -43,13 +58,27 @@ pub struct ReleaseBody {
     pub fencing_token: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReleaseManyBody {
+    pub lock_id: String,
+}
+
 pub fn router() -> Router<Arc<Node>> {
     Router::new()
         .route("/acquire", post(acquire_with_body_key))
+        .route("/acquire-many", post(acquire_many))
+        .route("/release-many", post(release_many))
         .route("/:key", get(get_lock))
         .route("/:key/acquire", post(acquire))
         .route("/:key/release", post(release))
         .route("/:key/watch", get(watch))
+}
+
+pub fn semaphore_router() -> Router<Arc<Node>> {
+    Router::new()
+        .route("/:key", get(get_lock))
+        .route("/:key/acquire", post(acquire))
+        .route("/:key/release", post(release))
 }
 
 /// `GET /v1/locks/{key}` — inspect lock state and FIFO wait queue.
@@ -75,6 +104,7 @@ async fn acquire(
         body.holder,
         body.ttl_ms,
         body.wait.unwrap_or(false),
+        body.max,
     )
     .await
 }
@@ -92,8 +122,26 @@ async fn acquire_with_body_key(
         body.holder,
         body.ttl_ms,
         body.wait.unwrap_or(false),
+        body.max,
     )
     .await
+}
+
+/// `POST /v1/locks/acquire-many` — atomically lock a union of keys.
+async fn acquire_many(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<AcquireManyBody>,
+) -> Response {
+    let result = node
+        .propose(Command::LockAcquireMany {
+            keys: body.keys,
+            holder: body.holder.unwrap_or_else(|| "anonymous".to_string()),
+            ttl_ms: body.ttl_ms.unwrap_or(30_000),
+            wait: body.wait.unwrap_or(false),
+        })
+        .await;
+    propose_response(result, &uri)
 }
 
 async fn acquire_key(
@@ -103,6 +151,7 @@ async fn acquire_key(
     holder: Option<String>,
     ttl_ms: Option<u64>,
     wait: bool,
+    max: Option<u32>,
 ) -> Response {
     let result = node
         .propose(Command::LockAcquire {
@@ -110,6 +159,7 @@ async fn acquire_key(
             holder: holder.unwrap_or_else(|| "anonymous".to_string()),
             ttl_ms: ttl_ms.unwrap_or(30_000),
             wait,
+            max: max.unwrap_or(1),
         })
         .await;
     propose_response(result, &uri)
@@ -127,6 +177,20 @@ async fn release(
             key,
             holder: body.holder,
             fencing_token: body.fencing_token,
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
+/// `POST /v1/locks/release-many` — release a composite lock by lock id.
+async fn release_many(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ReleaseManyBody>,
+) -> Response {
+    let result = node
+        .propose(Command::LockReleaseMany {
+            lock_id: body.lock_id,
         })
         .await;
     propose_response(result, &uri)

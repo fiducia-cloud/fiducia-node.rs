@@ -50,6 +50,8 @@ use crate::state::{
     ServiceInstance, StateMachine,
 };
 
+const LOCK_COORDINATION_ROUTING_KEY: &str = "__fiducia_lock_coordination__";
+
 /// Identifier of a shard (one independent Raft group). Re-exported from the
 /// shared routing crate so the type and the `key → shard` mapping can't drift
 /// between the node, the load balancer, and the brain.
@@ -148,7 +150,9 @@ pub enum RaftRpc {
 /// A single-key read, routed to its owning shard.
 ///
 /// Multi-shard scans (prefix/list) are not modeled here — a handler fans those
-/// out across shards itself.
+/// out across shards itself. Lock reads intentionally route through the same
+/// coordination shard as lock writes so composite locks conflict with
+/// single-key reads/writes on every member key.
 pub enum ReadRequest {
     Kv { key: String },
     Lock { key: String },
@@ -164,7 +168,7 @@ impl ReadRequest {
     pub fn routing_key(&self) -> &str {
         match self {
             ReadRequest::Kv { key } => key,
-            ReadRequest::Lock { key } => key,
+            ReadRequest::Lock { .. } => LOCK_COORDINATION_ROUTING_KEY,
             ReadRequest::RateLimit { key, .. } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,

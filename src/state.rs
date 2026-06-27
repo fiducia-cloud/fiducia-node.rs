@@ -4,12 +4,15 @@
 //! in committed-log order. In this single-node skeleton the log is local, but the
 //! state-machine semantics are the same ones the replicated path will use.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const LOCK_COORDINATION_ROUTING_KEY: &str = "__fiducia_lock_coordination__";
+const MAX_COMPOSITE_LOCK_KEYS: usize = 5;
 
 /// Every mutation in the system, as it travels through the replicated log.
 ///
@@ -35,11 +38,21 @@ pub enum Command {
         holder: String,
         ttl_ms: u64,
         wait: bool,
+        max: u32,
+    },
+    LockAcquireMany {
+        keys: Vec<String>,
+        holder: String,
+        ttl_ms: u64,
+        wait: bool,
     },
     LockRelease {
         key: String,
         holder: String,
         fencing_token: u64,
+    },
+    LockReleaseMany {
+        lock_id: String,
     },
 
     // --- Rate limiting -----------------------------------------------------
@@ -110,9 +123,11 @@ impl Command {
         match self {
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
-            | Command::LockAcquire { key, .. }
-            | Command::LockRelease { key, .. }
             | Command::RateLimitCheck { key, .. } => key,
+            Command::LockAcquire { .. }
+            | Command::LockAcquireMany { .. }
+            | Command::LockRelease { .. }
+            | Command::LockReleaseMany { .. } => LOCK_COORDINATION_ROUTING_KEY,
             Command::ScheduleUpsert { name, .. } | Command::ScheduleRecordRun { name, .. } => name,
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
@@ -168,13 +183,28 @@ pub struct LockState {
     pub holder: Option<String>,
     pub fencing_token: Option<u64>,
     pub lease_expires_ms: Option<u64>,
+    pub holders: Vec<LockHolderState>,
+    pub max_holders: u32,
+    pub available: u32,
     pub wait_queue: Vec<LockWaiter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LockHolderState {
+    pub holder: String,
+    pub lock_id: String,
+    pub fencing_token: u64,
+    pub lease_expires_ms: u64,
+    pub keys: Vec<String>,
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LockWaiter {
     pub holder: String,
     pub requested_ms: u64,
+    pub keys: Vec<String>,
+    pub max_holders: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -182,13 +212,23 @@ struct QueuedLockWaiter {
     holder: String,
     requested_ms: u64,
     ttl_ms: u64,
+    max_holders: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveLockHolder {
+    holder: String,
+    lock_id: String,
+    fencing_token: u64,
+    lease_expires_ms: u64,
+    keys: Vec<String>,
+    exclusive: bool,
 }
 
 #[derive(Debug, Clone)]
 struct LockRecord {
-    holder: Option<String>,
-    fencing_token: Option<u64>,
-    lease_expires_ms: Option<u64>,
+    max_holders: u32,
+    holders: Vec<ActiveLockHolder>,
     wait_queue: VecDeque<QueuedLockWaiter>,
 }
 
@@ -305,12 +345,22 @@ impl StateMachine {
                 holder,
                 ttl_ms,
                 wait,
-            } => store.apply_lock_acquire(revision, now, key, holder, ttl_ms, wait),
+                max,
+            } => store.apply_lock_acquire(revision, now, key, holder, ttl_ms, wait, max),
+            Command::LockAcquireMany {
+                keys,
+                holder,
+                ttl_ms,
+                wait,
+            } => store.apply_lock_acquire_many(revision, now, keys, holder, ttl_ms, wait),
             Command::LockRelease {
                 key,
                 holder,
                 fencing_token,
             } => store.apply_lock_release(revision, now, key, holder, fencing_token),
+            Command::LockReleaseMany { lock_id } => {
+                store.apply_lock_release_many(revision, now, lock_id)
+            }
             Command::RateLimitCheck {
                 key,
                 tenant,
@@ -456,17 +506,19 @@ impl Store {
                 .map(|expires| expires > now)
                 .unwrap_or(true)
         });
-        for lock in self.locks.values_mut() {
-            if lock
-                .lease_expires_ms
-                .map(|expires| expires <= now)
-                .unwrap_or(false)
-            {
-                lock.holder = None;
-                lock.fencing_token = None;
-                lock.lease_expires_ms = None;
-            }
-        }
+        let expired_composite_locks: HashSet<String> = self
+            .locks
+            .values()
+            .flat_map(|lock| lock.holders.iter())
+            .filter(|holder| holder.keys.len() > 1 && holder.lease_expires_ms <= now)
+            .map(|holder| holder.lock_id.clone())
+            .collect();
+        self.locks.retain(|_, lock| {
+            lock.holders.retain(|holder| {
+                holder.lease_expires_ms > now && !expired_composite_locks.contains(&holder.lock_id)
+            });
+            !lock.holders.is_empty() || !lock.wait_queue.is_empty()
+        });
         self.elections
             .retain(|_, leadership| leadership.lease_expires_ms > now);
         for instances in self.services.values_mut() {
@@ -518,42 +570,40 @@ impl Store {
         holder: String,
         ttl_ms: u64,
         wait: bool,
+        max: u32,
     ) -> Value {
-        let existing_holder = self.locks.get(&key).and_then(|lock| lock.holder.clone());
-        if existing_holder.is_none() {
-            let fencing_token = self.next_token();
-            let lease_expires_ms = now.saturating_add(ttl_ms);
-            let lock = self.locks.entry(key.clone()).or_insert_with(|| LockRecord {
-                holder: None,
-                fencing_token: None,
-                lease_expires_ms: None,
-                wait_queue: VecDeque::new(),
-            });
-            lock.holder = Some(holder.clone());
-            lock.fencing_token = Some(fencing_token);
-            lock.lease_expires_ms = Some(lease_expires_ms);
+        let max_holders = max.max(1);
+        if self.can_grant_single(&key, &holder, max_holders) {
+            let grant = self.grant_single_lock(
+                revision,
+                now,
+                key.clone(),
+                holder.clone(),
+                ttl_ms,
+                max_holders,
+            );
             return json!({
                 "acquired": true,
                 "queued": false,
                 "key": key,
                 "holder": holder,
-                "fencing_token": fencing_token,
-                "lease_expires_ms": lease_expires_ms,
+                "lock_id": grant.lock_id,
+                "fencing_token": grant.fencing_token,
+                "lease_expires_ms": grant.lease_expires_ms,
+                "holders": self.lock_holder_count(&key),
+                "max": self.lock_max_holders(&key),
+                "available": self.lock_available(&key),
                 "revision": revision,
             });
         }
 
-        let lock = self.locks.entry(key.clone()).or_insert_with(|| LockRecord {
-            holder: None,
-            fencing_token: None,
-            lease_expires_ms: None,
-            wait_queue: VecDeque::new(),
-        });
+        let lock = self.lock_entry(&key, max_holders);
         if wait && !lock.wait_queue.iter().any(|queued| queued.holder == holder) {
             lock.wait_queue.push_back(QueuedLockWaiter {
                 holder: holder.clone(),
                 requested_ms: now,
                 ttl_ms,
+                max_holders,
             });
         }
         let position = lock
@@ -567,7 +617,80 @@ impl Store {
             "position": position,
             "key": key,
             "holder": holder,
-            "current_holder": lock.holder,
+            "current_holder": lock.holders.first().map(|holder| holder.holder.clone()),
+            "holders": lock.holders.len(),
+            "max": lock.max_holders,
+            "available": lock.max_holders.saturating_sub(lock.holders.len() as u32),
+            "revision": revision,
+        })
+    }
+
+    fn apply_lock_acquire_many(
+        &mut self,
+        revision: u64,
+        now: u64,
+        keys: Vec<String>,
+        holder: String,
+        ttl_ms: u64,
+        wait: bool,
+    ) -> Value {
+        let keys = match canonical_lock_keys(keys) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                return json!({
+                    "acquired": false,
+                    "queued": false,
+                    "reason": reason,
+                    "revision": revision,
+                });
+            }
+        };
+        let conflict_keys = self.composite_conflicts(&keys);
+        if !conflict_keys.is_empty() {
+            return json!({
+                "acquired": false,
+                "queued": false,
+                "reason": "contended",
+                "wait_supported": false,
+                "keys": keys,
+                "holder": holder,
+                "conflict_keys": conflict_keys,
+                "requested_wait": wait,
+                "revision": revision,
+            });
+        }
+
+        let first_token = self.next_token();
+        let lock_id = lock_id_for(revision, first_token);
+        let mut fencing_tokens = serde_json::Map::new();
+        for (idx, key) in keys.iter().enumerate() {
+            let fencing_token = if idx == 0 {
+                first_token
+            } else {
+                self.next_token()
+            };
+            let lease_expires_ms = now.saturating_add(ttl_ms);
+            fencing_tokens.insert(key.clone(), json!(fencing_token));
+            let active = ActiveLockHolder {
+                holder: holder.clone(),
+                lock_id: lock_id.clone(),
+                fencing_token,
+                lease_expires_ms,
+                keys: keys.clone(),
+                exclusive: true,
+            };
+            let lock = self.lock_entry(key, 1);
+            lock.holders.push(active);
+        }
+
+        json!({
+            "acquired": true,
+            "queued": false,
+            "keys": keys,
+            "holder": holder,
+            "lock_id": lock_id,
+            "fencing_tokens": Value::Object(fencing_tokens),
+            "lease_expires_ms": now.saturating_add(ttl_ms),
             "revision": revision,
         })
     }
@@ -583,42 +706,208 @@ impl Store {
         let Some(existing) = self.locks.get(&key) else {
             return json!({ "released": false, "reason": "not_found", "revision": revision });
         };
-        if existing.holder.as_deref() != Some(holder.as_str())
-            || existing.fencing_token != Some(fencing_token)
-        {
+        let Some(position) = existing
+            .holders
+            .iter()
+            .position(|active| active.holder == holder && active.fencing_token == fencing_token)
+        else {
             return json!({ "released": false, "reason": "not_holder", "revision": revision });
+        };
+        if existing.holders[position].keys.len() > 1 {
+            return json!({ "released": false, "reason": "composite_release_required", "lock_id": existing.holders[position].lock_id, "revision": revision });
         }
 
-        let mut transferred_to = None;
-        let mut next_token = None;
-        let mut next_expires = None;
-        if let Some(mut lock) = self.locks.remove(&key) {
-            if let Some(waiter) = lock.wait_queue.pop_front() {
-                let token = self.next_token();
-                let expires = now.saturating_add(waiter.ttl_ms);
-                transferred_to = Some(waiter.holder.clone());
-                next_token = Some(token);
-                next_expires = Some(expires);
-                lock.holder = Some(waiter.holder);
-                lock.fencing_token = Some(token);
-                lock.lease_expires_ms = Some(expires);
-                self.locks.insert(key.clone(), lock);
-            } else {
-                lock.holder = None;
-                lock.fencing_token = None;
-                lock.lease_expires_ms = None;
-                self.locks.insert(key.clone(), lock);
-            }
+        if let Some(lock) = self.locks.get_mut(&key) {
+            lock.holders.remove(position);
         }
+        let transfers = self.grant_queued_single(&key, now, revision);
+        let transferred_to = transfers
+            .first()
+            .and_then(|transfer| transfer.get("holder"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let next_token = transfers
+            .first()
+            .and_then(|transfer| transfer.get("fencing_token"))
+            .and_then(Value::as_u64);
+        let next_expires = transfers
+            .first()
+            .and_then(|transfer| transfer.get("lease_expires_ms"))
+            .and_then(Value::as_u64);
 
         json!({
             "released": true,
             "key": key,
             "transferred_to": transferred_to,
+            "transfers": transfers,
             "fencing_token": next_token,
             "lease_expires_ms": next_expires,
+            "holders": self.lock_holder_count(&key),
+            "max": self.lock_max_holders(&key),
+            "available": self.lock_available(&key),
             "revision": revision,
         })
+    }
+
+    fn apply_lock_release_many(&mut self, revision: u64, now: u64, lock_id: String) -> Value {
+        let mut released_keys = Vec::new();
+        for (key, lock) in self.locks.iter_mut() {
+            let before = lock.holders.len();
+            lock.holders.retain(|active| active.lock_id != lock_id);
+            if lock.holders.len() != before {
+                released_keys.push(key.clone());
+            }
+        }
+        if released_keys.is_empty() {
+            return json!({ "released": false, "reason": "not_found", "lock_id": lock_id, "revision": revision });
+        }
+
+        released_keys.sort();
+        let mut transfers = Vec::new();
+        for key in &released_keys {
+            transfers.extend(self.grant_queued_single(key, now, revision));
+        }
+
+        json!({
+            "released": true,
+            "lock_id": lock_id,
+            "keys": released_keys,
+            "transfers": transfers,
+            "revision": revision,
+        })
+    }
+
+    fn lock_entry(&mut self, key: &str, max_holders: u32) -> &mut LockRecord {
+        self.locks
+            .entry(key.to_string())
+            .or_insert_with(|| LockRecord {
+                max_holders: max_holders.max(1),
+                holders: Vec::new(),
+                wait_queue: VecDeque::new(),
+            })
+    }
+
+    fn can_grant_single(&self, key: &str, holder: &str, max_holders: u32) -> bool {
+        let Some(lock) = self.locks.get(key) else {
+            return true;
+        };
+        if lock.wait_queue.front().is_some() {
+            return false;
+        }
+        if lock
+            .holders
+            .iter()
+            .any(|active| active.exclusive || active.holder == holder)
+        {
+            return false;
+        }
+        let capacity = if lock.holders.is_empty() {
+            max_holders.max(1)
+        } else {
+            lock.max_holders
+        };
+        (lock.holders.len() as u32) < capacity
+    }
+
+    fn grant_single_lock(
+        &mut self,
+        revision: u64,
+        now: u64,
+        key: String,
+        holder: String,
+        ttl_ms: u64,
+        max_holders: u32,
+    ) -> ActiveLockHolder {
+        let fencing_token = self.next_token();
+        let lease_expires_ms = now.saturating_add(ttl_ms);
+        let active = ActiveLockHolder {
+            holder,
+            lock_id: lock_id_for(revision, fencing_token),
+            fencing_token,
+            lease_expires_ms,
+            keys: vec![key.clone()],
+            exclusive: false,
+        };
+        let lock = self.lock_entry(&key, max_holders);
+        if lock.holders.is_empty() {
+            lock.max_holders = max_holders.max(1);
+        }
+        lock.holders.push(active.clone());
+        active
+    }
+
+    fn grant_queued_single(&mut self, key: &str, now: u64, revision: u64) -> Vec<Value> {
+        let mut transfers = Vec::new();
+        loop {
+            let can_grant = self
+                .locks
+                .get(key)
+                .map(|lock| {
+                    !lock.holders.iter().any(|active| active.exclusive)
+                        && (lock.holders.len() as u32) < lock.max_holders
+                        && lock.wait_queue.front().is_some()
+                })
+                .unwrap_or(false);
+            if !can_grant {
+                break;
+            }
+            let waiter = self
+                .locks
+                .get_mut(key)
+                .and_then(|lock| lock.wait_queue.pop_front());
+            let Some(waiter) = waiter else {
+                break;
+            };
+            let grant = self.grant_single_lock(
+                revision,
+                now,
+                key.to_string(),
+                waiter.holder,
+                waiter.ttl_ms,
+                waiter.max_holders,
+            );
+            transfers.push(json!({
+                "key": key,
+                "holder": grant.holder,
+                "lock_id": grant.lock_id,
+                "fencing_token": grant.fencing_token,
+                "lease_expires_ms": grant.lease_expires_ms,
+            }));
+        }
+        transfers
+    }
+
+    fn composite_conflicts(&self, keys: &[String]) -> Vec<String> {
+        keys.iter()
+            .filter(|key| {
+                self.locks
+                    .get(key.as_str())
+                    .map(|lock| !lock.holders.is_empty() || !lock.wait_queue.is_empty())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn lock_holder_count(&self, key: &str) -> usize {
+        self.locks
+            .get(key)
+            .map(|lock| lock.holders.len())
+            .unwrap_or(0)
+    }
+
+    fn lock_max_holders(&self, key: &str) -> u32 {
+        self.locks
+            .get(key)
+            .map(|lock| lock.max_holders)
+            .unwrap_or(1)
+    }
+
+    fn lock_available(&self, key: &str) -> u32 {
+        self.locks
+            .get(key)
+            .map(|lock| lock.max_holders.saturating_sub(lock.holders.len() as u32))
+            .unwrap_or(1)
     }
 
     fn apply_rate_limit_check(
@@ -871,20 +1160,41 @@ impl Store {
                 holder: None,
                 fencing_token: None,
                 lease_expires_ms: None,
+                holders: Vec::new(),
+                max_holders: 1,
+                available: 1,
                 wait_queue: Vec::new(),
             };
         };
+        let holders: Vec<LockHolderState> = lock
+            .holders
+            .iter()
+            .map(|holder| LockHolderState {
+                holder: holder.holder.clone(),
+                lock_id: holder.lock_id.clone(),
+                fencing_token: holder.fencing_token,
+                lease_expires_ms: holder.lease_expires_ms,
+                keys: holder.keys.clone(),
+                exclusive: holder.exclusive,
+            })
+            .collect();
+        let first = holders.first();
         LockState {
             key: key.to_string(),
-            holder: lock.holder.clone(),
-            fencing_token: lock.fencing_token,
-            lease_expires_ms: lock.lease_expires_ms,
+            holder: first.map(|holder| holder.holder.clone()),
+            fencing_token: first.map(|holder| holder.fencing_token),
+            lease_expires_ms: first.map(|holder| holder.lease_expires_ms),
+            holders,
+            max_holders: lock.max_holders,
+            available: lock.max_holders.saturating_sub(lock.holders.len() as u32),
             wait_queue: lock
                 .wait_queue
                 .iter()
                 .map(|waiter| LockWaiter {
                     holder: waiter.holder.clone(),
                     requested_ms: waiter.requested_ms,
+                    keys: vec![key.to_string()],
+                    max_holders: waiter.max_holders,
                 })
                 .collect(),
         }
@@ -912,6 +1222,23 @@ fn rate_limit_store_key(tenant: &str, key: &str) -> String {
     format!("{tenant}:{key}")
 }
 
+fn canonical_lock_keys(mut keys: Vec<String>) -> Result<Vec<String>, &'static str> {
+    keys.retain(|key| !key.trim().is_empty());
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return Err("empty_keys");
+    }
+    if keys.len() > MAX_COMPOSITE_LOCK_KEYS {
+        return Err("too_many_keys");
+    }
+    Ok(keys)
+}
+
+fn lock_id_for(revision: u64, fencing_token: u64) -> String {
+    format!("lck_{revision}_{fencing_token}")
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -935,6 +1262,7 @@ mod tests {
             holder: "worker-a".to_string(),
             ttl_ms: 30_000,
             wait: false,
+            max: 1,
         });
         assert_eq!(first.output["acquired"], true);
         let token = first.output["fencing_token"].as_u64().unwrap();
@@ -944,6 +1272,7 @@ mod tests {
             holder: "worker-b".to_string(),
             ttl_ms: 30_000,
             wait: true,
+            max: 1,
         });
         assert_eq!(second.output["queued"], true);
         assert_eq!(second.output["position"], 1);
@@ -956,6 +1285,122 @@ mod tests {
         assert_eq!(release.output["released"], true);
         assert_eq!(release.output["transferred_to"], "worker-b");
         assert!(release.output["fencing_token"].as_u64().unwrap() > token);
+    }
+
+    #[test]
+    fn semaphore_allows_multiple_holders_up_to_cap() {
+        let sm = StateMachine::new();
+        let first = sm.apply(Command::LockAcquire {
+            key: "deploys".to_string(),
+            holder: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 2,
+        });
+        let second = sm.apply(Command::LockAcquire {
+            key: "deploys".to_string(),
+            holder: "worker-b".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 2,
+        });
+        let third = sm.apply(Command::LockAcquire {
+            key: "deploys".to_string(),
+            holder: "worker-c".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 2,
+        });
+
+        assert_eq!(first.output["acquired"], true);
+        assert_eq!(second.output["acquired"], true);
+        assert_eq!(third.output["acquired"], false);
+        assert_eq!(third.output["max"], 2);
+        assert_eq!(sm.lock_get("deploys").holders.len(), 2);
+        assert_eq!(sm.lock_get("deploys").available, 0);
+    }
+
+    #[test]
+    fn multi_key_lock_blocks_any_overlapping_key_until_released() {
+        let sm = StateMachine::new();
+        let composite = sm.apply(Command::LockAcquireMany {
+            keys: vec!["inventory".to_string(), "orders".to_string()],
+            holder: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+        });
+        assert_eq!(composite.output["acquired"], true);
+        assert_eq!(composite.output["keys"][0], "inventory");
+        assert_eq!(composite.output["keys"][1], "orders");
+        assert!(composite.output["fencing_tokens"]["inventory"]
+            .as_u64()
+            .is_some());
+        assert!(composite.output["fencing_tokens"]["orders"]
+            .as_u64()
+            .is_some());
+
+        let blocked = sm.apply(Command::LockAcquire {
+            key: "orders".to_string(),
+            holder: "worker-b".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 1,
+        });
+        let unrelated = sm.apply(Command::LockAcquire {
+            key: "payments".to_string(),
+            holder: "worker-c".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 1,
+        });
+        assert_eq!(blocked.output["acquired"], false);
+        assert_eq!(unrelated.output["acquired"], true);
+
+        let lock_id = composite.output["lock_id"].as_str().unwrap().to_string();
+        let release = sm.apply(Command::LockReleaseMany { lock_id });
+        assert_eq!(release.output["released"], true);
+        assert_eq!(release.output["keys"][0], "inventory");
+        assert_eq!(release.output["keys"][1], "orders");
+
+        let after_release = sm.apply(Command::LockAcquire {
+            key: "orders".to_string(),
+            holder: "worker-b".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 1,
+        });
+        assert_eq!(after_release.output["acquired"], true);
+    }
+
+    #[test]
+    fn expired_multi_key_lock_releases_every_member_key() {
+        let sm = StateMachine::new();
+        let composite = sm.apply(Command::LockAcquireMany {
+            keys: vec!["inventory".to_string(), "orders".to_string()],
+            holder: "worker-a".to_string(),
+            ttl_ms: 1,
+            wait: false,
+        });
+        assert_eq!(composite.output["acquired"], true);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let blocked = sm.apply(Command::LockAcquire {
+            key: "orders".to_string(),
+            holder: "worker-b".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 1,
+        });
+        assert_eq!(blocked.output["acquired"], true);
+
+        let other_member = sm.apply(Command::LockAcquire {
+            key: "inventory".to_string(),
+            holder: "worker-c".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+            max: 1,
+        });
+        assert_eq!(other_member.output["acquired"], true);
     }
 
     #[test]

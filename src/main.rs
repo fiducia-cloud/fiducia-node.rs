@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/status", get(status))
         .nest("/kv", kv::router())
         .nest("/locks", locks::router())
+        .nest("/semaphores", locks::semaphore_router())
         .nest("/rate-limit", rate_limit::router())
         .nest("/ratelimit", rate_limit::router())
         .nest("/cron", schedule::router())
