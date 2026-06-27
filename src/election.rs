@@ -74,7 +74,7 @@ async fn renew(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ElectionRenew {
             name,
@@ -82,7 +82,7 @@ async fn renew(
             fencing_token: body.fencing_token,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `POST /v1/elections/{name}/resign` — give up leadership.
