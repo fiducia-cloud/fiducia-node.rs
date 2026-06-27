@@ -1,4 +1,4 @@
-//! Config KV with watches (skeleton handlers).
+//! Config KV with watches.
 //!
 //! A linearizable, versioned key/value store for configuration and feature
 //! flags — the etcd/ZooKeeper-znode primitive. Writes are proposed to the owning
@@ -6,12 +6,15 @@
 //! [`Node::query`]. `watch` streams change events so clients get live config
 //! push instead of polling.
 //!
+//! Keys are a **catch-all path segment**, so they may contain slashes
+//! (`flags/checkout`, `a/b/c/d`) — the whole point of a hierarchical config store.
+//!
 //! Routes (mounted under `/v1/kv`):
-//!   * `GET    /v1/kv/{key}`        — read a key (+ its revision)
-//!   * `PUT    /v1/kv/{key}`        — upsert `{ "value", "ttl_ms"? }`, optional CAS
-//!   * `DELETE /v1/kv/{key}`        — delete a key
-//!   * `GET    /v1/kv?prefix=...`   — list keys under a prefix
-//!   * `GET    /v1/kv/{key}/watch`  — SSE stream of changes (key or prefix)
+//!   * `GET    /v1/kv/{key}`             — read a key (+ its revision)
+//!   * `GET    /v1/kv/{key}?watch=true`  — SSE stream of changes (add `&prefix=true`)
+//!   * `PUT    /v1/kv/{key}`             — upsert `{ "value", "ttl_ms"? }`, optional CAS
+//!   * `DELETE /v1/kv/{key}`             — delete a key
+//!   * `GET    /v1/kv?prefix=...`        — list keys under a prefix
 
 use std::sync::Arc;
 
