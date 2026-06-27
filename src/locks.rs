@@ -46,12 +46,13 @@ pub struct ReleaseBody {
 }
 
 pub fn router() -> Router<Arc<Node>> {
+    // Acquire/release take their keys in the JSON body (a union may be many keys,
+    // and bodies are slash-safe). Inspect uses a catch-all so a single member key
+    // may contain slashes (`orders/42`).
     Router::new()
         .route("/acquire", post(acquire_union))
         .route("/release", post(release_token))
-        .route("/:key", get(get_lock))
-        .route("/:key/acquire", post(acquire_one))
-        .route("/:key/release", post(release_one))
+        .route("/*key", get(get_lock))
 }
 
 /// `GET /v1/locks/{key}` — inspect lock state for one member key.
