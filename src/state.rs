@@ -35,6 +35,24 @@ pub enum Command {
     ServiceRegister { service: String, instance_id: String, address: String, ttl_ms: u64 },
     ServiceHeartbeat { service: String, instance_id: String },
     ServiceDeregister { service: String, instance_id: String },
+
+    // --- Locks & semaphores ------------------------------------------------
+    // max == 1 is a mutex; max > 1 a counting semaphore.
+    LockAcquire { key: String, holder: String, ttl_ms: u64, max: u32 },
+    LockRelease { key: String, lock_id: String },
+
+    // --- Reader-writer locks -----------------------------------------------
+    RwAcquireRead { key: String, holder: String, ttl_ms: u64 },
+    RwEndRead { key: String, lock_id: String },
+    RwAcquireWrite { key: String, holder: String, ttl_ms: u64 },
+    RwEndWrite { key: String, lock_id: String },
+
+    // --- Rate limiting -----------------------------------------------------
+    RateLimitConsume { key: String, cost: u64 },
+
+    // --- Cron & scheduling -------------------------------------------------
+    CronCreate { name: String, schedule: String, target: String },
+    CronDelete { name: String },
 }
 
 impl Command {
@@ -55,6 +73,15 @@ impl Command {
             Command::ServiceRegister { service, .. } => service,
             Command::ServiceHeartbeat { service, .. } => service,
             Command::ServiceDeregister { service, .. } => service,
+            Command::LockAcquire { key, .. } => key,
+            Command::LockRelease { key, .. } => key,
+            Command::RwAcquireRead { key, .. } => key,
+            Command::RwEndRead { key, .. } => key,
+            Command::RwAcquireWrite { key, .. } => key,
+            Command::RwEndWrite { key, .. } => key,
+            Command::RateLimitConsume { key, .. } => key,
+            Command::CronCreate { name, .. } => name,
+            Command::CronDelete { name } => name,
         }
     }
 }
@@ -131,6 +158,15 @@ impl StateMachine {
             Command::ServiceRegister { .. } => { /* TODO: upsert instance */ }
             Command::ServiceHeartbeat { .. } => { /* TODO: extend instance lease */ }
             Command::ServiceDeregister { .. } => { /* TODO: remove instance */ }
+            Command::LockAcquire { .. } => { /* TODO: grant if under max + no writer; assign fencing token + lock_id; else FIFO-queue (blocking) */ }
+            Command::LockRelease { .. } => { /* TODO: release by lock_id; wake next FIFO waiter */ }
+            Command::RwAcquireRead { .. } => { /* TODO: grant read if no writer held/queued */ }
+            Command::RwEndRead { .. } => { /* TODO: drop reader; maybe promote a waiting writer */ }
+            Command::RwAcquireWrite { .. } => { /* TODO: grant write if no readers/writer */ }
+            Command::RwEndWrite { .. } => { /* TODO: drop writer; wake next waiter */ }
+            Command::RateLimitConsume { .. } => { /* TODO: token-bucket / sliding-window check-and-decrement */ }
+            Command::CronCreate { .. } => { /* TODO: store schedule; leader fires once; durable run history + retries */ }
+            Command::CronDelete { .. } => { /* TODO: remove schedule */ }
         }
 
         store.revision
