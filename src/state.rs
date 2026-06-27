@@ -29,14 +29,37 @@ pub enum Command {
         key: String,
     },
 
-    // --- Mutual-exclusion locks -------------------------------------------
+    // --- Mutual-exclusion locks (multi-key UNION) -------------------------
+    /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
+    /// the grant conflicts with anyone holding *any* of those keys, and is queued
+    /// (FIFO, deadlock-free) until *every* member key is free. A single-key lock
+    /// is just `keys = [k]`. This is the live-mutex "lock on a combination of
+    /// keys" primitive. See [`LOCK_DOMAIN`] for why these route together.
     LockAcquire {
-        key: String,
+        keys: Vec<String>,
         holder: String,
         ttl_ms: u64,
         wait: bool,
     },
+    /// Release a held lock by its fencing token, freeing every member key at once
+    /// and promoting the next grantable waiter(s).
     LockRelease {
+        holder: String,
+        fencing_token: u64,
+    },
+
+    // --- Counting semaphores ----------------------------------------------
+    /// Acquire one permit of a counting semaphore `key` that admits up to `limit`
+    /// concurrent holders. Beyond the cap, callers queue (FIFO) when `wait`.
+    SemaphoreAcquire {
+        key: String,
+        holder: String,
+        limit: u32,
+        ttl_ms: u64,
+        wait: bool,
+    },
+    /// Release one held permit by its fencing token, admitting the next waiter.
+    SemaphoreRelease {
         key: String,
         holder: String,
         fencing_token: u64,
