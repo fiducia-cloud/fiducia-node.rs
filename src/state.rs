@@ -1337,6 +1337,23 @@ mod tests {
         .output
     }
 
+    fn semaphore_acquire(
+        sm: &StateMachine,
+        key: &str,
+        holder: &str,
+        limit: u32,
+        wait: bool,
+    ) -> Value {
+        sm.apply(Command::SemaphoreAcquire {
+            key: key.to_string(),
+            holder: holder.to_string(),
+            limit,
+            ttl_ms: 30_000,
+            wait,
+        })
+        .output
+    }
+
     #[test]
     fn single_key_lock_queues_and_transfers_with_monotonic_fencing_tokens() {
         let sm = StateMachine::new();
@@ -1416,22 +1433,108 @@ mod tests {
     }
 
     #[test]
+    fn union_lock_canonicalizes_keys_and_releases_every_member() {
+        let sm = StateMachine::new();
+        let grant = acquire(&sm, &["z", "x", "x", "", "y"], "holder-1", false);
+        assert_eq!(grant["acquired"], true);
+        assert_eq!(grant["keys"], json!(["x", "y", "z"]));
+
+        for key in ["x", "y", "z"] {
+            let state = sm.lock_get(key);
+            assert_eq!(state.holder.as_deref(), Some("holder-1"));
+            assert_eq!(state.held_keys, vec!["x", "y", "z"]);
+        }
+
+        let release = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: grant["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(release.output["released"], true);
+
+        for key in ["x", "y", "z"] {
+            assert!(sm.lock_get(key).holder.is_none());
+        }
+    }
+
+    #[test]
+    fn no_wait_union_conflict_leaves_free_members_unheld_and_unqueued() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["x", "y"], "holder-1", false);
+        assert_eq!(first["acquired"], true);
+
+        let no_wait = acquire(&sm, &["y", "z"], "holder-2", false);
+        assert_eq!(no_wait["acquired"], false);
+        assert_eq!(no_wait["queued"], false);
+        assert_eq!(no_wait["conflicts"], json!(["y"]));
+        assert!(sm.lock_get("z").holder.is_none());
+        assert!(sm.lock_get("y").wait_queue.is_empty());
+
+        sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: first["fencing_token"].as_u64().unwrap(),
+        });
+
+        let retry = acquire(&sm, &["y", "z"], "holder-3", false);
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(sm.lock_get("z").holder.as_deref(), Some("holder-3"));
+    }
+
+    #[test]
+    fn stale_lock_holder_cannot_release_after_fifo_promotion() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["orders"], "holder-1", false);
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = acquire(&sm, &["orders"], "holder-2", true);
+        assert_eq!(queued["queued"], true);
+
+        let release = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        let token2 = release.output["promoted"][0]["fencing_token"]
+            .as_u64()
+            .unwrap();
+        assert!(token2 > token1);
+
+        let stale = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        assert_eq!(stale.output["released"], false);
+        assert_eq!(stale.output["reason"], "not_found");
+        assert_eq!(sm.lock_get("orders").holder.as_deref(), Some("holder-2"));
+    }
+
+    #[test]
+    fn expired_lock_grant_promotes_waiter_with_new_token() {
+        let sm = StateMachine::new();
+        let first = sm
+            .apply(Command::LockAcquire {
+                keys: vec!["lease-key".to_string()],
+                holder: "holder-1".to_string(),
+                ttl_ms: 50,
+                wait: false,
+            })
+            .output;
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = acquire(&sm, &["lease-key"], "holder-2", true);
+        assert_eq!(queued["queued"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let state = sm.lock_get("lease-key");
+        assert_eq!(state.holder.as_deref(), Some("holder-2"));
+        assert!(state.fencing_token.unwrap() > token1);
+        assert!(state.wait_queue.is_empty());
+    }
+
+    #[test]
     fn semaphore_caps_concurrent_holders_and_admits_in_fifo() {
         let sm = StateMachine::new();
-        let acq = |holder: &str, wait: bool| {
-            sm.apply(Command::SemaphoreAcquire {
-                key: "db-pool".to_string(),
-                holder: holder.to_string(),
-                limit: 2,
-                ttl_ms: 30_000,
-                wait,
-            })
-            .output
-        };
         // limit = 2: first two acquire, third is capped out and queues.
-        let a = acq("a", false);
-        let b = acq("b", false);
-        let c = acq("c", true);
+        let a = semaphore_acquire(&sm, "db-pool", "a", 2, false);
+        let b = semaphore_acquire(&sm, "db-pool", "b", 2, false);
+        let c = semaphore_acquire(&sm, "db-pool", "c", 2, true);
         assert_eq!(a["acquired"], true);
         assert_eq!(b["acquired"], true);
         assert_eq!(c["acquired"], false);
@@ -1448,6 +1551,55 @@ mod tests {
         let state = sm.semaphore_get("db-pool");
         assert_eq!(state.holders.len(), 2);
         assert!(state.holders.iter().any(|h| h.holder == "c"));
+    }
+
+    #[test]
+    fn semaphore_no_wait_over_cap_does_not_queue_or_consume_permit() {
+        let sm = StateMachine::new();
+        let first = semaphore_acquire(&sm, "pool", "holder-1", 1, false);
+        assert_eq!(first["acquired"], true);
+
+        let no_wait = semaphore_acquire(&sm, "pool", "holder-2", 1, false);
+        assert_eq!(no_wait["acquired"], false);
+        assert_eq!(no_wait["queued"], false);
+        let capped = sm.semaphore_get("pool");
+        assert_eq!(capped.holders.len(), 1);
+        assert!(capped.wait_queue.is_empty());
+
+        sm.apply(Command::SemaphoreRelease {
+            key: "pool".to_string(),
+            holder: "holder-1".to_string(),
+            fencing_token: first["fencing_token"].as_u64().unwrap(),
+        });
+
+        let retry = semaphore_acquire(&sm, "pool", "holder-3", 1, false);
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(sm.semaphore_get("pool").holders[0].holder, "holder-3");
+    }
+
+    #[test]
+    fn expired_semaphore_permit_promotes_fifo_waiter() {
+        let sm = StateMachine::new();
+        let first = sm
+            .apply(Command::SemaphoreAcquire {
+                key: "lease-pool".to_string(),
+                holder: "holder-1".to_string(),
+                limit: 1,
+                ttl_ms: 50,
+                wait: false,
+            })
+            .output;
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = semaphore_acquire(&sm, "lease-pool", "holder-2", 1, true);
+        assert_eq!(queued["queued"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let state = sm.semaphore_get("lease-pool");
+        assert_eq!(state.holders.len(), 1);
+        assert_eq!(state.holders[0].holder, "holder-2");
+        assert!(state.holders[0].fencing_token > token1);
+        assert!(state.wait_queue.is_empty());
     }
 
     #[test]
