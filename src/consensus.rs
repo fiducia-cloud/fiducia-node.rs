@@ -1092,8 +1092,14 @@ pub struct NodeStatus {
     pub node_id: String,
     pub peers: Vec<String>,
     pub shard_count: u32,
+    /// Count of hosted shards for which this node is currently leader.
+    pub leader_count: usize,
+    /// Count of hosted shards for which this node is currently follower.
+    pub follower_count: usize,
     /// Shards for which this node is currently the leader.
     pub leading_shards: Vec<ShardId>,
+    /// Shards for which this node is currently a follower.
+    pub following_shards: Vec<ShardId>,
     pub shards: Vec<ShardStatus>,
 }
 
