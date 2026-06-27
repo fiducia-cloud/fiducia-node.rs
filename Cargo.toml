@@ -28,5 +28,5 @@ fiducia-routing = { path = "../fiducia-routing.rs" }
 
 # Shared API payload/error contract (generated from fiducia-interfaces schemas).
 # The node's wire types (ProposeOutcome / ProposeError redirect, KvEntry, …) must
-# stay compatible with these; see the contract test in src/state.rs.
+# stay compatible with these; see the contract tests in src/consensus.rs.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
