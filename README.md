@@ -190,4 +190,5 @@ curl localhost:8090/v1/status        # per-shard role / term / commit index
 
 - [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane (placement, scaling, failure handling).
 - [`fiducia-node-sidecar.rs`](https://github.com/fiducia-cloud/fiducia-node-sidecar.rs) — per-node bridge to the brain + observability.
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website/marketing webserver.
+- [`fiducia-load-balance.rs`](https://github.com/fiducia-cloud/fiducia-load-balance.rs) — key-aware router that sends each request to the owning shard's leader.
+- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the customer portal/webserver.
