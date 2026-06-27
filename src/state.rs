@@ -495,6 +495,7 @@ impl StateMachine {
         ApplyResult { revision, output }
     }
 
+    #[allow(dead_code)]
     pub fn revision(&self) -> u64 {
         self.store.lock().unwrap().revision
     }
