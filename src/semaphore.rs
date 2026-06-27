@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Query, State},
     http::Uri,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -45,24 +45,29 @@ pub struct ReleaseBody {
     pub fencing_token: u64,
 }
 
-pub fn router() -> Router<Arc<Node>> {
-    // Key is in the JSON body for acquire/release (slash-safe); inspect uses a
-    // catch-all so the key may contain slashes (`pools/db/primary`).
-    Router::new()
-        .route("/acquire", post(acquire))
-        .route("/release", post(release))
-        .route("/*key", get(get_semaphore))
+#[derive(Debug, Deserialize)]
+pub struct KeyParam {
+    pub key: String,
 }
 
-/// `GET /v1/semaphores/{key}` — inspect permits, holders, and the wait queue.
+pub fn router() -> Router<Arc<Node>> {
+    // Keys never live in the URL path: in the JSON body for acquire/release, and
+    // `?key=` for inspect — both slash-safe.
+    Router::new()
+        .route("/", get(get_semaphore))
+        .route("/acquire", post(acquire))
+        .route("/release", post(release))
+}
+
+/// `GET /v1/semaphores?key=K` — inspect permits, holders, and the wait queue.
 async fn get_semaphore(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
+    Query(q): Query<KeyParam>,
 ) -> Response {
-    match node.query(ReadRequest::Semaphore { key: key.clone() }).await {
+    match node.query(ReadRequest::Semaphore { key: q.key.clone() }).await {
         Ok(ReadResponse::Semaphore(sem)) => {
-            Json(json!({ "key": key, "semaphore": sem })).into_response()
+            Json(json!({ "key": q.key, "semaphore": sem })).into_response()
         }
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
