@@ -1211,6 +1211,46 @@ mod tests {
 
     // --- response-shaping unit test (no cluster) --------------------------
 
+    // --- shared-interface contract (node wire types ⇄ fiducia-interfaces) -
+
+    #[test]
+    fn propose_error_redirect_is_wire_compatible_with_shared_interface() {
+        // The load balancer parses the node's NotLeader redirect via
+        // `fiducia_interfaces::ProposeError` to learn the leader to retry against.
+        // This pins that the node emits exactly the shape the LB consumes.
+        let node_err = ProposeError::NotLeader {
+            shard: 7,
+            leader: Some("http://leader-a:8090".to_string()),
+        };
+        let json = serde_json::to_value(&node_err).unwrap();
+        assert_eq!(json["reason"], "not_leader");
+        assert_eq!(json["shard"], 7);
+        assert_eq!(json["leader"], "http://leader-a:8090");
+
+        let shared: fiducia_interfaces::ProposeError = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            shared.reason,
+            fiducia_interfaces::ProposeErrorReason::NotLeader
+        ));
+        assert_eq!(shared.shard, 7);
+        assert_eq!(shared.leader.as_deref(), Some("http://leader-a:8090"));
+    }
+
+    #[test]
+    fn propose_outcome_is_wire_compatible_with_shared_interface() {
+        let outcome = ProposeOutcome {
+            shard: 3,
+            log_index: 42,
+            revision: 9,
+            output: serde_json::json!({ "ok": true }),
+        };
+        let shared: fiducia_interfaces::ProposeOutcome =
+            serde_json::from_value(serde_json::to_value(&outcome).unwrap()).unwrap();
+        assert_eq!(shared.shard, 3);
+        assert_eq!(shared.log_index, 42);
+        assert_eq!(shared.revision, 9);
+    }
+
     #[tokio::test]
     async fn not_leader_http_response_redirects_to_leader_and_names_shard() {
         let uri: Uri = "/v1/kv/orders/checkout?wait=true".parse().unwrap();
