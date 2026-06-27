@@ -1,0 +1,109 @@
+//! Counting semaphores — like a lock, but up to `limit` holders at once.
+//!
+//! A semaphore is the natural generalization of a mutex (`limit = 1`): N permits,
+//! handed out FIFO, each carrying a fencing token and a TTL lease. Use it to cap
+//! concurrency — a connection-pool size, a worker fan-out, a quota of in-flight
+//! jobs — where a plain lock (one holder) is too strict.
+//!
+//! Routes (mounted under `/v1/semaphores`):
+//!   * `GET  /v1/semaphores/{key}`          — limit, current holders, free permits, queue
+//!   * `POST /v1/semaphores/{key}/acquire`  — `{ holder, limit, ttl_ms?, wait? }`
+//!   * `POST /v1/semaphores/{key}/release`  — `{ holder, fencing_token }`
+
+use std::sync::Arc;
+
+use axum::{
+    extract::{Path, State},
+    http::Uri,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::state::Command;
+
+#[derive(Debug, Deserialize)]
+pub struct AcquireBody {
+    pub holder: Option<String>,
+    /// Maximum concurrent holders. Set on first use; may be re-tuned later.
+    pub limit: u32,
+    pub ttl_ms: Option<u64>,
+    pub wait: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseBody {
+    pub holder: String,
+    pub fencing_token: u64,
+}
+
+pub fn router() -> Router<Arc<Node>> {
+    Router::new()
+        .route("/:key", get(get_semaphore))
+        .route("/:key/acquire", post(acquire))
+        .route("/:key/release", post(release))
+}
+
+/// `GET /v1/semaphores/{key}` — inspect permits, holders, and the wait queue.
+async fn get_semaphore(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Path(key): Path<String>,
+) -> Response {
+    match node.query(ReadRequest::Semaphore { key: key.clone() }).await {
+        Ok(ReadResponse::Semaphore(sem)) => {
+            Json(json!({ "key": key, "semaphore": sem })).into_response()
+        }
+        Err(err) => read_error_response(err, &uri),
+        _ => Json(json!({ "error": "unavailable" })).into_response(),
+    }
+}
+
+/// `POST /v1/semaphores/{key}/acquire` — take a permit or join the FIFO queue.
+async fn acquire(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Path(key): Path<String>,
+    Json(body): Json<AcquireBody>,
+) -> Response {
+    let result = node
+        .propose(Command::SemaphoreAcquire {
+            key,
+            holder: body.holder.unwrap_or_else(|| "anonymous".to_string()),
+            limit: body.limit,
+            ttl_ms: body.ttl_ms.unwrap_or(30_000),
+            wait: body.wait.unwrap_or(false),
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
+/// `POST /v1/semaphores/{key}/release` — return one permit (admits the next waiter).
+async fn release(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Path(key): Path<String>,
+    Json(body): Json<ReleaseBody>,
+) -> Response {
+    let result = node
+        .propose(Command::SemaphoreRelease {
+            key,
+            holder: body.holder,
+            fencing_token: body.fencing_token,
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_builds() {
+        let _ = router();
+    }
+}
