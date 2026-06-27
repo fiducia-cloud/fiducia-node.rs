@@ -5,10 +5,13 @@
 //! concurrency — a connection-pool size, a worker fan-out, a quota of in-flight
 //! jobs — where a plain lock (one holder) is too strict.
 //!
+//! Keys travel in the JSON body for acquire/release (slash-safe); inspect uses a
+//! catch-all path, so keys may contain slashes (`pools/db/primary`).
+//!
 //! Routes (mounted under `/v1/semaphores`):
-//!   * `GET  /v1/semaphores/{key}`          — limit, current holders, free permits, queue
-//!   * `POST /v1/semaphores/{key}/acquire`  — `{ holder, limit, ttl_ms?, wait? }`
-//!   * `POST /v1/semaphores/{key}/release`  — `{ holder, fencing_token }`
+//!   * `POST /v1/semaphores/acquire`  — `{ key, holder, limit, ttl_ms?, wait? }`
+//!   * `POST /v1/semaphores/release`  — `{ key, holder, fencing_token }`
+//!   * `GET  /v1/semaphores/{key}`    — limit, current holders, free permits, queue
 
 use std::sync::Arc;
 
