@@ -52,7 +52,11 @@ async fn main() {
         .route("/status", get(status))
         .nest("/kv", kv::router())
         .nest("/elections", election::router())
-        .nest("/services", discovery::router());
+        .nest("/services", discovery::router())
+        .nest("/locks", locks::router())
+        .nest("/rw", locks::rw_router())
+        .nest("/ratelimit", ratelimit::router())
+        .nest("/cron", cron::router());
 
     let app = Router::new()
         .route("/healthz", get(health))
