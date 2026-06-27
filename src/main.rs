@@ -2,7 +2,8 @@
 //!
 //! A node hosts replicas of many shards (each an independent Raft group),
 //! leading some and following others, and exposes the coordination API over
-//! HTTP: config KV with watches, a leader-election API, and service discovery.
+//! HTTP: locks, rate limits, cron schedules, config KV, leader election, and
+//! service discovery.
 //!
 //! This is a **skeleton**: the routing, consensus, and state-machine shapes are
 //! in place; the per-command logic, replication, watches, and TTL expiry are
@@ -12,6 +13,9 @@ mod consensus;
 mod discovery;
 mod election;
 mod kv;
+mod locks;
+mod rate_limit;
+mod schedule;
 mod state;
 
 use std::net::SocketAddr;
@@ -26,7 +30,7 @@ use consensus::{Node, NodeConfig};
 const SERVICE: &str = "fiducia-node";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     // Bootstrap this node. Single-node by default; FIDUCIA_PEERS / shard count
@@ -43,6 +47,9 @@ async fn main() {
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
+        .nest("/locks", locks::router())
+        .nest("/rate-limit", rate_limit::router())
+        .nest("/cron", schedule::router())
         .nest("/elections", election::router())
         .nest("/services", discovery::router());
 
@@ -60,8 +67,9 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!("{SERVICE} listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn health() -> Json<Value> {
@@ -69,9 +77,7 @@ async fn health() -> Json<Value> {
 }
 
 /// `GET /v1/status` — per-shard consensus status for this node.
-async fn status(
-    axum::extract::State(node): axum::extract::State<Arc<Node>>,
-) -> Json<Value> {
+async fn status(axum::extract::State(node): axum::extract::State<Arc<Node>>) -> Json<Value> {
     Json(json!({
         "service": SERVICE,
         "version": env!("CARGO_PKG_VERSION"),

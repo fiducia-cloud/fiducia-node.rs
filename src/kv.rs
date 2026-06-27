@@ -17,13 +17,15 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
+    http::Uri,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_json, Node, ReadRequest, ReadResponse};
+use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -43,36 +45,39 @@ pub fn router() -> Router<Arc<Node>> {
 }
 
 /// `GET /v1/kv/{key}` — read one key.
-async fn get_key(State(node): State<Arc<Node>>, Path(key): Path<String>) -> Json<Value> {
+async fn get_key(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
     match node.query(ReadRequest::Kv { key: key.clone() }).await {
-        Some(ReadResponse::Kv(Some(entry))) => Json(json!({ "key": key, "found": true, "entry": entry })),
-        Some(ReadResponse::Kv(None)) => Json(json!({ "key": key, "found": false })),
-        _ => Json(json!({ "error": "unavailable" })),
+        Ok(ReadResponse::Kv(Some(entry))) => {
+            Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
+        }
+        Ok(ReadResponse::Kv(None)) => Json(json!({ "key": key, "found": false })).into_response(),
+        Err(err) => read_error_response(err, &uri),
+        _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
 /// `PUT /v1/kv/{key}` — upsert (optionally compare-and-swap).
 async fn put_key(
     State(node): State<Arc<Node>>,
+    uri: Uri,
     Path(key): Path<String>,
     Json(body): Json<PutBody>,
-) -> Json<Value> {
-    // TODO: honor body.prev_revision for compare-and-swap once apply is wired.
-    let _ = body.prev_revision;
+) -> Response {
     let result = node
         .propose(Command::KvPut {
             key,
             value: body.value,
             ttl_ms: body.ttl_ms,
+            prev_revision: body.prev_revision,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result, &uri)
 }
 
 /// `DELETE /v1/kv/{key}` — remove a key.
-async fn delete_key(State(node): State<Arc<Node>>, Path(key): Path<String>) -> Json<Value> {
+async fn delete_key(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
     let result = node.propose(Command::KvDelete { key }).await;
-    Json(propose_json(result))
+    propose_response(result, &uri)
 }
 
 /// `GET /v1/kv?prefix=...` — list keys under a prefix.

@@ -36,10 +36,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::{
+    http::{header::LOCATION, HeaderValue, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::state::{Command, KvEntry, Leadership, ServiceInstance, StateMachine};
+use crate::state::{
+    Command, KvEntry, Leadership, LockState, RateLimitSnapshot, Schedule, ScheduleRun,
+    ServiceInstance, StateMachine,
+};
 
 /// Identifier of a shard (one independent Raft group). Re-exported from the
 /// shared routing crate so the type and the `key → shard` mapping can't drift
@@ -87,7 +96,12 @@ impl Default for NodeConfig {
             node_id: std::env::var("FIDUCIA_NODE_ID").unwrap_or_else(|_| "node-a".to_string()),
             peers: std::env::var("FIDUCIA_PEERS")
                 .ok()
-                .map(|s| s.split(',').filter(|p| !p.is_empty()).map(String::from).collect())
+                .map(|s| {
+                    s.split(',')
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
                 .unwrap_or_default(),
             shard_count: std::env::var("FIDUCIA_SHARD_COUNT")
                 .ok()
@@ -112,14 +126,12 @@ pub enum ShardMsg {
     /// A read served off this shard's applied state.
     Query {
         request: ReadRequest,
-        resp: oneshot::Sender<ReadResponse>,
+        resp: oneshot::Sender<Result<ReadResponse, ProposeError>>,
     },
     /// An inbound peer Raft RPC, demuxed to this shard by the transport.
     Raft(RaftRpc),
     /// A request for this shard's consensus status.
-    Status {
-        resp: oneshot::Sender<ShardStatus>,
-    },
+    Status { resp: oneshot::Sender<ShardStatus> },
 }
 
 /// Peer-to-peer Raft messages (stub).
@@ -139,6 +151,10 @@ pub enum RaftRpc {
 /// out across shards itself.
 pub enum ReadRequest {
     Kv { key: String },
+    Lock { key: String },
+    RateLimit { tenant: String, key: String },
+    Schedule { name: String },
+    ScheduleHistory { name: String },
     Election { name: String },
     Service { service: String },
 }
@@ -148,6 +164,9 @@ impl ReadRequest {
     pub fn routing_key(&self) -> &str {
         match self {
             ReadRequest::Kv { key } => key,
+            ReadRequest::Lock { key } => key,
+            ReadRequest::RateLimit { key, .. } => key,
+            ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
             ReadRequest::Service { service } => service,
         }
@@ -155,8 +174,13 @@ impl ReadRequest {
 }
 
 /// The answer to a [`ReadRequest`], typed by domain.
+#[derive(Debug)]
 pub enum ReadResponse {
     Kv(Option<KvEntry>),
+    Lock(LockState),
+    RateLimit(Option<RateLimitSnapshot>),
+    Schedule(Option<Schedule>),
+    ScheduleHistory(Vec<ScheduleRun>),
     Election(Option<Leadership>),
     Service(Vec<ServiceInstance>),
 }
@@ -280,25 +304,46 @@ impl ShardActor {
 
         // Single-node fast path: a one-member quorum is satisfied immediately.
         self.commit_index = index;
-        let revision = self.state.apply(command);
+        let applied = self.state.apply(command);
 
         Ok(ProposeOutcome {
             shard: self.shard_id,
             log_index: index,
-            revision,
+            revision: applied.revision,
+            output: applied.output,
         })
     }
 
     /// Serve a read off applied state.
     ///
-    /// TODO(reads): call the state-machine read helpers; returns empty/None until
-    /// `StateMachine` reads (and `apply`) are implemented. TODO(cluster): gate
-    /// behind the leader lease for linearizability.
-    fn handle_query(&self, request: ReadRequest) -> ReadResponse {
+    /// TODO(cluster): gate behind the leader lease for linearizability once
+    /// multi-node Raft is wired.
+    fn handle_query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader {
+                shard: self.shard_id,
+                leader: self.leader_id.clone(),
+            });
+        }
+
         match request {
-            ReadRequest::Kv { .. } => ReadResponse::Kv(None),
-            ReadRequest::Election { .. } => ReadResponse::Election(None),
-            ReadRequest::Service { .. } => ReadResponse::Service(Vec::new()),
+            ReadRequest::Kv { key } => Ok(ReadResponse::Kv(self.state.kv_get(&key))),
+            ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
+            ReadRequest::RateLimit { tenant, key } => Ok(ReadResponse::RateLimit(
+                self.state.rate_limit_get(&tenant, &key),
+            )),
+            ReadRequest::Schedule { name } => {
+                Ok(ReadResponse::Schedule(self.state.schedule_get(&name)))
+            }
+            ReadRequest::ScheduleHistory { name } => Ok(ReadResponse::ScheduleHistory(
+                self.state.schedule_history(&name),
+            )),
+            ReadRequest::Election { name } => {
+                Ok(ReadResponse::Election(self.state.election_get(&name)))
+            }
+            ReadRequest::Service { service } => {
+                Ok(ReadResponse::Service(self.state.service_list(&service)))
+            }
         }
     }
 
@@ -395,14 +440,16 @@ impl Node {
 
     /// Serve a single-key read from the owning shard. `None` means the shard is
     /// unreachable on this node.
-    pub async fn query(&self, request: ReadRequest) -> Option<ReadResponse> {
+    pub async fn query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
         let shard = self.shard_for(request.routing_key());
-        let tx = self.sender(shard)?;
+        let Some(tx) = self.sender(shard) else {
+            return Err(ProposeError::Unavailable { shard });
+        };
         let (resp, rx) = oneshot::channel();
         if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
-            return None;
+            return Err(ProposeError::Unavailable { shard });
         }
-        rx.await.ok()
+        rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }))
     }
 
     /// Per-shard consensus status across all shards this node hosts.
@@ -467,25 +514,174 @@ pub struct ProposeOutcome {
     pub log_index: u64,
     /// Revision produced by applying the command to that shard's state machine.
     pub revision: u64,
+    /// Domain-specific output from the committed state-machine command.
+    pub output: Value,
 }
 
 /// Why a proposal could not be committed.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum ProposeError {
-    /// This node is not the leader of the target shard; retry against `leader`.
+    /// This node is not the leader of the target shard.
     NotLeader {
         shard: ShardId,
+        /// Reroutable leader base URL for the client/LB HTTP plane, when known.
         leader: Option<String>,
     },
     /// The target shard is not reachable on this node (no replica / actor gone).
     Unavailable { shard: ShardId },
 }
 
-/// Render a propose result as JSON for an HTTP response (shared by handlers).
-pub fn propose_json(result: Result<ProposeOutcome, ProposeError>) -> serde_json::Value {
+/// Render a proposal result as an HTTP response.
+///
+/// Followers return a redirect plus leader headers so the LB can repair a stale
+/// shard->leader cache without already knowing the current leader.
+pub fn propose_response(result: Result<ProposeOutcome, ProposeError>, uri: &Uri) -> Response {
     match result {
-        Ok(outcome) => serde_json::json!({ "committed": true, "result": outcome }),
-        Err(err) => serde_json::json!({ "committed": false, "error": err }),
+        Ok(outcome) => {
+            Json(serde_json::json!({ "committed": true, "result": outcome })).into_response()
+        }
+        Err(err) => error_response(err, uri),
+    }
+}
+
+pub fn read_error_response(err: ProposeError, uri: &Uri) -> Response {
+    error_response(err, uri)
+}
+
+fn error_response(err: ProposeError, uri: &Uri) -> Response {
+    match err {
+        ProposeError::NotLeader { shard, leader } => {
+            let body = Json(serde_json::json!({
+                "committed": false,
+                "error": {
+                    "reason": "not_leader",
+                    "shard": shard,
+                    "leader": leader,
+                }
+            }));
+            let mut response = (StatusCode::TEMPORARY_REDIRECT, body).into_response();
+            response
+                .headers_mut()
+                .insert("x-fiducia-not-leader", HeaderValue::from_static("true"));
+            response.headers_mut().insert(
+                "x-fiducia-shard",
+                HeaderValue::from_str(&shard.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            if let Some(leader) = leader {
+                if let Ok(value) = HeaderValue::from_str(&leader) {
+                    response.headers_mut().insert("x-fiducia-leader", value);
+                }
+                if let Some(location) = leader_location(&leader, uri) {
+                    if let Ok(value) = HeaderValue::from_str(&location) {
+                        response.headers_mut().insert(LOCATION, value);
+                    }
+                }
+            }
+            response
+        }
+        other => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "committed": false, "error": other })),
+        )
+            .into_response(),
+    }
+}
+
+fn leader_location(leader: &str, uri: &Uri) -> Option<String> {
+    if !(leader.starts_with("http://") || leader.starts_with("https://")) {
+        return None;
+    }
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    Some(format!("{}{}", leader.trim_end_matches('/'), path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+
+    fn command() -> Command {
+        Command::KvDelete {
+            key: "orders/checkout".to_string(),
+        }
+    }
+
+    fn follower() -> ShardActor {
+        let transport = Arc::new(Transport::new("follower-a".to_string(), vec![]));
+        let mut actor = ShardActor::new(7, "follower-a".to_string(), transport);
+        actor.role = Role::Follower;
+        actor.leader_id = Some("http://leader-a:8090".to_string());
+        actor
+    }
+
+    #[test]
+    fn follower_propose_returns_not_leader_with_known_leader() {
+        let mut actor = follower();
+        let err = actor
+            .handle_propose(command())
+            .expect_err("follower must reject writes");
+
+        match err {
+            ProposeError::NotLeader { shard, leader } => {
+                assert_eq!(shard, 7);
+                assert_eq!(leader.as_deref(), Some("http://leader-a:8090"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follower_query_returns_not_leader_with_known_leader() {
+        let actor = follower();
+        let err = actor
+            .handle_query(ReadRequest::Kv {
+                key: "orders/checkout".to_string(),
+            })
+            .expect_err("follower must reject linearizable reads");
+
+        match err {
+            ProposeError::NotLeader { shard, leader } => {
+                assert_eq!(shard, 7);
+                assert_eq!(leader.as_deref(), Some("http://leader-a:8090"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn not_leader_http_response_redirects_to_leader_and_names_shard() {
+        let uri: Uri = "/v1/kv/orders/checkout?wait=true".parse().unwrap();
+        let response = propose_response(
+            Err(ProposeError::NotLeader {
+                shard: 7,
+                leader: Some("http://leader-a:8090".to_string()),
+            }),
+            &uri,
+        );
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get("x-fiducia-not-leader").unwrap(),
+            "true"
+        );
+        assert_eq!(response.headers().get("x-fiducia-shard").unwrap(), "7");
+        assert_eq!(
+            response.headers().get("x-fiducia-leader").unwrap(),
+            "http://leader-a:8090"
+        );
+        assert_eq!(
+            response.headers().get(LOCATION).unwrap(),
+            "http://leader-a:8090/v1/kv/orders/checkout?wait=true"
+        );
+
+        let body = to_bytes(Body::from(response.into_body()), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["reason"], "not_leader");
+        assert_eq!(json["error"]["leader"], "http://leader-a:8090");
+        assert_eq!(json["error"]["shard"], 7);
     }
 }
