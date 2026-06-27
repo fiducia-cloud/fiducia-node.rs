@@ -134,13 +134,22 @@ pub enum Command {
 /// atomically and detect that it conflicts with a holder of `{B}`, one state
 /// machine must see every member key together. Routing every lock/semaphore
 /// command to a single coordinator (the live-mutex single-broker model) gives
-/// exactly that. KV/rate-limit/discovery/etc. stay sharded by their own key.
+/// exactly that. KV/rate-limit/etc. stay sharded by their own key; service
+/// discovery has its own coordinator because listing service names is global.
 /// Sharding the lock space across coordinators (cross-shard 2PC for sets that
 /// span them) is the documented scaling path.
 ///
 /// Defined in the shared [`fiducia_routing`] crate so the node, the load
 /// balancer, and the brain route locks to the **same** coordinator shard.
 pub const LOCK_DOMAIN: &str = fiducia_routing::LOCK_COORDINATION_KEY;
+
+/// Routing key under which all service-discovery state lives.
+///
+/// This keeps `GET /v1/services` linearizable without asking every shard leader
+/// for a partial service-name list. Individual service lookups still return one
+/// service's instances, but all discovery mutations and reads meet in the same
+/// replicated state machine.
+pub const SERVICE_DOMAIN: &str = fiducia_routing::SERVICE_DISCOVERY_KEY;
 
 impl Command {
     /// Key used to route this command to its owning shard.
@@ -157,9 +166,9 @@ impl Command {
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
-            Command::ServiceRegister { service, .. }
-            | Command::ServiceHeartbeat { service, .. }
-            | Command::ServiceDeregister { service, .. } => service,
+            Command::ServiceRegister { .. }
+            | Command::ServiceHeartbeat { .. }
+            | Command::ServiceDeregister { .. } => SERVICE_DOMAIN,
         }
     }
 }
@@ -561,6 +570,14 @@ impl StateMachine {
             .map(|instances| instances.values().cloned().collect())
             .unwrap_or_default()
     }
+
+    pub fn service_names(&self) -> Vec<String> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut names: Vec<String> = store.services.keys().cloned().collect();
+        names.sort();
+        names
+    }
 }
 
 impl Store {
@@ -605,6 +622,7 @@ impl Store {
         for instances in self.services.values_mut() {
             instances.retain(|_, instance| instance.lease_expires_ms > now);
         }
+        self.services.retain(|_, instances| !instances.is_empty());
     }
 
     fn apply_kv_put(
@@ -1190,6 +1208,14 @@ impl Store {
             .get_mut(&service)
             .map(|instances| instances.remove(&instance_id).is_some())
             .unwrap_or(false);
+        if self
+            .services
+            .get(&service)
+            .map(|instances| instances.is_empty())
+            .unwrap_or(false)
+        {
+            self.services.remove(&service);
+        }
         json!({ "deregistered": removed, "service": service, "instance_id": instance_id })
     }
 
@@ -1605,5 +1631,76 @@ mod tests {
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].metadata["region"], "us-east-1");
         assert!(instances[0].lease_expires_ms >= initial_expiry);
+    }
+
+    #[test]
+    fn service_names_are_sorted_and_pruned_when_empty() {
+        let sm = StateMachine::new();
+        sm.apply(Command::ServiceRegister {
+            service: "worker".to_string(),
+            instance_id: "w-1".to_string(),
+            address: "http://10.0.0.2:8080".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
+        });
+        sm.apply(Command::ServiceRegister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+            address: "http://10.0.0.1:8080".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
+        });
+
+        assert_eq!(
+            sm.service_names(),
+            vec!["api".to_string(), "worker".to_string()]
+        );
+
+        sm.apply(Command::ServiceDeregister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+        });
+
+        assert_eq!(sm.service_names(), vec!["worker".to_string()]);
+        assert!(sm.service_list("api").is_empty());
+    }
+
+    #[test]
+    fn expired_service_instances_leave_no_stale_service_name() {
+        let sm = StateMachine::new();
+        sm.apply(Command::ServiceRegister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+            address: "http://10.0.0.1:8080".to_string(),
+            ttl_ms: 0,
+            metadata: HashMap::new(),
+        });
+
+        assert!(sm.service_list("api").is_empty());
+        assert!(sm.service_names().is_empty());
+    }
+
+    #[test]
+    fn service_discovery_routes_to_the_registry_coordination_domain() {
+        for command in [
+            Command::ServiceRegister {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+                address: "http://10.0.0.1:8080".to_string(),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            },
+            Command::ServiceHeartbeat {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+                ttl_ms: None,
+            },
+            Command::ServiceDeregister {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+            },
+        ] {
+            assert_eq!(command.routing_key(), SERVICE_DOMAIN);
+        }
     }
 }

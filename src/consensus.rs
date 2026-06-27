@@ -196,6 +196,7 @@ pub enum ReadRequest {
     Schedule { name: String },
     ScheduleHistory { name: String },
     Election { name: String },
+    Services,
     Service { service: String },
 }
 
@@ -209,7 +210,7 @@ impl ReadRequest {
             ReadRequest::RateLimit { key, .. } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
-            ReadRequest::Service { service } => service,
+            ReadRequest::Services | ReadRequest::Service { .. } => crate::state::SERVICE_DOMAIN,
         }
     }
 }
@@ -224,6 +225,7 @@ pub enum ReadResponse {
     Schedule(Option<Schedule>),
     ScheduleHistory(Vec<ScheduleRun>),
     Election(Option<Leadership>),
+    Services(Vec<String>),
     Service(Vec<ServiceInstance>),
 }
 
@@ -850,6 +852,7 @@ impl ShardActor {
             ReadRequest::Election { name } => {
                 Ok(ReadResponse::Election(self.state.election_get(&name)))
             }
+            ReadRequest::Services => Ok(ReadResponse::Services(self.state.service_names())),
             ReadRequest::Service { service } => {
                 Ok(ReadResponse::Service(self.state.service_list(&service)))
             }

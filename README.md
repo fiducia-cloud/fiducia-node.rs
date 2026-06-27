@@ -88,7 +88,8 @@ by-key request — it's always `?key=`, never a per-endpoint path shape.
 > detecting it conflicts with a holder of `{b}` requires one state machine to see
 > every member key together. So **all** lock/semaphore state lives in a single
 > Raft group (the `LOCK_DOMAIN` routing key) — the single-broker model live-mutex
-> uses. KV / rate-limit / discovery stay sharded by their own key. Sharding the
+> uses. KV / rate-limit stay sharded by their own key; service discovery uses a
+> registry coordinator so service names can be listed linearizably. Sharding the
 > lock space itself (cross-shard 2PC for sets that span coordinators) is the
 > documented scaling path.
 

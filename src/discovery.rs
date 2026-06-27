@@ -1,11 +1,11 @@
-//! Service discovery (skeleton handlers).
+//! Service discovery handlers.
 //!
 //! A registry of live service instances with TTL-based health: instances
 //! register an address, heartbeat to stay listed, and silently drop out when
 //! their lease expires (crash-safe — no stale endpoints). Mutations are proposed
-//! to the shard owning the service name; reads go through [`Node::query`]. A
-//! service's instances all route to one shard, so listing a service is a
-//! single-shard read.
+//! to the service-discovery coordinator shard; reads go through [`Node::query`].
+//! That keeps the service-name registry linearizable while still allowing each
+//! service lookup to return only that service's live instances.
 //!
 //! Routes (mounted under `/v1/services`):
 //!   * `GET    /v1/services`                                  — list services
@@ -56,9 +56,14 @@ pub fn router() -> Router<Arc<Node>> {
 }
 
 /// `GET /v1/services` — list known service names.
-async fn list_services(State(_node): State<Arc<Node>>) -> Json<Value> {
-    // TODO: services span shards, so this fans out across shards and merges.
-    Json(json!({ "error": "not_implemented", "op": "discovery.list_services" }))
+async fn list_services(State(node): State<Arc<Node>>, uri: Uri) -> Response {
+    match node.query(ReadRequest::Services).await {
+        Ok(ReadResponse::Services(services)) => {
+            Json(json!({ "services": services })).into_response()
+        }
+        Err(err) => read_error_response(err, &uri),
+        _ => Json(json!({ "error": "unavailable" })).into_response(),
+    }
 }
 
 /// `GET /v1/services/{service}` — list live (unexpired) instances.
