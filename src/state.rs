@@ -158,6 +158,15 @@ impl StateMachine {
             Command::ServiceRegister { .. } => { /* TODO: upsert instance */ }
             Command::ServiceHeartbeat { .. } => { /* TODO: extend instance lease */ }
             Command::ServiceDeregister { .. } => { /* TODO: remove instance */ }
+            Command::LockAcquire { .. } => { /* TODO: grant if under max + no writer; assign fencing token + lock_id; else FIFO-queue (blocking) */ }
+            Command::LockRelease { .. } => { /* TODO: release by lock_id; wake next FIFO waiter */ }
+            Command::RwAcquireRead { .. } => { /* TODO: grant read if no writer held/queued */ }
+            Command::RwEndRead { .. } => { /* TODO: drop reader; maybe promote a waiting writer */ }
+            Command::RwAcquireWrite { .. } => { /* TODO: grant write if no readers/writer */ }
+            Command::RwEndWrite { .. } => { /* TODO: drop writer; wake next waiter */ }
+            Command::RateLimitConsume { .. } => { /* TODO: token-bucket / sliding-window check-and-decrement */ }
+            Command::CronCreate { .. } => { /* TODO: store schedule; leader fires once; durable run history + retries */ }
+            Command::CronDelete { .. } => { /* TODO: remove schedule */ }
         }
 
         store.revision
