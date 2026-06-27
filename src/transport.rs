@@ -116,7 +116,12 @@ impl LoopbackRegistry {
     }
 
     fn sender(&self, node_id: &str, shard: ShardId) -> Option<mpsc::Sender<ShardMsg>> {
-        self.nodes.lock().unwrap().get(node_id)?.get(&shard).cloned()
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(node_id)?
+            .get(&shard)
+            .cloned()
     }
 }
 
@@ -171,12 +176,23 @@ impl Transport {
             Transport::Loopback(reg) => {
                 let inbox = reg.sender(peer, shard)?;
                 let (resp, rx) = oneshot::channel();
-                inbox.send(ShardMsg::AppendEntries { req, resp }).await.ok()?;
+                inbox
+                    .send(ShardMsg::AppendEntries { req, resp })
+                    .await
+                    .ok()?;
                 rx.await.ok()
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/append");
-                client.post(url).json(&req).send().await.ok()?.json().await.ok()
+                client
+                    .post(url)
+                    .json(&req)
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()
             }
         }
     }
@@ -197,7 +213,15 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/vote");
-                client.post(url).json(&req).send().await.ok()?.json().await.ok()
+                client
+                    .post(url)
+                    .json(&req)
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()
             }
         }
     }

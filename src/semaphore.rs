@@ -65,7 +65,10 @@ async fn get_semaphore(
     uri: Uri,
     Query(q): Query<KeyParam>,
 ) -> Response {
-    match node.query(ReadRequest::Semaphore { key: q.key.clone() }).await {
+    match node
+        .query(ReadRequest::Semaphore { key: q.key.clone() })
+        .await
+    {
         Ok(ReadResponse::Semaphore(sem)) => {
             Json(json!({ "key": q.key, "semaphore": sem })).into_response()
         }
@@ -111,9 +114,28 @@ async fn release(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn router_builds() {
         let _ = router();
+    }
+
+    #[test]
+    fn acquire_body_accepts_slash_safe_key_and_limit() {
+        let body: AcquireBody = serde_json::from_value(json!({
+            "key": "pools/db/primary",
+            "holder": "worker-a",
+            "limit": 3,
+            "ttl_ms": 45_000,
+            "wait": true
+        }))
+        .unwrap();
+
+        assert_eq!(body.key, "pools/db/primary");
+        assert_eq!(body.holder.as_deref(), Some("worker-a"));
+        assert_eq!(body.limit, 3);
+        assert_eq!(body.ttl_ms, Some(45_000));
+        assert_eq!(body.wait, Some(true));
     }
 }
