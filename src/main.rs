@@ -14,9 +14,12 @@ mod discovery;
 mod election;
 mod kv;
 mod locks;
+mod raft_api;
 mod rate_limit;
 mod schedule;
+mod semaphore;
 mod state;
+mod transport;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
