@@ -58,7 +58,7 @@ async fn put_key(
     State(node): State<Arc<Node>>,
     Path(key): Path<String>,
     Json(body): Json<PutBody>,
-) -> Json<Value> {
+) -> Response {
     // TODO: honor body.prev_revision for compare-and-swap once apply is wired.
     let _ = body.prev_revision;
     let result = node
@@ -68,7 +68,7 @@ async fn put_key(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `DELETE /v1/kv/{key}` — remove a key.
