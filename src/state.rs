@@ -162,6 +162,28 @@ impl Command {
             | Command::ServiceDeregister { service, .. } => service,
         }
     }
+
+    /// Short, stable label for this command's operation kind — used as the `op`
+    /// attribute on telemetry spans/events so traces group by primitive.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::KvPut { .. } => "kv.put",
+            Command::KvDelete { .. } => "kv.delete",
+            Command::LockAcquire { .. } => "lock.acquire",
+            Command::LockRelease { .. } => "lock.release",
+            Command::SemaphoreAcquire { .. } => "semaphore.acquire",
+            Command::SemaphoreRelease { .. } => "semaphore.release",
+            Command::RateLimitCheck { .. } => "ratelimit.check",
+            Command::ScheduleUpsert { .. } => "schedule.upsert",
+            Command::ScheduleRecordRun { .. } => "schedule.record_run",
+            Command::ElectionCampaign { .. } => "election.campaign",
+            Command::ElectionRenew { .. } => "election.renew",
+            Command::ElectionResign { .. } => "election.resign",
+            Command::ServiceRegister { .. } => "service.register",
+            Command::ServiceHeartbeat { .. } => "service.heartbeat",
+            Command::ServiceDeregister { .. } => "service.deregister",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
