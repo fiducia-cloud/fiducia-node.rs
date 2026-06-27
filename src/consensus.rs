@@ -935,19 +935,55 @@ impl Node {
     /// Propose a command to the Raft group of the shard that owns its key. Returns
     /// once the entry **commits** on a quorum (or fast on not-leader/timeout).
     pub async fn propose(&self, command: Command) -> Result<ProposeOutcome, ProposeError> {
-        let shard = self.shard_for(command.routing_key());
-        let Some(tx) = self.sender(shard) else {
-            return Err(ProposeError::Unavailable { shard });
-        };
-        let (resp, rx) = oneshot::channel();
-        if tx.send(ShardMsg::Propose { command, resp }).await.is_err() {
-            return Err(ProposeError::Unavailable { shard });
+        // Telemetry: capture the op label + routing key BEFORE the command is moved
+        // into the shard actor, so every lock/semaphore/kv write emits one outcome
+        // event with op/key/shard/latency. This single chokepoint covers all writes.
+        let op = command.kind();
+        let routing_key = command.routing_key().to_string();
+        let shard = self.shard_for(&routing_key);
+        let started = std::time::Instant::now();
+        let result = async {
+            let Some(tx) = self.sender(shard) else {
+                return Err(ProposeError::Unavailable { shard });
+            };
+            let (resp, rx) = oneshot::channel();
+            if tx.send(ShardMsg::Propose { command, resp }).await.is_err() {
+                return Err(ProposeError::Unavailable { shard });
+            }
+            match tokio::time::timeout(COMMIT_WAIT, rx).await {
+                Ok(Ok(result)) => result,
+                // Sender dropped (actor gone) or commit timed out.
+                _ => Err(ProposeError::Unavailable { shard }),
+            }
         }
-        match tokio::time::timeout(COMMIT_WAIT, rx).await {
-            Ok(Ok(result)) => result,
-            // Sender dropped (actor gone) or commit timed out.
-            _ => Err(ProposeError::Unavailable { shard }),
+        .await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+        match &result {
+            Ok(_) => tracing::info!(
+                op,
+                shard = ?shard,
+                key = %routing_key,
+                elapsed_ms,
+                committed = true,
+                "propose committed"
+            ),
+            Err(ProposeError::NotLeader { leader, .. }) => tracing::debug!(
+                op,
+                shard = ?shard,
+                key = %routing_key,
+                elapsed_ms,
+                leader = leader.as_deref().unwrap_or("unknown"),
+                "propose redirected: this node is not the shard leader"
+            ),
+            Err(ProposeError::Unavailable { .. }) => tracing::warn!(
+                op,
+                shard = ?shard,
+                key = %routing_key,
+                elapsed_ms,
+                "propose unavailable: shard not hosted here or commit lost quorum"
+            ),
         }
+        result
     }
 
     /// Serve a single-key read from the owning shard.
