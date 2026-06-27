@@ -511,6 +511,12 @@ impl StateMachine {
         store.lock_snapshot(key)
     }
 
+    pub fn semaphore_get(&self, key: &str) -> SemaphoreState {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store.semaphore_snapshot(key)
+    }
+
     pub fn rate_limit_get(&self, tenant: &str, key: &str) -> Option<RateLimitSnapshot> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
