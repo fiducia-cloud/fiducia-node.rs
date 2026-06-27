@@ -14,9 +14,12 @@ mod discovery;
 mod election;
 mod kv;
 mod locks;
+mod raft_api;
 mod rate_limit;
 mod schedule;
+mod semaphore;
 mod state;
+mod transport;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,12 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.shard_count,
         config.peers
     );
-    let node = Arc::new(Node::bootstrap(config));
+    let node = Arc::new(Node::bootstrap_http(config));
 
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
         .nest("/locks", locks::router())
+        .nest("/semaphores", semaphore::router())
         .nest("/rate-limit", rate_limit::router())
         .nest("/ratelimit", rate_limit::router())
         .nest("/cron", schedule::router())
@@ -63,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .nest("/v1", v1)
+        // Internal node↔node Raft RPC (peer transport server side); not under /v1.
+        .nest("/raft", raft_api::router())
         .with_state(node)
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.

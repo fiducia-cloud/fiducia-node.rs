@@ -1,37 +1,40 @@
-//! Mutual-exclusion locks.
+//! Mutual-exclusion locks — single-key **and** multi-key **union** locks.
+//!
+//! A lock can cover a *set* of keys: acquiring `{a, b, c}` succeeds only when
+//! every member is free, and conflicts with anyone holding *any* of them. The
+//! grant is atomic (all-or-nothing) and the wait queue is FIFO and deadlock-free
+//! (see [`crate::state`]). This is Fiducia's flagship primitive — the
+//! live-mutex "lock on a combination of keys" model, made linearizable by Raft.
+//!
+//! Keys never live in the URL path — acquire/release carry them in the JSON body
+//! (a union may be many keys), inspect takes `?key=` — so they may contain
+//! slashes (`orders/42`).
 //!
 //! Routes (mounted under `/v1/locks`):
-//!   * `POST /v1/locks/acquire`       — advertised body-key acquire endpoint
-//!   * `GET  /v1/locks/{key}`         — inspect holder, fencing token, lease, queue
-//!   * `POST /v1/locks/{key}/acquire` — try or queue for the lock
-//!   * `POST /v1/locks/{key}/release` — release with holder + fencing token
-//!   * `GET  /v1/locks/{key}/watch`   — SSE placeholder for lock changes
+//!   * `POST /v1/locks/acquire`     — union acquire: `{ keys:[..]|key, holder, ttl_ms?, wait? }`
+//!   * `POST /v1/locks/release`     — release by `{ holder, fencing_token }`
+//!   * `GET  /v1/locks?key=K`       — inspect a member key: holder, the held union, queue
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Query, State},
     http::Uri,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
-#[derive(Debug, Deserialize)]
+/// Acquire body. Supply `keys` for a union lock, or `key` for a single-key lock.
+#[derive(Debug, Default, Deserialize)]
 pub struct AcquireBody {
-    pub holder: Option<String>,
-    pub ttl_ms: Option<u64>,
-    pub wait: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AcquireWithKeyBody {
-    pub key: String,
+    pub keys: Option<Vec<String>>,
+    pub key: Option<String>,
     pub holder: Option<String>,
     pub ttl_ms: Option<u64>,
     pub wait: Option<bool>,
@@ -43,88 +46,80 @@ pub struct ReleaseBody {
     pub fencing_token: u64,
 }
 
-pub fn router() -> Router<Arc<Node>> {
-    Router::new()
-        .route("/acquire", post(acquire_with_body_key))
-        .route("/:key", get(get_lock))
-        .route("/:key/acquire", post(acquire))
-        .route("/:key/release", post(release))
-        .route("/:key/watch", get(watch))
+#[derive(Debug, Deserialize)]
+pub struct KeyParam {
+    pub key: String,
 }
 
-/// `GET /v1/locks/{key}` — inspect lock state and FIFO wait queue.
-async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
-    match node.query(ReadRequest::Lock { key: key.clone() }).await {
-        Ok(ReadResponse::Lock(lock)) => Json(json!({ "key": key, "lock": lock })).into_response(),
+pub fn router() -> Router<Arc<Node>> {
+    // Keys never live in the URL path: acquire/release carry them in the JSON body
+    // (a union may be many keys), and inspect takes `?key=` — both slash-safe.
+    Router::new()
+        .route("/", get(get_lock))
+        .route("/acquire", post(acquire_union))
+        .route("/release", post(release_token))
+}
+
+/// `GET /v1/locks?key=K` — inspect lock state for one member key.
+async fn get_lock(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Query(q): Query<KeyParam>,
+) -> Response {
+    match node.query(ReadRequest::Lock { key: q.key.clone() }).await {
+        Ok(ReadResponse::Lock(lock)) => {
+            Json(json!({ "key": q.key, "lock": lock })).into_response()
+        }
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
-/// `POST /v1/locks/{key}/acquire` — acquire immediately or join FIFO queue.
-async fn acquire(
+/// `POST /v1/locks/acquire` — acquire the union of `keys` (or a single `key`).
+async fn acquire_union(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
     Json(body): Json<AcquireBody>,
 ) -> Response {
-    acquire_key(
-        node,
-        uri,
-        key,
-        body.holder,
-        body.ttl_ms,
-        body.wait.unwrap_or(false),
-    )
-    .await
+    let keys = body
+        .keys
+        .clone()
+        .or_else(|| body.key.clone().map(|k| vec![k]))
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no_keys", "detail": "provide `keys` or `key`" })),
+        )
+            .into_response();
+    }
+    acquire(node, uri, keys, body).await
 }
 
-/// `POST /v1/locks/acquire` — compatibility route with key in JSON.
-async fn acquire_with_body_key(
-    State(node): State<Arc<Node>>,
-    uri: Uri,
-    Json(body): Json<AcquireWithKeyBody>,
-) -> Response {
-    acquire_key(
-        node,
-        uri,
-        body.key,
-        body.holder,
-        body.ttl_ms,
-        body.wait.unwrap_or(false),
-    )
-    .await
-}
-
-async fn acquire_key(
-    node: Arc<Node>,
-    uri: Uri,
-    key: String,
-    holder: Option<String>,
-    ttl_ms: Option<u64>,
-    wait: bool,
-) -> Response {
+async fn acquire(node: Arc<Node>, uri: Uri, keys: Vec<String>, body: AcquireBody) -> Response {
     let result = node
         .propose(Command::LockAcquire {
-            key,
-            holder: holder.unwrap_or_else(|| "anonymous".to_string()),
-            ttl_ms: ttl_ms.unwrap_or(30_000),
-            wait,
+            keys,
+            holder: body.holder.unwrap_or_else(|| "anonymous".to_string()),
+            ttl_ms: body.ttl_ms.unwrap_or(30_000),
+            wait: body.wait.unwrap_or(false),
         })
         .await;
     propose_response(result, &uri)
 }
 
-/// `POST /v1/locks/{key}/release` — release only with the current fencing token.
-async fn release(
+/// `POST /v1/locks/release` — release a (possibly multi-key) grant by token.
+async fn release_token(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
     Json(body): Json<ReleaseBody>,
 ) -> Response {
+    release(node, uri, body).await
+}
+
+async fn release(node: Arc<Node>, uri: Uri, body: ReleaseBody) -> Response {
     let result = node
         .propose(Command::LockRelease {
-            key,
             holder: body.holder,
             fencing_token: body.fencing_token,
         })
@@ -132,17 +127,12 @@ async fn release(
     propose_response(result, &uri)
 }
 
-/// `GET /v1/locks/{key}/watch` — SSE stream of lock changes.
-async fn watch(State(_node): State<Arc<Node>>, Path(_key): Path<String>) -> Json<Value> {
-    Json(json!({ "error": "not_implemented", "op": "locks.watch" }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn router_builds_with_advertised_alias_and_keyed_routes() {
+    fn router_builds_with_union_and_single_key_routes() {
         let _ = router();
     }
 }

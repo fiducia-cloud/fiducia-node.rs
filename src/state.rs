@@ -29,14 +29,37 @@ pub enum Command {
         key: String,
     },
 
-    // --- Mutual-exclusion locks -------------------------------------------
+    // --- Mutual-exclusion locks (multi-key UNION) -------------------------
+    /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
+    /// the grant conflicts with anyone holding *any* of those keys, and is queued
+    /// (FIFO, deadlock-free) until *every* member key is free. A single-key lock
+    /// is just `keys = [k]`. This is the live-mutex "lock on a combination of
+    /// keys" primitive. See [`LOCK_DOMAIN`] for why these route together.
     LockAcquire {
-        key: String,
+        keys: Vec<String>,
         holder: String,
         ttl_ms: u64,
         wait: bool,
     },
+    /// Release a held lock by its fencing token, freeing every member key at once
+    /// and promoting the next grantable waiter(s).
     LockRelease {
+        holder: String,
+        fencing_token: u64,
+    },
+
+    // --- Counting semaphores ----------------------------------------------
+    /// Acquire one permit of a counting semaphore `key` that admits up to `limit`
+    /// concurrent holders. Beyond the cap, callers queue (FIFO) when `wait`.
+    SemaphoreAcquire {
+        key: String,
+        holder: String,
+        limit: u32,
+        ttl_ms: u64,
+        wait: bool,
+    },
+    /// Release one held permit by its fencing token, admitting the next waiter.
+    SemaphoreRelease {
         key: String,
         holder: String,
         fencing_token: u64,
@@ -104,14 +127,28 @@ pub enum Command {
     },
 }
 
+/// Routing key under which **all** lock + semaphore state lives, so the entire
+/// lock service is one linearizable Raft group (one shard leader).
+///
+/// This is the price of correct multi-key **union** locking: to grant `{A,B,C}`
+/// atomically and detect that it conflicts with a holder of `{B}`, one state
+/// machine must see every member key together. Routing every lock/semaphore
+/// command to a single coordinator (the live-mutex single-broker model) gives
+/// exactly that. KV/rate-limit/discovery/etc. stay sharded by their own key.
+/// Sharding the lock space across coordinators (cross-shard 2PC for sets that
+/// span them) is the documented scaling path.
+pub const LOCK_DOMAIN: &str = "\u{0}fiducia-lock-coordinator";
+
 impl Command {
     /// Key used to route this command to its owning shard.
     pub fn routing_key(&self) -> &str {
         match self {
+            Command::LockAcquire { .. }
+            | Command::LockRelease { .. }
+            | Command::SemaphoreAcquire { .. }
+            | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
-            | Command::LockAcquire { key, .. }
-            | Command::LockRelease { key, .. }
             | Command::RateLimitCheck { key, .. } => key,
             Command::ScheduleUpsert { name, .. } | Command::ScheduleRecordRun { name, .. } => name,
             Command::ElectionCampaign { name, .. }
@@ -161,35 +198,96 @@ pub struct KvEntry {
     pub expires_at_ms: Option<u64>,
 }
 
-/// Current lock state for a key.
+/// Read view of one lock **member key**: who holds it, the whole set held with it
+/// (the acquired union), and who is queued behind it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LockState {
     pub key: String,
     pub holder: Option<String>,
     pub fencing_token: Option<u64>,
     pub lease_expires_ms: Option<u64>,
+    /// Every member key held together by the current holder (the union grant).
+    pub held_keys: Vec<String>,
+    /// Holders queued on a set that includes this key, in FIFO order.
     pub wait_queue: Vec<LockWaiter>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LockWaiter {
     pub holder: String,
+    /// The full key set this waiter is trying to acquire.
+    pub keys: Vec<String>,
     pub requested_ms: u64,
 }
 
+/// One held union-lock acquisition.
 #[derive(Debug, Clone)]
-struct QueuedLockWaiter {
+struct LockGrant {
     holder: String,
-    requested_ms: u64,
+    keys: Vec<String>,
+    fencing_token: u64,
+    lease_expires_ms: u64,
+}
+
+/// One queued union-lock request awaiting its whole key set.
+#[derive(Debug, Clone)]
+struct QueuedLock {
+    holder: String,
+    keys: Vec<String>,
     ttl_ms: u64,
+    requested_ms: u64,
+}
+
+/// The multi-key lock table: which member key is held by which grant, the grants
+/// themselves, and the FIFO wait queue of whole requests.
+#[derive(Default)]
+struct LockManager {
+    /// member key → owning grant's fencing token.
+    held: HashMap<String, u64>,
+    /// fencing token → grant.
+    grants: HashMap<u64, LockGrant>,
+    /// FIFO queue of requests waiting for their full union to be free.
+    queue: VecDeque<QueuedLock>,
+}
+
+/// Read view of a counting semaphore.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemaphoreState {
+    pub key: String,
+    pub limit: u32,
+    pub holders: Vec<SemaphoreHolder>,
+    /// Free permits right now (`limit - holders`, floored at 0).
+    pub available: u32,
+    pub wait_queue: Vec<LockWaiter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemaphoreHolder {
+    pub holder: String,
+    pub fencing_token: u64,
+    pub lease_expires_ms: u64,
 }
 
 #[derive(Debug, Clone)]
-struct LockRecord {
-    holder: Option<String>,
-    fencing_token: Option<u64>,
-    lease_expires_ms: Option<u64>,
-    wait_queue: VecDeque<QueuedLockWaiter>,
+struct SemaphoreSlot {
+    holder: String,
+    fencing_token: u64,
+    lease_expires_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedPermit {
+    holder: String,
+    ttl_ms: u64,
+    requested_ms: u64,
+}
+
+/// A counting semaphore: up to `limit` permits, plus a FIFO queue for the rest.
+#[derive(Debug, Clone)]
+struct Semaphore {
+    limit: u32,
+    holders: Vec<SemaphoreSlot>,
+    queue: VecDeque<QueuedPermit>,
 }
 
 /// Distributed rate-limit snapshot.
@@ -263,7 +361,8 @@ struct Store {
     revision: u64,
     next_fencing_token: u64,
     kv: HashMap<String, KvEntry>,
-    locks: HashMap<String, LockRecord>,
+    locks: LockManager,
+    semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
     elections: HashMap<String, Leadership>,
     schedules: HashMap<String, ScheduleRecord>,
@@ -301,16 +400,27 @@ impl StateMachine {
                 json!({ "ok": true, "deleted": existed, "revision": revision })
             }
             Command::LockAcquire {
-                key,
+                keys,
                 holder,
                 ttl_ms,
                 wait,
-            } => store.apply_lock_acquire(revision, now, key, holder, ttl_ms, wait),
+            } => store.apply_lock_acquire(revision, now, keys, holder, ttl_ms, wait),
             Command::LockRelease {
+                holder,
+                fencing_token,
+            } => store.apply_lock_release(revision, now, holder, fencing_token),
+            Command::SemaphoreAcquire {
+                key,
+                holder,
+                limit,
+                ttl_ms,
+                wait,
+            } => store.apply_semaphore_acquire(revision, now, key, holder, limit, ttl_ms, wait),
+            Command::SemaphoreRelease {
                 key,
                 holder,
                 fencing_token,
-            } => store.apply_lock_release(revision, now, key, holder, fencing_token),
+            } => store.apply_semaphore_release(revision, now, key, holder, fencing_token),
             Command::RateLimitCheck {
                 key,
                 tenant,
@@ -385,6 +495,7 @@ impl StateMachine {
         ApplyResult { revision, output }
     }
 
+    #[allow(dead_code)]
     pub fn revision(&self) -> u64 {
         self.store.lock().unwrap().revision
     }
@@ -399,6 +510,12 @@ impl StateMachine {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
         store.lock_snapshot(key)
+    }
+
+    pub fn semaphore_get(&self, key: &str) -> SemaphoreState {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store.semaphore_snapshot(key)
     }
 
     pub fn rate_limit_get(&self, tenant: &str, key: &str) -> Option<RateLimitSnapshot> {
@@ -456,17 +573,30 @@ impl Store {
                 .map(|expires| expires > now)
                 .unwrap_or(true)
         });
-        for lock in self.locks.values_mut() {
-            if lock
-                .lease_expires_ms
-                .map(|expires| expires <= now)
-                .unwrap_or(false)
-            {
-                lock.holder = None;
-                lock.fencing_token = None;
-                lock.lease_expires_ms = None;
+        // Expire any union-lock grants whose lease lapsed, freeing their member
+        // keys, then promote whatever the freed keys now unblock.
+        let expired: Vec<u64> = self
+            .locks
+            .grants
+            .iter()
+            .filter(|(_, g)| g.lease_expires_ms <= now)
+            .map(|(token, _)| *token)
+            .collect();
+        if !expired.is_empty() {
+            for token in expired {
+                self.release_grant(token);
+            }
+            self.lock_promote(now);
+        }
+        // Expire semaphore permits, then admit whoever was waiting.
+        for sem in self.semaphores.values_mut() {
+            let before = sem.holders.len();
+            sem.holders.retain(|slot| slot.lease_expires_ms > now);
+            if sem.holders.len() != before {
+                // A slot freed up; admit FIFO waiters up to the limit below.
             }
         }
+        self.semaphores_promote(now);
         self.elections
             .retain(|_, leadership| leadership.lease_expires_ms > now);
         for instances in self.services.values_mut() {
@@ -510,69 +640,249 @@ impl Store {
         json!({ "ok": true, "key": key, "revision": revision, "expires_at_ms": expires_at_ms })
     }
 
+    /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
         revision: u64,
         now: u64,
-        key: String,
+        keys: Vec<String>,
         holder: String,
         ttl_ms: u64,
         wait: bool,
     ) -> Value {
-        let existing_holder = self.locks.get(&key).and_then(|lock| lock.holder.clone());
-        if existing_holder.is_none() {
-            let fencing_token = self.next_token();
+        let keys = canonical_keys(&keys);
+        if keys.is_empty() {
+            return json!({ "acquired": false, "reason": "no_keys", "revision": revision });
+        }
+
+        // Grantable now iff no member key is held AND none is reserved by a
+        // request already in the queue (FIFO fairness — we'd join the tail).
+        let blocked_by_held = keys.iter().any(|k| self.locks.held.contains_key(k));
+        let reserved: std::collections::HashSet<&str> = self
+            .locks
+            .queue
+            .iter()
+            .flat_map(|q| q.keys.iter().map(|k| k.as_str()))
+            .collect();
+        let blocked_by_queue = keys.iter().any(|k| reserved.contains(k.as_str()));
+
+        if !blocked_by_held && !blocked_by_queue {
+            let token = self.next_token();
             let lease_expires_ms = now.saturating_add(ttl_ms);
-            let lock = self.locks.entry(key.clone()).or_insert_with(|| LockRecord {
-                holder: None,
-                fencing_token: None,
-                lease_expires_ms: None,
-                wait_queue: VecDeque::new(),
+            self.install_grant(LockGrant {
+                holder: holder.clone(),
+                keys: keys.clone(),
+                fencing_token: token,
+                lease_expires_ms,
             });
-            lock.holder = Some(holder.clone());
-            lock.fencing_token = Some(fencing_token);
-            lock.lease_expires_ms = Some(lease_expires_ms);
             return json!({
                 "acquired": true,
                 "queued": false,
-                "key": key,
+                "keys": keys,
                 "holder": holder,
-                "fencing_token": fencing_token,
+                "fencing_token": token,
                 "lease_expires_ms": lease_expires_ms,
                 "revision": revision,
             });
         }
 
-        let lock = self.locks.entry(key.clone()).or_insert_with(|| LockRecord {
-            holder: None,
-            fencing_token: None,
-            lease_expires_ms: None,
-            wait_queue: VecDeque::new(),
-        });
-        if wait && !lock.wait_queue.iter().any(|queued| queued.holder == holder) {
-            lock.wait_queue.push_back(QueuedLockWaiter {
+        // Not grantable. Queue it (idempotently) when the caller wants to wait.
+        let already = self
+            .locks
+            .queue
+            .iter()
+            .any(|q| q.holder == holder && q.keys == keys);
+        if wait && !already {
+            self.locks.queue.push_back(QueuedLock {
                 holder: holder.clone(),
-                requested_ms: now,
+                keys: keys.clone(),
                 ttl_ms,
+                requested_ms: now,
             });
         }
-        let position = lock
-            .wait_queue
+        let position = self
+            .locks
+            .queue
             .iter()
-            .position(|queued| queued.holder == holder)
+            .position(|q| q.holder == holder && q.keys == keys)
             .map(|idx| idx + 1);
+        let conflicts: Vec<String> = keys
+            .iter()
+            .filter(|k| self.locks.held.contains_key(*k))
+            .cloned()
+            .collect();
         json!({
             "acquired": false,
-            "queued": wait,
+            "queued": wait && position.is_some(),
             "position": position,
-            "key": key,
+            "keys": keys,
             "holder": holder,
-            "current_holder": lock.holder,
+            "conflicts": conflicts,
             "revision": revision,
         })
     }
 
+    /// Release a union grant by its fencing token, freeing all member keys and
+    /// promoting whatever waiters that unblocks.
     fn apply_lock_release(
+        &mut self,
+        revision: u64,
+        now: u64,
+        holder: String,
+        fencing_token: u64,
+    ) -> Value {
+        let Some(grant) = self.locks.grants.get(&fencing_token) else {
+            return json!({ "released": false, "reason": "not_found", "revision": revision });
+        };
+        if grant.holder != holder {
+            return json!({ "released": false, "reason": "not_holder", "revision": revision });
+        }
+        let keys = grant.keys.clone();
+        self.release_grant(fencing_token);
+        let promoted = self.lock_promote(now);
+        json!({
+            "released": true,
+            "keys": keys,
+            "promoted": promoted,
+            "revision": revision,
+        })
+    }
+
+    /// Insert a grant and mark every member key held by it.
+    fn install_grant(&mut self, grant: LockGrant) {
+        for key in &grant.keys {
+            self.locks.held.insert(key.clone(), grant.fencing_token);
+        }
+        self.locks.grants.insert(grant.fencing_token, grant);
+    }
+
+    /// Remove a grant and free its member keys (no promotion).
+    fn release_grant(&mut self, fencing_token: u64) {
+        if let Some(grant) = self.locks.grants.remove(&fencing_token) {
+            for key in &grant.keys {
+                if self.locks.held.get(key) == Some(&fencing_token) {
+                    self.locks.held.remove(key);
+                }
+            }
+        }
+    }
+
+    /// Index of the first queue entry whose whole key set is free, treating the
+    /// key sets of earlier still-queued entries as reserved (so a later request
+    /// can't barge ahead of an earlier overlapping one — FIFO, no starvation).
+    fn lock_first_grantable(&self) -> Option<usize> {
+        let mut reserved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (idx, q) in self.locks.queue.iter().enumerate() {
+            let blocked = q
+                .keys
+                .iter()
+                .any(|k| self.locks.held.contains_key(k) || reserved.contains(k.as_str()));
+            if !blocked {
+                return Some(idx);
+            }
+            for k in &q.keys {
+                reserved.insert(k.as_str());
+            }
+        }
+        None
+    }
+
+    /// Grant every queued request that can now be satisfied; returns who was
+    /// promoted and the token they were granted.
+    fn lock_promote(&mut self, now: u64) -> Vec<Value> {
+        let mut promoted = Vec::new();
+        while let Some(idx) = self.lock_first_grantable() {
+            let waiter = self.locks.queue.remove(idx).expect("index from scan");
+            let token = self.next_token();
+            let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
+            promoted.push(json!({
+                "holder": waiter.holder,
+                "keys": waiter.keys,
+                "fencing_token": token,
+                "lease_expires_ms": lease_expires_ms,
+            }));
+            self.install_grant(LockGrant {
+                holder: waiter.holder,
+                keys: waiter.keys,
+                fencing_token: token,
+                lease_expires_ms,
+            });
+        }
+        promoted
+    }
+
+    // --- counting semaphores ---------------------------------------------
+
+    fn apply_semaphore_acquire(
+        &mut self,
+        revision: u64,
+        now: u64,
+        key: String,
+        holder: String,
+        limit: u32,
+        ttl_ms: u64,
+        wait: bool,
+    ) -> Value {
+        let sem = self.semaphores.entry(key.clone()).or_insert_with(|| Semaphore {
+            limit: limit.max(1),
+            holders: Vec::new(),
+            queue: VecDeque::new(),
+        });
+        // Let callers re-tune the cap; shrinking just stops new grants until it
+        // drains back under the new limit.
+        sem.limit = limit.max(1);
+
+        let has_capacity = (sem.holders.len() as u32) < sem.limit;
+        let queue_empty = sem.queue.is_empty();
+        if has_capacity && queue_empty {
+            let token = self.next_token();
+            let lease_expires_ms = now.saturating_add(ttl_ms);
+            let sem = self.semaphores.get_mut(&key).expect("just inserted");
+            sem.holders.push(SemaphoreSlot {
+                holder: holder.clone(),
+                fencing_token: token,
+                lease_expires_ms,
+            });
+            let available = sem.limit.saturating_sub(sem.holders.len() as u32);
+            return json!({
+                "acquired": true,
+                "queued": false,
+                "key": key,
+                "holder": holder,
+                "fencing_token": token,
+                "lease_expires_ms": lease_expires_ms,
+                "available": available,
+                "limit": sem.limit,
+                "revision": revision,
+            });
+        }
+
+        let already = sem.queue.iter().any(|q| q.holder == holder);
+        if wait && !already {
+            sem.queue.push_back(QueuedPermit {
+                holder: holder.clone(),
+                ttl_ms,
+                requested_ms: now,
+            });
+        }
+        let position = sem
+            .queue
+            .iter()
+            .position(|q| q.holder == holder)
+            .map(|idx| idx + 1);
+        json!({
+            "acquired": false,
+            "queued": wait && position.is_some(),
+            "position": position,
+            "key": key,
+            "holder": holder,
+            "limit": sem.limit,
+            "available": 0,
+            "revision": revision,
+        })
+    }
+
+    fn apply_semaphore_release(
         &mut self,
         revision: u64,
         now: u64,
@@ -580,45 +890,56 @@ impl Store {
         holder: String,
         fencing_token: u64,
     ) -> Value {
-        let Some(existing) = self.locks.get(&key) else {
+        let Some(sem) = self.semaphores.get_mut(&key) else {
             return json!({ "released": false, "reason": "not_found", "revision": revision });
         };
-        if existing.holder.as_deref() != Some(holder.as_str())
-            || existing.fencing_token != Some(fencing_token)
-        {
+        let before = sem.holders.len();
+        sem.holders
+            .retain(|slot| !(slot.fencing_token == fencing_token && slot.holder == holder));
+        if sem.holders.len() == before {
             return json!({ "released": false, "reason": "not_holder", "revision": revision });
         }
-
-        let mut transferred_to = None;
-        let mut next_token = None;
-        let mut next_expires = None;
-        if let Some(mut lock) = self.locks.remove(&key) {
-            if let Some(waiter) = lock.wait_queue.pop_front() {
-                let token = self.next_token();
-                let expires = now.saturating_add(waiter.ttl_ms);
-                transferred_to = Some(waiter.holder.clone());
-                next_token = Some(token);
-                next_expires = Some(expires);
-                lock.holder = Some(waiter.holder);
-                lock.fencing_token = Some(token);
-                lock.lease_expires_ms = Some(expires);
-                self.locks.insert(key.clone(), lock);
-            } else {
-                lock.holder = None;
-                lock.fencing_token = None;
-                lock.lease_expires_ms = None;
-                self.locks.insert(key.clone(), lock);
-            }
-        }
-
+        let promoted = self.semaphore_promote(&key, now);
         json!({
             "released": true,
             "key": key,
-            "transferred_to": transferred_to,
-            "fencing_token": next_token,
-            "lease_expires_ms": next_expires,
+            "promoted": promoted,
             "revision": revision,
         })
+    }
+
+    /// Admit FIFO waiters of one semaphore up to its limit.
+    fn semaphore_promote(&mut self, key: &str, now: u64) -> Vec<Value> {
+        let mut promoted = Vec::new();
+        loop {
+            let Some(sem) = self.semaphores.get(key) else { break };
+            if (sem.holders.len() as u32) >= sem.limit || sem.queue.is_empty() {
+                break;
+            }
+            let token = self.next_token();
+            let sem = self.semaphores.get_mut(key).expect("checked above");
+            let waiter = sem.queue.pop_front().expect("non-empty checked");
+            let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
+            sem.holders.push(SemaphoreSlot {
+                holder: waiter.holder.clone(),
+                fencing_token: token,
+                lease_expires_ms,
+            });
+            promoted.push(json!({
+                "holder": waiter.holder,
+                "fencing_token": token,
+                "lease_expires_ms": lease_expires_ms,
+            }));
+        }
+        promoted
+    }
+
+    /// Admit waiters across every semaphore (used after a TTL sweep).
+    fn semaphores_promote(&mut self, now: u64) {
+        let keys: Vec<String> = self.semaphores.keys().cloned().collect();
+        for key in keys {
+            self.semaphore_promote(&key, now);
+        }
     }
 
     fn apply_rate_limit_check(
@@ -865,26 +1186,62 @@ impl Store {
     }
 
     fn lock_snapshot(&self, key: &str) -> LockState {
-        let Some(lock) = self.locks.get(key) else {
-            return LockState {
+        let grant = self
+            .locks
+            .held
+            .get(key)
+            .and_then(|token| self.locks.grants.get(token));
+        let wait_queue = self
+            .locks
+            .queue
+            .iter()
+            .filter(|q| q.keys.iter().any(|k| k == key))
+            .map(|q| LockWaiter {
+                holder: q.holder.clone(),
+                keys: q.keys.clone(),
+                requested_ms: q.requested_ms,
+            })
+            .collect();
+        LockState {
+            key: key.to_string(),
+            holder: grant.map(|g| g.holder.clone()),
+            fencing_token: grant.map(|g| g.fencing_token),
+            lease_expires_ms: grant.map(|g| g.lease_expires_ms),
+            held_keys: grant.map(|g| g.keys.clone()).unwrap_or_default(),
+            wait_queue,
+        }
+    }
+
+    fn semaphore_snapshot(&self, key: &str) -> SemaphoreState {
+        let Some(sem) = self.semaphores.get(key) else {
+            return SemaphoreState {
                 key: key.to_string(),
-                holder: None,
-                fencing_token: None,
-                lease_expires_ms: None,
+                limit: 0,
+                holders: Vec::new(),
+                available: 0,
                 wait_queue: Vec::new(),
             };
         };
-        LockState {
+        SemaphoreState {
             key: key.to_string(),
-            holder: lock.holder.clone(),
-            fencing_token: lock.fencing_token,
-            lease_expires_ms: lock.lease_expires_ms,
-            wait_queue: lock
-                .wait_queue
+            limit: sem.limit,
+            available: sem.limit.saturating_sub(sem.holders.len() as u32),
+            holders: sem
+                .holders
                 .iter()
-                .map(|waiter| LockWaiter {
-                    holder: waiter.holder.clone(),
-                    requested_ms: waiter.requested_ms,
+                .map(|slot| SemaphoreHolder {
+                    holder: slot.holder.clone(),
+                    fencing_token: slot.fencing_token,
+                    lease_expires_ms: slot.lease_expires_ms,
+                })
+                .collect(),
+            wait_queue: sem
+                .queue
+                .iter()
+                .map(|q| LockWaiter {
+                    holder: q.holder.clone(),
+                    keys: vec![key.to_string()],
+                    requested_ms: q.requested_ms,
                 })
                 .collect(),
         }
@@ -912,6 +1269,15 @@ fn rate_limit_store_key(tenant: &str, key: &str) -> String {
     format!("{tenant}:{key}")
 }
 
+/// Sort + dedup a key set so `{A,B}` and `{B,A,B}` are the same union, and so
+/// conflict/grant checks are order-independent.
+fn canonical_keys(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = keys.iter().filter(|k| !k.is_empty()).cloned().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -927,35 +1293,124 @@ pub fn valid_cron_expression(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lock_acquire_queues_and_transfers_with_fencing_tokens() {
-        let sm = StateMachine::new();
-        let first = sm.apply(Command::LockAcquire {
-            key: "orders/checkout".to_string(),
-            holder: "worker-a".to_string(),
+    fn acquire(sm: &StateMachine, keys: &[&str], holder: &str, wait: bool) -> Value {
+        sm.apply(Command::LockAcquire {
+            keys: keys.iter().map(|s| s.to_string()).collect(),
+            holder: holder.to_string(),
             ttl_ms: 30_000,
-            wait: false,
-        });
-        assert_eq!(first.output["acquired"], true);
-        let token = first.output["fencing_token"].as_u64().unwrap();
+            wait,
+        })
+        .output
+    }
 
-        let second = sm.apply(Command::LockAcquire {
-            key: "orders/checkout".to_string(),
-            holder: "worker-b".to_string(),
-            ttl_ms: 30_000,
-            wait: true,
-        });
-        assert_eq!(second.output["queued"], true);
-        assert_eq!(second.output["position"], 1);
+    #[test]
+    fn single_key_lock_queues_and_transfers_with_monotonic_fencing_tokens() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["orders/checkout"], "worker-a", false);
+        assert_eq!(first["acquired"], true);
+        let token = first["fencing_token"].as_u64().unwrap();
+
+        let second = acquire(&sm, &["orders/checkout"], "worker-b", true);
+        assert_eq!(second["queued"], true);
+        assert_eq!(second["position"], 1);
 
         let release = sm.apply(Command::LockRelease {
-            key: "orders/checkout".to_string(),
             holder: "worker-a".to_string(),
             fencing_token: token,
         });
         assert_eq!(release.output["released"], true);
-        assert_eq!(release.output["transferred_to"], "worker-b");
-        assert!(release.output["fencing_token"].as_u64().unwrap() > token);
+        // worker-b is promoted with a strictly newer fencing token.
+        let promoted = &release.output["promoted"][0];
+        assert_eq!(promoted["holder"], "worker-b");
+        assert!(promoted["fencing_token"].as_u64().unwrap() > token);
+        // ...and now holds the key.
+        assert_eq!(sm.lock_get("orders/checkout").holder.as_deref(), Some("worker-b"));
+    }
+
+    #[test]
+    fn multi_key_union_lock_conflicts_on_any_shared_member() {
+        let sm = StateMachine::new();
+        // Hold the union {a, b}.
+        let g1 = acquire(&sm, &["a", "b"], "holder-1", false);
+        assert_eq!(g1["acquired"], true);
+
+        // {b, c} overlaps on b → must conflict and queue.
+        let g2 = acquire(&sm, &["b", "c"], "holder-2", true);
+        assert_eq!(g2["acquired"], false);
+        assert_eq!(g2["queued"], true);
+        assert_eq!(g2["conflicts"], json!(["b"]));
+
+        // {d, e} is disjoint → grants immediately even while {a,b} is held.
+        let g3 = acquire(&sm, &["d", "e"], "holder-3", false);
+        assert_eq!(g3["acquired"], true);
+
+        // Release {a,b}; holder-2's {b,c} is now grantable and is promoted.
+        let token1 = g1["fencing_token"].as_u64().unwrap();
+        let rel = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        assert_eq!(rel.output["promoted"][0]["holder"], "holder-2");
+        assert_eq!(sm.lock_get("c").holder.as_deref(), Some("holder-2"));
+        assert_eq!(sm.lock_get("b").holder.as_deref(), Some("holder-2"));
+    }
+
+    #[test]
+    fn union_queue_is_fifo_fair_and_deadlock_free() {
+        let sm = StateMachine::new();
+        // holder-1 holds {x}. Two waiters queue behind it: {x,y} then {y}.
+        let g1 = acquire(&sm, &["x"], "holder-1", false);
+        let w_xy = acquire(&sm, &["x", "y"], "holder-2", true);
+        assert_eq!(w_xy["queued"], true);
+        // {y} alone is free, BUT holder-2 ({x,y}) is ahead and reserves y, so a
+        // later {y} request must wait behind it (no barging → no starvation).
+        let w_y = acquire(&sm, &["y"], "holder-3", true);
+        assert_eq!(w_y["queued"], true);
+        assert_eq!(w_y["position"], 2);
+
+        // Release {x}: holder-2 ({x,y}) is promoted first (FIFO); holder-3 still waits.
+        let rel = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: g1["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(rel.output["promoted"][0]["holder"], "holder-2");
+        assert_eq!(sm.lock_get("y").holder.as_deref(), Some("holder-2"));
+        assert_eq!(sm.lock_get("y").wait_queue[0].holder, "holder-3");
+    }
+
+    #[test]
+    fn semaphore_caps_concurrent_holders_and_admits_in_fifo() {
+        let sm = StateMachine::new();
+        let acq = |holder: &str, wait: bool| {
+            sm.apply(Command::SemaphoreAcquire {
+                key: "db-pool".to_string(),
+                holder: holder.to_string(),
+                limit: 2,
+                ttl_ms: 30_000,
+                wait,
+            })
+            .output
+        };
+        // limit = 2: first two acquire, third is capped out and queues.
+        let a = acq("a", false);
+        let b = acq("b", false);
+        let c = acq("c", true);
+        assert_eq!(a["acquired"], true);
+        assert_eq!(b["acquired"], true);
+        assert_eq!(c["acquired"], false);
+        assert_eq!(c["queued"], true);
+        assert_eq!(sm.semaphore_get("db-pool").available, 0);
+
+        // a releases its permit → c is admitted.
+        let rel = sm.apply(Command::SemaphoreRelease {
+            key: "db-pool".to_string(),
+            holder: "a".to_string(),
+            fencing_token: a["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(rel.output["promoted"][0]["holder"], "c");
+        let state = sm.semaphore_get("db-pool");
+        assert_eq!(state.holders.len(), 2);
+        assert!(state.holders.iter().any(|h| h.holder == "c"));
     }
 
     #[test]

@@ -7,11 +7,16 @@ description = "Raft-replicated coordination engine for fiducia.cloud — config 
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower-http = { version = "0.5", features = ["trace", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Peer transport: the HTTP client a leader uses to send AppendEntries/RequestVote
+# to its shard peers. Intra-cluster plain HTTP, so no TLS backend is pulled in.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
