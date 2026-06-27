@@ -6,14 +6,14 @@
 //! (see [`crate::state`]). This is Fiducia's flagship primitive — the
 //! live-mutex "lock on a combination of keys" model, made linearizable by Raft.
 //!
-//! Keys travel in the JSON body (a union may be many keys, and bodies are
-//! slash-safe), so member keys may contain slashes (`orders/42`). Inspect uses a
-//! catch-all path for the same reason.
+//! Keys never live in the URL path — acquire/release carry them in the JSON body
+//! (a union may be many keys), inspect takes `?key=` — so they may contain
+//! slashes (`orders/42`).
 //!
 //! Routes (mounted under `/v1/locks`):
-//!   * `POST /v1/locks/acquire`        — union acquire: `{ keys:[..]|key, holder, ttl_ms?, wait? }`
-//!   * `POST /v1/locks/release`        — release by `{ holder, fencing_token }`
-//!   * `GET  /v1/locks/{key}`          — inspect a member key: holder, the held union, queue
+//!   * `POST /v1/locks/acquire`     — union acquire: `{ keys:[..]|key, holder, ttl_ms?, wait? }`
+//!   * `POST /v1/locks/release`     — release by `{ holder, fencing_token }`
+//!   * `GET  /v1/locks?key=K`       — inspect a member key: holder, the held union, queue
 
 use std::sync::Arc;
 
