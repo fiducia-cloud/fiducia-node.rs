@@ -82,14 +82,14 @@ async fn register(
 async fn heartbeat(
     State(node): State<Arc<Node>>,
     Path((service, id)): Path<(String, String)>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ServiceHeartbeat {
             service,
             instance_id: id,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `DELETE /v1/services/{service}/instances/{id}` — deregister an instance.
