@@ -338,16 +338,27 @@ impl StateMachine {
                 json!({ "ok": true, "deleted": existed, "revision": revision })
             }
             Command::LockAcquire {
-                key,
+                keys,
                 holder,
                 ttl_ms,
                 wait,
-            } => store.apply_lock_acquire(revision, now, key, holder, ttl_ms, wait),
+            } => store.apply_lock_acquire(revision, now, keys, holder, ttl_ms, wait),
             Command::LockRelease {
+                holder,
+                fencing_token,
+            } => store.apply_lock_release(revision, now, holder, fencing_token),
+            Command::SemaphoreAcquire {
+                key,
+                holder,
+                limit,
+                ttl_ms,
+                wait,
+            } => store.apply_semaphore_acquire(revision, now, key, holder, limit, ttl_ms, wait),
+            Command::SemaphoreRelease {
                 key,
                 holder,
                 fencing_token,
-            } => store.apply_lock_release(revision, now, key, holder, fencing_token),
+            } => store.apply_semaphore_release(revision, now, key, holder, fencing_token),
             Command::RateLimitCheck {
                 key,
                 tenant,
