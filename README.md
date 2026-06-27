@@ -160,7 +160,11 @@ deliberate:
 
 This is the standard Raft durability stack (WAL → snapshot → compaction); none of
 it changes the API or the state-machine semantics above. A single embedded engine
-(e.g. a segmented WAL, or `redb`/`sled`) plugs in behind that seam.
+plugs in behind that seam — see [`docs/storage.md`](docs/storage.md) for the
+concrete design: embedded RocksDB under `FIDUCIA_NODE_DATA_DIR`, with column
+families for the Raft log/meta, applied coordination state, watch indexes, and
+snapshots. (Postgres/Supabase stay the *business*/control-plane database — orgs,
+projects, users, API keys, audit, billing — never the coordination store.)
 
 ## Layout
 
