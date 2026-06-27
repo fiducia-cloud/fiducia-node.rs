@@ -85,16 +85,6 @@ async fn acquire_union(
     acquire(node, uri, keys, body).await
 }
 
-/// `POST /v1/locks/{key}/acquire` — single-key convenience.
-async fn acquire_one(
-    State(node): State<Arc<Node>>,
-    uri: Uri,
-    Path(key): Path<String>,
-    Json(body): Json<AcquireBody>,
-) -> Response {
-    acquire(node, uri, vec![key], body).await
-}
-
 async fn acquire(node: Arc<Node>, uri: Uri, keys: Vec<String>, body: AcquireBody) -> Response {
     let result = node
         .propose(Command::LockAcquire {
