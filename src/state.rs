@@ -73,6 +73,15 @@ impl Command {
             Command::ServiceRegister { service, .. } => service,
             Command::ServiceHeartbeat { service, .. } => service,
             Command::ServiceDeregister { service, .. } => service,
+            Command::LockAcquire { key, .. } => key,
+            Command::LockRelease { key, .. } => key,
+            Command::RwAcquireRead { key, .. } => key,
+            Command::RwEndRead { key, .. } => key,
+            Command::RwAcquireWrite { key, .. } => key,
+            Command::RwEndWrite { key, .. } => key,
+            Command::RateLimitConsume { key, .. } => key,
+            Command::CronCreate { name, .. } => name,
+            Command::CronDelete { name } => name,
         }
     }
 }
