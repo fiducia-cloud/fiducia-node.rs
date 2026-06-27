@@ -35,6 +35,24 @@ pub enum Command {
     ServiceRegister { service: String, instance_id: String, address: String, ttl_ms: u64 },
     ServiceHeartbeat { service: String, instance_id: String },
     ServiceDeregister { service: String, instance_id: String },
+
+    // --- Locks & semaphores ------------------------------------------------
+    // max == 1 is a mutex; max > 1 a counting semaphore.
+    LockAcquire { key: String, holder: String, ttl_ms: u64, max: u32 },
+    LockRelease { key: String, lock_id: String },
+
+    // --- Reader-writer locks -----------------------------------------------
+    RwAcquireRead { key: String, holder: String, ttl_ms: u64 },
+    RwEndRead { key: String, lock_id: String },
+    RwAcquireWrite { key: String, holder: String, ttl_ms: u64 },
+    RwEndWrite { key: String, lock_id: String },
+
+    // --- Rate limiting -----------------------------------------------------
+    RateLimitConsume { key: String, cost: u64 },
+
+    // --- Cron & scheduling -------------------------------------------------
+    CronCreate { name: String, schedule: String, target: String },
+    CronDelete { name: String },
 }
 
 impl Command {
