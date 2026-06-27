@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Query, State},
     http::Uri,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -30,8 +30,7 @@ use serde_json::json;
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
-/// Acquire body. Supply `keys` for a union lock, or `key` for a single-key lock;
-/// on the `/{key}/acquire` route the path key is used.
+/// Acquire body. Supply `keys` for a union lock, or `key` for a single-key lock.
 #[derive(Debug, Default, Deserialize)]
 pub struct AcquireBody {
     pub keys: Option<Vec<String>>,
@@ -47,20 +46,30 @@ pub struct ReleaseBody {
     pub fencing_token: u64,
 }
 
-pub fn router() -> Router<Arc<Node>> {
-    // Acquire/release take their keys in the JSON body (a union may be many keys,
-    // and bodies are slash-safe). Inspect uses a catch-all so a single member key
-    // may contain slashes (`orders/42`).
-    Router::new()
-        .route("/acquire", post(acquire_union))
-        .route("/release", post(release_token))
-        .route("/*key", get(get_lock))
+#[derive(Debug, Deserialize)]
+pub struct KeyParam {
+    pub key: String,
 }
 
-/// `GET /v1/locks/{key}` — inspect lock state for one member key.
-async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
-    match node.query(ReadRequest::Lock { key: key.clone() }).await {
-        Ok(ReadResponse::Lock(lock)) => Json(json!({ "key": key, "lock": lock })).into_response(),
+pub fn router() -> Router<Arc<Node>> {
+    // Keys never live in the URL path: acquire/release carry them in the JSON body
+    // (a union may be many keys), and inspect takes `?key=` — both slash-safe.
+    Router::new()
+        .route("/", get(get_lock))
+        .route("/acquire", post(acquire_union))
+        .route("/release", post(release_token))
+}
+
+/// `GET /v1/locks?key=K` — inspect lock state for one member key.
+async fn get_lock(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Query(q): Query<KeyParam>,
+) -> Response {
+    match node.query(ReadRequest::Lock { key: q.key.clone() }).await {
+        Ok(ReadResponse::Lock(lock)) => {
+            Json(json!({ "key": q.key, "lock": lock })).into_response()
+        }
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
