@@ -19,11 +19,16 @@ use std::sync::Arc;
 
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use tower_http::{catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use consensus::{Node, NodeConfig};
 
 const SERVICE: &str = "fiducia-node";
+
+/// Cap request bodies (KV values). Generous for coordination data; rejects
+/// memory-exhaustion payloads. NOTE: deliberately **no request timeout** — KV
+/// `watch` streams and blocking lock acquires are long-lived by design.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
