@@ -56,7 +56,11 @@ async fn main() {
         .route("/readyz", get(health))
         .nest("/v1", v1)
         .with_state(node)
-        .layer(TraceLayer::new_for_http());
+        // Hardening (outermost last): catch handler panics → 500 and cap body
+        // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.
+        .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
         .ok()
