@@ -999,16 +999,24 @@ impl Node {
             }
         }
         shards.sort_by_key(|s| s.shard_id);
-        let leading_shards = shards
+        let leading_shards: Vec<ShardId> = shards
             .iter()
             .filter(|s| s.role == Role::Leader)
+            .map(|s| s.shard_id)
+            .collect();
+        let following_shards: Vec<ShardId> = shards
+            .iter()
+            .filter(|s| s.role == Role::Follower)
             .map(|s| s.shard_id)
             .collect();
         NodeStatus {
             node_id: self.config.node_id.clone(),
             peers: self.config.peers.clone(),
             shard_count: self.config.shard_count,
+            leader_count: leading_shards.len(),
+            follower_count: following_shards.len(),
             leading_shards,
+            following_shards,
             shards,
         }
     }
