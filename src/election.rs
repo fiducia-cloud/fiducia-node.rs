@@ -27,7 +27,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_json, Node, ReadRequest, ReadResponse};
+use axum::response::Response;
+
+use crate::consensus::{propose_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
