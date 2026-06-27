@@ -1185,26 +1185,62 @@ impl Store {
     }
 
     fn lock_snapshot(&self, key: &str) -> LockState {
-        let Some(lock) = self.locks.get(key) else {
-            return LockState {
+        let grant = self
+            .locks
+            .held
+            .get(key)
+            .and_then(|token| self.locks.grants.get(token));
+        let wait_queue = self
+            .locks
+            .queue
+            .iter()
+            .filter(|q| q.keys.iter().any(|k| k == key))
+            .map(|q| LockWaiter {
+                holder: q.holder.clone(),
+                keys: q.keys.clone(),
+                requested_ms: q.requested_ms,
+            })
+            .collect();
+        LockState {
+            key: key.to_string(),
+            holder: grant.map(|g| g.holder.clone()),
+            fencing_token: grant.map(|g| g.fencing_token),
+            lease_expires_ms: grant.map(|g| g.lease_expires_ms),
+            held_keys: grant.map(|g| g.keys.clone()).unwrap_or_default(),
+            wait_queue,
+        }
+    }
+
+    fn semaphore_snapshot(&self, key: &str) -> SemaphoreState {
+        let Some(sem) = self.semaphores.get(key) else {
+            return SemaphoreState {
                 key: key.to_string(),
-                holder: None,
-                fencing_token: None,
-                lease_expires_ms: None,
+                limit: 0,
+                holders: Vec::new(),
+                available: 0,
                 wait_queue: Vec::new(),
             };
         };
-        LockState {
+        SemaphoreState {
             key: key.to_string(),
-            holder: lock.holder.clone(),
-            fencing_token: lock.fencing_token,
-            lease_expires_ms: lock.lease_expires_ms,
-            wait_queue: lock
-                .wait_queue
+            limit: sem.limit,
+            available: sem.limit.saturating_sub(sem.holders.len() as u32),
+            holders: sem
+                .holders
                 .iter()
-                .map(|waiter| LockWaiter {
-                    holder: waiter.holder.clone(),
-                    requested_ms: waiter.requested_ms,
+                .map(|slot| SemaphoreHolder {
+                    holder: slot.holder.clone(),
+                    fencing_token: slot.fencing_token,
+                    lease_expires_ms: slot.lease_expires_ms,
+                })
+                .collect(),
+            wait_queue: sem
+                .queue
+                .iter()
+                .map(|q| LockWaiter {
+                    holder: q.holder.clone(),
+                    keys: vec![key.to_string()],
+                    requested_ms: q.requested_ms,
                 })
                 .collect(),
         }
