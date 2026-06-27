@@ -27,7 +27,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_json, Node, ReadRequest, ReadResponse};
+use axum::response::Response;
+
+use crate::consensus::{propose_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +58,7 @@ async fn campaign(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
     Json(body): Json<CampaignBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ElectionCampaign {
             name,
@@ -64,7 +66,7 @@ async fn campaign(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `POST /v1/elections/{name}/renew` — extend the lease (must hold the token).
@@ -72,7 +74,7 @@ async fn renew(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ElectionRenew {
             name,
@@ -80,7 +82,7 @@ async fn renew(
             fencing_token: body.fencing_token,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `POST /v1/elections/{name}/resign` — give up leadership.
@@ -88,7 +90,7 @@ async fn resign(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ElectionResign {
             name,
@@ -96,7 +98,7 @@ async fn resign(
             fencing_token: body.fencing_token,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `GET /v1/elections/{name}` — observe the current leader.

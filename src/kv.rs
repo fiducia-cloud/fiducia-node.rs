@@ -23,7 +23,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_json, Node, ReadRequest, ReadResponse};
+use axum::response::Response;
+
+use crate::consensus::{propose_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +58,7 @@ async fn put_key(
     State(node): State<Arc<Node>>,
     Path(key): Path<String>,
     Json(body): Json<PutBody>,
-) -> Json<Value> {
+) -> Response {
     // TODO: honor body.prev_revision for compare-and-swap once apply is wired.
     let _ = body.prev_revision;
     let result = node
@@ -66,13 +68,13 @@ async fn put_key(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `DELETE /v1/kv/{key}` — remove a key.
-async fn delete_key(State(node): State<Arc<Node>>, Path(key): Path<String>) -> Json<Value> {
+async fn delete_key(State(node): State<Arc<Node>>, Path(key): Path<String>) -> Response {
     let result = node.propose(Command::KvDelete { key }).await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `GET /v1/kv?prefix=...` — list keys under a prefix.

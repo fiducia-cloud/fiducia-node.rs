@@ -25,7 +25,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_json, Node, ReadRequest, ReadResponse};
+use axum::response::Response;
+
+use crate::consensus::{propose_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -64,7 +66,7 @@ async fn register(
     State(node): State<Arc<Node>>,
     Path((service, id)): Path<(String, String)>,
     Json(body): Json<RegisterBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ServiceRegister {
             service,
@@ -73,35 +75,35 @@ async fn register(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `POST /v1/services/{service}/instances/{id}/heartbeat` — renew the lease.
 async fn heartbeat(
     State(node): State<Arc<Node>>,
     Path((service, id)): Path<(String, String)>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ServiceHeartbeat {
             service,
             instance_id: id,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `DELETE /v1/services/{service}/instances/{id}` — deregister an instance.
 async fn deregister(
     State(node): State<Arc<Node>>,
     Path((service, id)): Path<(String, String)>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ServiceDeregister {
             service,
             instance_id: id,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
