@@ -69,10 +69,20 @@ curl -XPOST localhost:8090/v1/semaphores/acquire \
   -d '{"key":"db-pool","holder":"conn-1","limit":10,"ttl_ms":30000,"wait":true}'
 ```
 
-All keys are hierarchical — they may contain slashes (`flags/checkout`,
-`orders/42`, `pools/db/primary`). Lock/semaphore keys travel in the request body;
-KV keys are a catch-all path segment (`GET /v1/kv/flags/checkout`), with `watch`
-as a query flag (`GET /v1/kv/flags/checkout?watch=true`).
+**Keys are never in the URL path** — they go in `?key=` (or, for the multi-key
+lock acquire/release, the JSON body). So they're free of any path grammar and may
+contain slashes, dots, or be empty (`flags/checkout`, `orders/42`,
+`pools/db/primary`, even a key named `acquire`):
+
+```bash
+curl     'localhost:8090/v1/kv?key=flags/checkout'              # read
+curl -XPUT 'localhost:8090/v1/kv?key=flags/checkout' -d '{"value":"on"}'
+curl -N   'localhost:8090/v1/kv?key=flags/checkout&watch=true'  # SSE watch
+curl     'localhost:8090/v1/locks?key=orders/42'               # inspect
+```
+
+This is also why the load balancer can read the routing key the same way on every
+by-key request — it's always `?key=`, never a per-endpoint path shape.
 
 > **Why locks route to one coordinator.** Granting `{a,b,c}` atomically and
 > detecting it conflicts with a holder of `{b}` requires one state machine to see
