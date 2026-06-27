@@ -108,6 +108,12 @@ impl LoopbackRegistry {
             .insert(shard, inbox);
     }
 
+    /// Remove a whole node from the registry — used to simulate a node going
+    /// away (its peers can then no longer reach it, like a crash/partition).
+    pub fn deregister(&self, node_id: &str) {
+        self.nodes.lock().unwrap().remove(node_id);
+    }
+
     fn sender(&self, node_id: &str, shard: ShardId) -> Option<mpsc::Sender<ShardMsg>> {
         self.nodes.lock().unwrap().get(node_id)?.get(&shard).cloned()
     }
