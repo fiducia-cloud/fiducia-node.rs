@@ -15,15 +15,22 @@
 
 use std::sync::Arc;
 
+use std::convert::Infallible;
+use std::time::Duration;
+
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::Uri,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
