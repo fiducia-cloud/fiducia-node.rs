@@ -9,9 +9,12 @@
 //! marked with `TODO`s in the respective modules.
 
 mod consensus;
+mod cron;
 mod discovery;
 mod election;
 mod kv;
+mod locks;
+mod ratelimit;
 mod state;
 
 use std::net::SocketAddr;
