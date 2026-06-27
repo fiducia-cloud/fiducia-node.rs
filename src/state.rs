@@ -1268,6 +1268,15 @@ fn rate_limit_store_key(tenant: &str, key: &str) -> String {
     format!("{tenant}:{key}")
 }
 
+/// Sort + dedup a key set so `{A,B}` and `{B,A,B}` are the same union, and so
+/// conflict/grant checks are order-independent.
+fn canonical_keys(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = keys.iter().filter(|k| !k.is_empty()).cloned().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
