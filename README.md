@@ -1,8 +1,8 @@
 # fiducia-node
 
 The Raft-replicated **coordination engine** behind [fiducia.cloud](https://fiducia.cloud).
-A node is a data-plane process that hosts shard replicas and serves the
-coordination API over HTTP.
+A node is the data-plane process that runs on each VM or bare-metal machine,
+hosts shard replicas, and serves the coordination API over HTTP.
 
 The consensus core is **real**: each shard runs a faithful Raft (randomized
 leader election, log replication with the `AppendEntries` consistency check,
@@ -160,7 +160,11 @@ deliberate:
 
 This is the standard Raft durability stack (WAL → snapshot → compaction); none of
 it changes the API or the state-machine semantics above. A single embedded engine
-(e.g. a segmented WAL, or `redb`/`sled`) plugs in behind that seam.
+plugs in behind that seam — see [`docs/storage.md`](docs/storage.md) for the
+concrete design: embedded RocksDB under `FIDUCIA_NODE_DATA_DIR`, with column
+families for the Raft log/meta, applied coordination state, watch indexes, and
+snapshots. (Postgres/Supabase stay the *business*/control-plane database — orgs,
+projects, users, API keys, audit, billing — never the coordination store.)
 
 ## Layout
 
@@ -190,4 +194,5 @@ curl localhost:8090/v1/status        # per-shard role / term / commit index
 
 - [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane (placement, scaling, failure handling).
 - [`fiducia-node-sidecar.rs`](https://github.com/fiducia-cloud/fiducia-node-sidecar.rs) — per-node bridge to the brain + observability.
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website/marketing webserver.
+- [`fiducia-load-balance.rs`](https://github.com/fiducia-cloud/fiducia-load-balance.rs) — key-aware router that sends each request to the owning shard's leader.
+- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the customer portal/webserver.
