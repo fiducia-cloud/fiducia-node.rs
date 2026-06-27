@@ -127,7 +127,8 @@ impl LoopbackRegistry {
 /// time" — Raft tolerates dropped messages, so callers simply retry on the next
 /// tick.
 pub enum Transport {
-    /// In-process delivery to another node's shard inbox (tests).
+    /// In-process delivery to another node's shard inbox (the test harness).
+    #[allow(dead_code)]
     Loopback(LoopbackRegistry),
     /// JSON-over-HTTP to a peer's `/raft/{shard}/…` endpoints (production).
     Http(reqwest::Client),
