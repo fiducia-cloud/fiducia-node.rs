@@ -67,6 +67,20 @@ leader redistribution** are not a node's job — they belong to the control
 plane, **`fiducia-brain`**, which tells nodes which shards to host and moves
 leadership/replicas around.
 
+### Storage backing
+
+Config KV is **not** backed by Postgres, Supabase, Redis, or one central
+database. The production backing store is the owning shard's replicated Raft log
+plus local per-node snapshots. Each `PUT`/`DELETE` is a committed `Command` in
+that shard's log; the applied state machine materializes the latest value,
+revision, TTL, and watch events.
+
+The current skeleton keeps that applied state in memory. The durable node store
+is specified in [`docs/storage.md`](docs/storage.md): embedded RocksDB under
+`FIDUCIA_NODE_DATA_DIR`, with column families for Raft log/meta, applied
+coordination state, watch indexes, and snapshots. Postgres/Supabase remain the
+business/control-plane database for orgs, projects, users, API keys, and audit.
+
 ## Layout
 
 | File              | Responsibility                                                    |
