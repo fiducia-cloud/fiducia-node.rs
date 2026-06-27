@@ -27,6 +27,7 @@ use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
 pub struct AcquireBody {
+    pub key: String,
     pub holder: Option<String>,
     /// Maximum concurrent holders. Set on first use; may be re-tuned later.
     pub limit: u32,
@@ -36,15 +37,18 @@ pub struct AcquireBody {
 
 #[derive(Debug, Deserialize)]
 pub struct ReleaseBody {
+    pub key: String,
     pub holder: String,
     pub fencing_token: u64,
 }
 
 pub fn router() -> Router<Arc<Node>> {
+    // Key is in the JSON body for acquire/release (slash-safe); inspect uses a
+    // catch-all so the key may contain slashes (`pools/db/primary`).
     Router::new()
-        .route("/:key", get(get_semaphore))
-        .route("/:key/acquire", post(acquire))
-        .route("/:key/release", post(release))
+        .route("/acquire", post(acquire))
+        .route("/release", post(release))
+        .route("/*key", get(get_semaphore))
 }
 
 /// `GET /v1/semaphores/{key}` — inspect permits, holders, and the wait queue.
@@ -62,16 +66,15 @@ async fn get_semaphore(
     }
 }
 
-/// `POST /v1/semaphores/{key}/acquire` — take a permit or join the FIFO queue.
+/// `POST /v1/semaphores/acquire` — take a permit of `key` or join the FIFO queue.
 async fn acquire(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
     Json(body): Json<AcquireBody>,
 ) -> Response {
     let result = node
         .propose(Command::SemaphoreAcquire {
-            key,
+            key: body.key,
             holder: body.holder.unwrap_or_else(|| "anonymous".to_string()),
             limit: body.limit,
             ttl_ms: body.ttl_ms.unwrap_or(30_000),
@@ -81,16 +84,15 @@ async fn acquire(
     propose_response(result, &uri)
 }
 
-/// `POST /v1/semaphores/{key}/release` — return one permit (admits the next waiter).
+/// `POST /v1/semaphores/release` — return one permit of `key` (admits the next waiter).
 async fn release(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
     Json(body): Json<ReleaseBody>,
 ) -> Response {
     let result = node
         .propose(Command::SemaphoreRelease {
-            key,
+            key: body.key,
             holder: body.holder,
             fencing_token: body.fencing_token,
         })
