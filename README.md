@@ -1,9 +1,8 @@
 # fiducia-node
 
 The Raft-replicated **coordination engine** behind [fiducia.cloud](https://fiducia.cloud).
-<<<<<<< HEAD
-A node is a data-plane process that hosts shard replicas and serves the
-coordination API over HTTP.
+A node is the data-plane process that runs on each VM or bare-metal machine,
+hosts shard replicas, and serves the coordination API over HTTP.
 
 The consensus core is **real**: each shard runs a faithful Raft (randomized
 leader election, log replication with the `AppendEntries` consistency check,
@@ -27,25 +26,6 @@ All over HTTP (`/v1`):
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
 | **Service discovery** | `/v1/services/*`   | TTL-health registry of live service instances (Consul/etcd).   |
-=======
-A node is the data-plane process that runs on each VM or bare-metal machine,
-hosts shard replicas, and serves the coordination API. This repository is
-currently a **skeleton** — the architecture and HTTP surface are in place; the
-clustered consensus and watch internals are still marked with `TODO`s.
-
-## What a node serves
-
-Six coordination primitives, all over HTTP (`/v1`):
-
-| Primitive            | Routes                              | What it is                                                      |
-|----------------------|-------------------------------------|----------------------------------------------------------------|
-| **Config KV + watches** | `/v1/kv/*`                       | Linearizable, versioned key/value with live `watch` streams (etcd/znode). |
-| **Locks + semaphores** | `/v1/locks/*`, `/v1/semaphores/*` | TTL leases, fencing tokens, multi-key union locks, capped semaphores, FIFO waiters. |
-| **Rate limiting**    | `/v1/rate-limit/*`                  | Token-bucket and sliding-window decisions committed per shard.  |
-| **Cron / scheduling** | `/v1/cron/*`                       | Recurring and one-shot schedules with durable run history.      |
-| **Leader election**     | `/v1/elections/*`                | Clients campaign for a named leadership with TTL leases + fencing tokens. |
-| **Service discovery**   | `/v1/services/*`                 | TTL-health registry of live service instances (Consul/etcd).   |
->>>>>>> origin/main
 
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
 internal `/raft/{shard}/{append,vote}` peer endpoints.
@@ -132,21 +112,9 @@ with its own log, term, and elected leader.
 ```
 
 A physical node is **leader for some shards and follower for others**, so
-<<<<<<< HEAD
 leadership — and write throughput — spreads across the cluster instead of
 funneling through one global leader. Writes to keys in different shards never
 serialize against each other (CockroachDB ranges / TiKV regions).
-=======
-leadership — and write throughput — spreads across the whole cluster instead of
-funneling through one global leader. The target placement invariant is that
-every healthy node leads at least one shard and follows others; after failover,
-a node may temporarily lead more shards until the control plane rebalances.
-A command's *routing key* (KV key, lock key, rate-limit key, schedule name,
-election name, or service name) is hashed to a shard; that shard's Raft group
-orders and commits it. Writes to keys in different shards never serialize
-against each other. This is the "multi-Raft" design used by CockroachDB
-(ranges) and TiKV (regions).
->>>>>>> origin/main
 
 ### Concurrency model: one actor per shard
 
@@ -159,7 +127,6 @@ inbox message, so a slow peer can't stall the shard.
 
 ### Peer transport (testable in-process)
 
-<<<<<<< HEAD
 [`Transport`](src/transport.rs) has two backings: **HTTP** (`reqwest` → a peer's
 `/raft/{shard}/…`) for production, and an in-process **loopback** registry for
 tests — so a whole multi-node cluster (election + replication + failover) runs
@@ -208,60 +175,6 @@ it changes the API or the state-machine semantics above. A single embedded engin
 | `src/semaphore.rs` | counting-semaphore handlers                                          |
 | `src/kv.rs`        | config KV + SSE watch handlers                                       |
 | `src/rate_limit.rs`, `src/schedule.rs`, `src/election.rs`, `src/discovery.rs` | the other primitives |
-=======
-Shard **placement, rebalancing, scale up/down, node-failure handling, and
-leader redistribution** are not a node's job — they belong to the control
-plane, **`fiducia-brain`**, which tells nodes which shards to host and moves
-leadership/replicas around.
-
-### Locks and semaphores
-
-Locks are the highest-value coordination primitive, so the skeleton favors
-correctness over maximum partitioning here. Single-key locks, semaphores, and
-multi-key locks all route through the same lock-coordination shard. That keeps a
-single-key acquire on `B` from bypassing an active composite lock on `[A, B]`.
-
-- **Mutex:** `POST /v1/locks/{key}/acquire` with default `max=1`.
-- **Semaphore:** same acquire path with `max > 1`, or the
-  `/v1/semaphores/{key}/acquire` alias. Up to `max` holders can hold the key at
-  once; every holder gets its own fencing token.
-- **Multi-key union lock:** `POST /v1/locks/acquire-many` with `keys`. The keys
-  are sorted/deduped, capped at five, and acquired atomically: either every key
-  is held under one `lock_id`, or none are. The grant returns a per-key
-  `fencing_tokens` map. Composite locks are exclusive on every member key and
-  conflict with single-key locks and semaphores on any overlap.
-- **Release:** single-key holders release with `{holder, fencing_token}`;
-  composite holders release the whole union with `/v1/locks/release-many` and
-  the returned `lock_id`.
-
-### Storage backing
-
-Config KV is **not** backed by Postgres, Supabase, Redis, or one central
-database. The production backing store is the owning shard's replicated Raft log
-plus local per-node snapshots. Each `PUT`/`DELETE` is a committed `Command` in
-that shard's log; the applied state machine materializes the latest value,
-revision, TTL, and watch events.
-
-The current skeleton keeps that applied state in memory. The durable node store
-is specified in [`docs/storage.md`](docs/storage.md): embedded RocksDB under
-`FIDUCIA_NODE_DATA_DIR`, with column families for Raft log/meta, applied
-coordination state, watch indexes, and snapshots. Postgres/Supabase remain the
-business/control-plane database for orgs, projects, users, API keys, and audit.
-
-## Layout
-
-| File              | Responsibility                                                    |
-|-------------------|-------------------------------------------------------------------|
-| `src/main.rs`     | axum wiring, router, health/status                                |
-| `src/consensus.rs`| multi-Raft core: shards, per-shard log + role, routing, `propose` |
-| `src/state.rs`    | replicated state machine: `Command`s and coordination state       |
-| `src/kv.rs`       | config KV + watch handlers                                        |
-| `src/locks.rs`    | mutual-exclusion lock handlers                                    |
-| `src/rate_limit.rs` | distributed rate-limit handlers                                 |
-| `src/schedule.rs` | cron / one-shot schedule handlers                                 |
-| `src/election.rs` | leader-election handlers                                          |
-| `src/discovery.rs`| service-discovery handlers                                        |
->>>>>>> origin/main
 
 ## Run locally
 
@@ -276,11 +189,5 @@ curl localhost:8090/v1/status        # per-shard role / term / commit index
 ## Related
 
 - [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane (placement, scaling, failure handling).
-<<<<<<< HEAD
 - [`fiducia-node-sidecar.rs`](https://github.com/fiducia-cloud/fiducia-node-sidecar.rs) — per-node bridge to the brain + observability.
 - [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website/marketing webserver.
-=======
-- [`fiducia-load-balance.rs`](https://github.com/fiducia-cloud/fiducia-load-balance.rs) — key-aware router that sends requests to each shard leader.
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the customer portal/webserver.
-- [`fiducia-ui.web`](https://github.com/fiducia-cloud/fiducia-ui.web) — the website frontend.
->>>>>>> origin/main
