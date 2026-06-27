@@ -1292,35 +1292,124 @@ pub fn valid_cron_expression(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lock_acquire_queues_and_transfers_with_fencing_tokens() {
-        let sm = StateMachine::new();
-        let first = sm.apply(Command::LockAcquire {
-            key: "orders/checkout".to_string(),
-            holder: "worker-a".to_string(),
+    fn acquire(sm: &StateMachine, keys: &[&str], holder: &str, wait: bool) -> Value {
+        sm.apply(Command::LockAcquire {
+            keys: keys.iter().map(|s| s.to_string()).collect(),
+            holder: holder.to_string(),
             ttl_ms: 30_000,
-            wait: false,
-        });
-        assert_eq!(first.output["acquired"], true);
-        let token = first.output["fencing_token"].as_u64().unwrap();
+            wait,
+        })
+        .output
+    }
 
-        let second = sm.apply(Command::LockAcquire {
-            key: "orders/checkout".to_string(),
-            holder: "worker-b".to_string(),
-            ttl_ms: 30_000,
-            wait: true,
-        });
-        assert_eq!(second.output["queued"], true);
-        assert_eq!(second.output["position"], 1);
+    #[test]
+    fn single_key_lock_queues_and_transfers_with_monotonic_fencing_tokens() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["orders/checkout"], "worker-a", false);
+        assert_eq!(first["acquired"], true);
+        let token = first["fencing_token"].as_u64().unwrap();
+
+        let second = acquire(&sm, &["orders/checkout"], "worker-b", true);
+        assert_eq!(second["queued"], true);
+        assert_eq!(second["position"], 1);
 
         let release = sm.apply(Command::LockRelease {
-            key: "orders/checkout".to_string(),
             holder: "worker-a".to_string(),
             fencing_token: token,
         });
         assert_eq!(release.output["released"], true);
-        assert_eq!(release.output["transferred_to"], "worker-b");
-        assert!(release.output["fencing_token"].as_u64().unwrap() > token);
+        // worker-b is promoted with a strictly newer fencing token.
+        let promoted = &release.output["promoted"][0];
+        assert_eq!(promoted["holder"], "worker-b");
+        assert!(promoted["fencing_token"].as_u64().unwrap() > token);
+        // ...and now holds the key.
+        assert_eq!(sm.lock_get("orders/checkout").holder.as_deref(), Some("worker-b"));
+    }
+
+    #[test]
+    fn multi_key_union_lock_conflicts_on_any_shared_member() {
+        let sm = StateMachine::new();
+        // Hold the union {a, b}.
+        let g1 = acquire(&sm, &["a", "b"], "holder-1", false);
+        assert_eq!(g1["acquired"], true);
+
+        // {b, c} overlaps on b → must conflict and queue.
+        let g2 = acquire(&sm, &["b", "c"], "holder-2", true);
+        assert_eq!(g2["acquired"], false);
+        assert_eq!(g2["queued"], true);
+        assert_eq!(g2["conflicts"], json!(["b"]));
+
+        // {d, e} is disjoint → grants immediately even while {a,b} is held.
+        let g3 = acquire(&sm, &["d", "e"], "holder-3", false);
+        assert_eq!(g3["acquired"], true);
+
+        // Release {a,b}; holder-2's {b,c} is now grantable and is promoted.
+        let token1 = g1["fencing_token"].as_u64().unwrap();
+        let rel = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        assert_eq!(rel.output["promoted"][0]["holder"], "holder-2");
+        assert_eq!(sm.lock_get("c").holder.as_deref(), Some("holder-2"));
+        assert_eq!(sm.lock_get("b").holder.as_deref(), Some("holder-2"));
+    }
+
+    #[test]
+    fn union_queue_is_fifo_fair_and_deadlock_free() {
+        let sm = StateMachine::new();
+        // holder-1 holds {x}. Two waiters queue behind it: {x,y} then {y}.
+        let g1 = acquire(&sm, &["x"], "holder-1", false);
+        let w_xy = acquire(&sm, &["x", "y"], "holder-2", true);
+        assert_eq!(w_xy["queued"], true);
+        // {y} alone is free, BUT holder-2 ({x,y}) is ahead and reserves y, so a
+        // later {y} request must wait behind it (no barging → no starvation).
+        let w_y = acquire(&sm, &["y"], "holder-3", true);
+        assert_eq!(w_y["queued"], true);
+        assert_eq!(w_y["position"], 2);
+
+        // Release {x}: holder-2 ({x,y}) is promoted first (FIFO); holder-3 still waits.
+        let rel = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: g1["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(rel.output["promoted"][0]["holder"], "holder-2");
+        assert_eq!(sm.lock_get("y").holder.as_deref(), Some("holder-2"));
+        assert_eq!(sm.lock_get("y").wait_queue[0].holder, "holder-3");
+    }
+
+    #[test]
+    fn semaphore_caps_concurrent_holders_and_admits_in_fifo() {
+        let sm = StateMachine::new();
+        let acq = |holder: &str, wait: bool| {
+            sm.apply(Command::SemaphoreAcquire {
+                key: "db-pool".to_string(),
+                holder: holder.to_string(),
+                limit: 2,
+                ttl_ms: 30_000,
+                wait,
+            })
+            .output
+        };
+        // limit = 2: first two acquire, third is capped out and queues.
+        let a = acq("a", false);
+        let b = acq("b", false);
+        let c = acq("c", true);
+        assert_eq!(a["acquired"], true);
+        assert_eq!(b["acquired"], true);
+        assert_eq!(c["acquired"], false);
+        assert_eq!(c["queued"], true);
+        assert_eq!(sm.semaphore_get("db-pool").available, 0);
+
+        // a releases its permit → c is admitted.
+        let rel = sm.apply(Command::SemaphoreRelease {
+            key: "db-pool".to_string(),
+            holder: "a".to_string(),
+            fencing_token: a["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(rel.output["promoted"][0]["holder"], "c");
+        let state = sm.semaphore_get("db-pool");
+        assert_eq!(state.holders.len(), 2);
+        assert!(state.holders.iter().any(|h| h.holder == "c"));
     }
 
     #[test]
