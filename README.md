@@ -65,9 +65,14 @@ model, made linearizable by Raft):
 **Semaphores** generalize a lock to *N* holders (a mutex is `limit = 1`):
 
 ```bash
-curl -XPOST localhost:8090/v1/semaphores/db-pool/acquire \
-  -d '{"holder":"conn-1","limit":10,"ttl_ms":30000,"wait":true}'
+curl -XPOST localhost:8090/v1/semaphores/acquire \
+  -d '{"key":"db-pool","holder":"conn-1","limit":10,"ttl_ms":30000,"wait":true}'
 ```
+
+All keys are hierarchical — they may contain slashes (`flags/checkout`,
+`orders/42`, `pools/db/primary`). Lock/semaphore keys travel in the request body;
+KV keys are a catch-all path segment (`GET /v1/kv/flags/checkout`), with `watch`
+as a query flag (`GET /v1/kv/flags/checkout?watch=true`).
 
 > **Why locks route to one coordinator.** Granting `{a,b,c}` atomically and
 > detecting it conflicts with a holder of `{b}` requires one state machine to see
