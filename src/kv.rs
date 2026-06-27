@@ -6,24 +6,26 @@
 //! [`Node::query`]. `watch` streams change events so clients get live config
 //! push instead of polling.
 //!
-//! Keys are a **catch-all path segment**, so they may contain slashes
-//! (`flags/checkout`, `a/b/c/d`) — the whole point of a hierarchical config store.
+//! **The key is a `?key=` query parameter, never a path segment.** That keeps it
+//! free of any path grammar (it may contain slashes, dots, be empty, etc.) and
+//! gives the load balancer one uniform place to find the routing key on every
+//! request — the same reason etcd carries keys in the request, not the URL.
 //!
 //! Routes (mounted under `/v1/kv`):
-//!   * `GET    /v1/kv/{key}`             — read a key (+ its revision)
-//!   * `GET    /v1/kv/{key}?watch=true`  — SSE stream of changes (add `&prefix=true`)
-//!   * `PUT    /v1/kv/{key}`             — upsert `{ "value", "ttl_ms"? }`, optional CAS
-//!   * `DELETE /v1/kv/{key}`             — delete a key
-//!   * `GET    /v1/kv?prefix=...`        — list keys under a prefix
-
-use std::sync::Arc;
+//!   * `GET    /v1/kv?key=K`              — read a key (+ its revision)
+//!   * `GET    /v1/kv?key=K&watch=true`   — SSE stream of changes for that key
+//!   * `GET    /v1/kv?prefix=P&watch=true`— SSE stream for every key under prefix `P`
+//!   * `GET    /v1/kv?prefix=P`           — list keys under a prefix
+//!   * `PUT    /v1/kv?key=K`              — upsert `{ "value", "ttl_ms"? }`, optional CAS
+//!   * `DELETE /v1/kv?key=K`              — delete a key
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::Uri,
+    extract::{Query, State},
+    http::{StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -47,42 +49,58 @@ pub struct PutBody {
     pub prev_revision: Option<u64>,
 }
 
-pub fn router() -> Router<Arc<Node>> {
-    // `/*key` is a catch-all so keys may contain slashes (`flags/checkout`,
-    // `orders/42/lock`). `watch` is a query flag on GET rather than a `/{key}/watch`
-    // suffix, because a catch-all can't be followed by another path segment.
-    Router::new()
-        .route("/", get(list))
-        .route("/*key", get(get_or_watch).put(put_key).delete(delete_key))
+/// Query parameters shared by the KV verbs. `key` selects a single key;
+/// `prefix` selects a range (for list / prefix-watch); `watch` switches a read
+/// into an SSE stream.
+#[derive(Debug, Default, Deserialize)]
+pub struct KvParams {
+    pub key: Option<String>,
+    pub prefix: Option<String>,
+    pub watch: Option<bool>,
 }
 
-/// `GET /v1/kv/{key}` — read one key, or (with `?watch=true`) stream its changes.
-async fn get_or_watch(
+pub fn router() -> Router<Arc<Node>> {
+    Router::new().route("/", get(get_or_list).put(put_key).delete(delete_key))
+}
+
+/// `GET /v1/kv` — read a key, watch a key/prefix, or list a prefix, by query.
+async fn get_or_list(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
-    Query(q): Query<GetQuery>,
+    Query(q): Query<KvParams>,
 ) -> Response {
     if q.watch.unwrap_or(false) {
-        return watch(node, key, q.prefix.unwrap_or(false)).await;
+        return match (q.key, q.prefix) {
+            (Some(key), _) => watch(node, key, false).await,
+            (None, Some(prefix)) => watch(node, prefix, true).await,
+            (None, None) => bad_request("watch requires `key` or `prefix`"),
+        };
     }
-    match node.query(ReadRequest::Kv { key: key.clone() }).await {
-        Ok(ReadResponse::Kv(Some(entry))) => {
-            Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
-        }
-        Ok(ReadResponse::Kv(None)) => Json(json!({ "key": key, "found": false })).into_response(),
-        Err(err) => read_error_response(err, &uri),
-        _ => Json(json!({ "error": "unavailable" })).into_response(),
+    match q.key {
+        Some(key) => match node.query(ReadRequest::Kv { key: key.clone() }).await {
+            Ok(ReadResponse::Kv(Some(entry))) => {
+                Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
+            }
+            Ok(ReadResponse::Kv(None)) => {
+                Json(json!({ "key": key, "found": false })).into_response()
+            }
+            Err(err) => read_error_response(err, &uri),
+            _ => Json(json!({ "error": "unavailable" })).into_response(),
+        },
+        None => list(q.prefix),
     }
 }
 
-/// `PUT /v1/kv/{key}` — upsert (optionally compare-and-swap).
+/// `PUT /v1/kv?key=K` — upsert (optionally compare-and-swap). Value in the body.
 async fn put_key(
     State(node): State<Arc<Node>>,
     uri: Uri,
-    Path(key): Path<String>,
+    Query(q): Query<KvParams>,
     Json(body): Json<PutBody>,
 ) -> Response {
+    let Some(key) = q.key else {
+        return bad_request("missing `key`");
+    };
     let result = node
         .propose(Command::KvPut {
             key,
@@ -94,30 +112,27 @@ async fn put_key(
     propose_response(result, &uri)
 }
 
-/// `DELETE /v1/kv/{key}` — remove a key.
-async fn delete_key(State(node): State<Arc<Node>>, uri: Uri, Path(key): Path<String>) -> Response {
+/// `DELETE /v1/kv?key=K` — remove a key.
+async fn delete_key(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Query(q): Query<KvParams>,
+) -> Response {
+    let Some(key) = q.key else {
+        return bad_request("missing `key`");
+    };
     let result = node.propose(Command::KvDelete { key }).await;
     propose_response(result, &uri)
 }
 
 /// `GET /v1/kv?prefix=...` — list keys under a prefix.
-async fn list(State(_node): State<Arc<Node>>) -> Json<Value> {
+fn list(prefix: Option<String>) -> Response {
     // TODO: a prefix can span shards, so this fans out across the shards it
     // touches (a per-shard Query each) and merges the results.
-    Json(json!({ "error": "not_implemented", "op": "kv.list" }))
+    Json(json!({ "error": "not_implemented", "op": "kv.list", "prefix": prefix })).into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GetQuery {
-    /// Stream changes as Server-Sent Events instead of returning the current value.
-    pub watch: Option<bool>,
-    /// With `watch`, match every key that *starts with* `{key}` (best-effort:
-    /// only keys on the same shard as the prefix are observed).
-    pub prefix: Option<bool>,
-}
-
-/// `GET /v1/kv/{key}?watch=true` — SSE stream of change events for a key (or, with
-/// `&prefix=true`, a prefix).
+/// SSE stream of change events for a key (or, when `prefix`, every key under it).
 ///
 /// Subscribes to the owning shard's change broadcast and pushes one SSE event per
 /// committed put/delete that matches. The connection is long-lived (no request
@@ -146,5 +161,13 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
     });
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+fn bad_request(detail: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "bad_request", "detail": detail })),
+    )
         .into_response()
 }
