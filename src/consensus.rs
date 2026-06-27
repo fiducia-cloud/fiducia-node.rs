@@ -429,6 +429,13 @@ impl ShardActor {
     fn start_election(&mut self) {
         self.current_term += 1;
         self.role = Role::Candidate;
+        tracing::info!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            term = self.current_term,
+            members = self.members,
+            "raft: election timeout — starting campaign as candidate"
+        );
         self.voted_for = Some(self.node_id.clone());
         self.leader_id = None;
         self.votes.clear();
