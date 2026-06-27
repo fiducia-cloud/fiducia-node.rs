@@ -58,7 +58,7 @@ async fn campaign(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
     Json(body): Json<CampaignBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ElectionCampaign {
             name,
@@ -66,7 +66,7 @@ async fn campaign(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `POST /v1/elections/{name}/renew` — extend the lease (must hold the token).
