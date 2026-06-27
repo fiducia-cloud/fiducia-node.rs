@@ -1015,6 +1015,7 @@ impl Node {
 
     /// Stop all shard actors and, for loopback, remove this node from the
     /// registry — i.e. simulate the node going away (used by failover tests).
+    #[allow(dead_code)]
     pub fn shutdown(&self, registry: Option<&LoopbackRegistry>) {
         for task in &self.tasks {
             task.abort();
