@@ -137,7 +137,10 @@ pub enum Command {
 /// exactly that. KV/rate-limit/discovery/etc. stay sharded by their own key.
 /// Sharding the lock space across coordinators (cross-shard 2PC for sets that
 /// span them) is the documented scaling path.
-pub const LOCK_DOMAIN: &str = "\u{0}fiducia-lock-coordinator";
+///
+/// Defined in the shared [`fiducia_routing`] crate so the node, the load
+/// balancer, and the brain route locks to the **same** coordinator shard.
+pub const LOCK_DOMAIN: &str = fiducia_routing::LOCK_COORDINATION_KEY;
 
 impl Command {
     /// Key used to route this command to its owning shard.
