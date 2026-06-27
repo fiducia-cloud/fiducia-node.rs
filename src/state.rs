@@ -127,14 +127,28 @@ pub enum Command {
     },
 }
 
+/// Routing key under which **all** lock + semaphore state lives, so the entire
+/// lock service is one linearizable Raft group (one shard leader).
+///
+/// This is the price of correct multi-key **union** locking: to grant `{A,B,C}`
+/// atomically and detect that it conflicts with a holder of `{B}`, one state
+/// machine must see every member key together. Routing every lock/semaphore
+/// command to a single coordinator (the live-mutex single-broker model) gives
+/// exactly that. KV/rate-limit/discovery/etc. stay sharded by their own key.
+/// Sharding the lock space across coordinators (cross-shard 2PC for sets that
+/// span them) is the documented scaling path.
+pub const LOCK_DOMAIN: &str = "\u{0}fiducia-lock-coordinator";
+
 impl Command {
     /// Key used to route this command to its owning shard.
     pub fn routing_key(&self) -> &str {
         match self {
+            Command::LockAcquire { .. }
+            | Command::LockRelease { .. }
+            | Command::SemaphoreAcquire { .. }
+            | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
-            | Command::LockAcquire { key, .. }
-            | Command::LockRelease { key, .. }
             | Command::RateLimitCheck { key, .. } => key,
             Command::ScheduleUpsert { name, .. } | Command::ScheduleRecordRun { name, .. } => name,
             Command::ElectionCampaign { name, .. }
