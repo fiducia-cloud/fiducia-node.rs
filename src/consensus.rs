@@ -482,10 +482,75 @@ pub enum ProposeError {
     Unavailable { shard: ShardId },
 }
 
-/// Render a propose result as JSON for an HTTP response (shared by handlers).
-pub fn propose_json(result: Result<ProposeOutcome, ProposeError>) -> serde_json::Value {
+/// Build the HTTP response for a propose result, including the **NotLeader
+/// redirect contract**.
+///
+/// A follower that receives a write returns `421 Misdirected Request` with the
+/// shard's current leader in the `x-fiducia-leader` header (and JSON body), so
+/// the load balancer (or a client) re-routes to the leader. The follower knows
+/// the leader from its own Raft state (`leader_id`, learned via `AppendEntries`),
+/// so this works even when the LB's `shard → leader` cache is stale or empty.
+pub fn propose_response(result: Result<ProposeOutcome, ProposeError>) -> axum::response::Response {
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
     match result {
-        Ok(outcome) => serde_json::json!({ "committed": true, "result": outcome }),
-        Err(err) => serde_json::json!({ "committed": false, "error": err }),
+        Ok(outcome) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "committed": true, "result": outcome })),
+        )
+            .into_response(),
+        Err(ProposeError::NotLeader { shard, leader }) => {
+            let leader_hdr = leader.clone();
+            let body = serde_json::json!({
+                "committed": false, "reason": "not_leader", "shard": shard, "leader": leader,
+            });
+            let mut resp = (StatusCode::MISDIRECTED_REQUEST, axum::Json(body)).into_response();
+            if let Some(hv) = leader_hdr.as_deref().and_then(|l| HeaderValue::from_str(l).ok()) {
+                resp.headers_mut().insert("x-fiducia-leader", hv);
+            }
+            resp
+        }
+        Err(ProposeError::Unavailable { shard }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "committed": false, "reason": "unavailable", "shard": shard })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn not_leader_returns_421_and_leader_header() {
+        // A follower kicks the write back with the leader it knows, so the LB
+        // can re-route even if its cache is stale.
+        let resp = propose_response(Err(ProposeError::NotLeader {
+            shard: 3,
+            leader: Some("node-b".into()),
+        }));
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(resp.headers().get("x-fiducia-leader").unwrap(), "node-b");
+    }
+
+    #[test]
+    fn not_leader_without_known_leader_is_421_without_header() {
+        let resp = propose_response(Err(ProposeError::NotLeader { shard: 3, leader: None }));
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert!(resp.headers().get("x-fiducia-leader").is_none());
+    }
+
+    #[test]
+    fn ok_is_200_and_unavailable_is_503() {
+        assert_eq!(
+            propose_response(Ok(ProposeOutcome { shard: 0, log_index: 1, revision: 1 })).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            propose_response(Err(ProposeError::Unavailable { shard: 1 })).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
