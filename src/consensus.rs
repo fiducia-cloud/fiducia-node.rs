@@ -868,7 +868,11 @@ impl ShardActor {
 pub struct Node {
     config: NodeConfig,
     shards: HashMap<ShardId, mpsc::Sender<ShardMsg>>,
+    /// Kept alive so the shared transport outlives the actors that clone it.
+    #[allow(dead_code)]
     transport: Arc<Transport>,
+    /// Shard actor handles — used by `shutdown` (failover tests / graceful stop).
+    #[allow(dead_code)]
     tasks: Vec<JoinHandle<()>>,
 }
 
