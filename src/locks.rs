@@ -106,17 +106,6 @@ async fn release_token(
     release(node, uri, body).await
 }
 
-/// `POST /v1/locks/{key}/release` — convenience; the grant is still identified by
-/// its fencing token (the path key only names the route).
-async fn release_one(
-    State(node): State<Arc<Node>>,
-    uri: Uri,
-    Path(_key): Path<String>,
-    Json(body): Json<ReleaseBody>,
-) -> Response {
-    release(node, uri, body).await
-}
-
 async fn release(node: Arc<Node>, uri: Uri, body: ReleaseBody) -> Response {
     let result = node
         .propose(Command::LockRelease {
