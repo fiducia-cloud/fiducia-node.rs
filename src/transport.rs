@@ -135,6 +135,7 @@ pub enum Transport {
 }
 
 impl Transport {
+    #[allow(dead_code)]
     pub fn loopback(registry: LoopbackRegistry) -> Self {
         Transport::Loopback(registry)
     }
