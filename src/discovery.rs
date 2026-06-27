@@ -66,7 +66,7 @@ async fn register(
     State(node): State<Arc<Node>>,
     Path((service, id)): Path<(String, String)>,
     Json(body): Json<RegisterBody>,
-) -> Json<Value> {
+) -> Response {
     let result = node
         .propose(Command::ServiceRegister {
             service,
@@ -75,7 +75,7 @@ async fn register(
             ttl_ms: body.ttl_ms,
         })
         .await;
-    Json(propose_json(result))
+    propose_response(result)
 }
 
 /// `POST /v1/services/{service}/instances/{id}/heartbeat` — renew the lease.
