@@ -61,15 +61,9 @@ pub fn router() -> Router<Arc<Node>> {
 }
 
 /// `GET /v1/locks?key=K` — inspect lock state for one member key.
-async fn get_lock(
-    State(node): State<Arc<Node>>,
-    uri: Uri,
-    Query(q): Query<KeyParam>,
-) -> Response {
+async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<KeyParam>) -> Response {
     match node.query(ReadRequest::Lock { key: q.key.clone() }).await {
-        Ok(ReadResponse::Lock(lock)) => {
-            Json(json!({ "key": q.key, "lock": lock })).into_response()
-        }
+        Ok(ReadResponse::Lock(lock)) => Json(json!({ "key": q.key, "lock": lock })).into_response(),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
@@ -130,9 +124,30 @@ async fn release(node: Arc<Node>, uri: Uri, body: ReleaseBody) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn router_builds_with_union_and_single_key_routes() {
         let _ = router();
+    }
+
+    #[test]
+    fn acquire_body_accepts_union_keys_with_slashes() {
+        let body: AcquireBody = serde_json::from_value(json!({
+            "keys": ["orders/42", "inventory/sku-7"],
+            "holder": "worker-a",
+            "ttl_ms": 15_000,
+            "wait": true
+        }))
+        .unwrap();
+
+        assert_eq!(
+            body.keys.unwrap(),
+            vec!["orders/42".to_string(), "inventory/sku-7".to_string()]
+        );
+        assert_eq!(body.key, None);
+        assert_eq!(body.holder.as_deref(), Some("worker-a"));
+        assert_eq!(body.ttl_ms, Some(15_000));
+        assert_eq!(body.wait, Some(true));
     }
 }
