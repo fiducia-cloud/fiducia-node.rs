@@ -352,6 +352,11 @@ struct ShardActor {
     timing: RaftTiming,
     election_deadline: Instant,
     heartbeat_deadline: Instant,
+    /// When we last heard from a valid leader (an `AppendEntries`). Tracked
+    /// **separately** from `election_deadline` (which we reset for our own
+    /// campaigning) so pre-vote's leader-stickiness reflects the *leader's*
+    /// liveness, not our candidacy.
+    last_leader_contact: Instant,
     rng: Rng,
 
     // --- client write waiters: log index → who is blocked on its commit ---
