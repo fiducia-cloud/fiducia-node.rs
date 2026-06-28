@@ -1122,18 +1122,70 @@ impl ShardActor {
         }
     }
 
-    fn publish_change(&self, command: &Command, revision: u64) {
+    fn publish_change(&self, command: &Command, output: &serde_json::Value, revision: u64) {
+        // Only publish changes that actually mutated state: a campaign that lost
+        // or a renew by a stale token must not look like a leadership change.
+        let flagged = |field: &str| output.get(field).and_then(|v| v.as_bool()).unwrap_or(false);
+        let detail = |field: &str| output.get(field).cloned();
         let event = match command {
             Command::KvPut { key, .. } => Some(ChangeEvent {
+                scope: "kv",
                 kind: "put",
                 key: key.clone(),
                 revision,
+                detail: None,
             }),
             Command::KvDelete { key } => Some(ChangeEvent {
+                scope: "kv",
                 kind: "delete",
                 key: key.clone(),
                 revision,
+                detail: None,
             }),
+            Command::ElectionCampaign { name, .. } if flagged("won") => Some(ChangeEvent {
+                scope: "election",
+                kind: "elected",
+                key: name.clone(),
+                revision,
+                detail: detail("leadership"),
+            }),
+            Command::ElectionRenew { name, .. } if flagged("renewed") => Some(ChangeEvent {
+                scope: "election",
+                kind: "renewed",
+                key: name.clone(),
+                revision,
+                detail: detail("leadership"),
+            }),
+            Command::ElectionResign { name, .. } if flagged("resigned") => Some(ChangeEvent {
+                scope: "election",
+                kind: "resigned",
+                key: name.clone(),
+                revision,
+                detail: None,
+            }),
+            Command::ServiceRegister { service, .. } if flagged("registered") => Some(ChangeEvent {
+                scope: "service",
+                kind: "register",
+                key: service.clone(),
+                revision,
+                detail: detail("instance"),
+            }),
+            Command::ServiceHeartbeat { service, .. } if flagged("heartbeat") => Some(ChangeEvent {
+                scope: "service",
+                kind: "heartbeat",
+                key: service.clone(),
+                revision,
+                detail: detail("instance"),
+            }),
+            Command::ServiceDeregister { service, .. } if flagged("deregistered") => {
+                Some(ChangeEvent {
+                    scope: "service",
+                    kind: "deregister",
+                    key: service.clone(),
+                    revision,
+                    detail: None,
+                })
+            }
             _ => None,
         };
         if let Some(event) = event {
