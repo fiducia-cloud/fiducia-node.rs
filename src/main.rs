@@ -56,6 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let node = Arc::new(Node::bootstrap_http(config));
 
+    // The cron firing loop: fires due schedules on the shards this node leads.
+    schedule_runner::spawn(node.clone());
+
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
