@@ -400,10 +400,16 @@ impl ShardActor {
         transport: Arc<Transport>,
         self_tx: mpsc::Sender<ShardMsg>,
         timing: RaftTiming,
+        store: Option<ShardStore>,
+        recovered: Recovered,
     ) -> Self {
         let members = peers.len() + 1;
         let single = members == 1;
         let (changes, _) = broadcast::channel(CHANGE_BUFFER);
+        // Seed from disk when we have it. A fresh shard recovers `term == 0`; this
+        // engine numbers terms from 1, so keep the floor at 1 for a clean start.
+        let current_term = recovered.current_term.max(1);
+        let recovered_commit = recovered.commit_index.min(recovered.log.len() as u64);
         let mut actor = ShardActor {
             shard_id,
             node_id: node_id.clone(),
@@ -411,15 +417,17 @@ impl ShardActor {
             members,
             transport,
             self_tx,
-            // A single-node shard leads itself from t=0 (no one to elect against);
-            // a real group starts as a follower and runs an election.
+            // We always restart as a follower (even if we last led) so a stale term
+            // can't serve writes before re-validation; a single-node shard is the
+            // exception — it has no one to elect against, so it leads from t=0.
             role: if single { Role::Leader } else { Role::Follower },
-            current_term: 1,
-            voted_for: None,
+            current_term,
+            voted_for: recovered.voted_for,
             leader_id: if single { Some(node_id.clone()) } else { None },
-            log: Vec::new(),
-            commit_index: 0,
+            log: recovered.log,
+            commit_index: recovered_commit,
             last_applied: 0,
+            store,
             votes: HashSet::new(),
             pre_votes: HashSet::new(),
             pre_vote_term: 0,
