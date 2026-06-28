@@ -349,6 +349,15 @@ pub enum ReadRequest {
     /// Every schedule definition on one shard. Fanned out by
     /// [`Node::list_schedules`] for the firing loop to find due fires.
     ScheduleList,
+    /// Whole-coordinator lock inventory: every grant + the FIFO wait queue. All
+    /// lock state lives on the [`LOCK_DOMAIN`](crate::state::LOCK_DOMAIN) shard,
+    /// so this routes to that single shard.
+    LockInventory,
+    /// Snapshot of every counting semaphore on the lock-coordinator shard.
+    SemaphoreInventory,
+    /// Every named election with live leadership on one shard. Elections route by
+    /// name, so [`Node::list_elections`] fans this out and merges.
+    ElectionList,
 }
 
 impl ReadRequest {
