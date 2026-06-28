@@ -63,18 +63,83 @@ pub use fiducia_routing::ShardId;
 
 /// Depth of each shard actor's inbox before senders must wait.
 const SHARD_INBOX_CAPACITY: usize = 1024;
-/// How often a shard actor wakes to check election/heartbeat deadlines.
-const TICK: Duration = Duration::from_millis(20);
-/// Leaders send heartbeats this often (must be << the election timeout).
-const HEARTBEAT: Duration = Duration::from_millis(50);
-/// Election timeout base; the actual timeout is `MIN + rand(0..JITTER)` so peers
-/// don't all campaign at once (the standard split-vote avoidance).
-const ELECTION_MIN_MS: u64 = 150;
-const ELECTION_JITTER_MS: u64 = 150;
 /// How long a client write waits for its entry to commit before giving up.
 const COMMIT_WAIT: Duration = Duration::from_secs(5);
 /// Capacity of each shard's change-event broadcast (feeds KV watches).
 const CHANGE_BUFFER: usize = 256;
+
+/// Raft timing knobs. The defaults are the original **LAN** values, so a node
+/// started with none of the env vars set behaves byte-for-byte as before. For a
+/// cross-cloud (WAN) deployment these must be sized **above** the inter-cloud
+/// round-trip + jitter, or transatlantic latency triggers spurious elections and
+/// leadership flapping — set e.g. `FIDUCIA_RAFT_HEARTBEAT_MS=150`,
+/// `FIDUCIA_RAFT_ELECTION_MIN_MS=1000`, `FIDUCIA_RAFT_ELECTION_JITTER_MS=1000`.
+#[derive(Debug, Clone, Copy)]
+pub struct RaftTiming {
+    /// How often a shard actor wakes to check election/heartbeat deadlines.
+    pub tick: Duration,
+    /// How often a leader sends heartbeats (must be `<<` the election timeout).
+    pub heartbeat: Duration,
+    /// Election-timeout base; the actual timeout is `min + rand(0..jitter)` so
+    /// peers don't all campaign at once (split-vote avoidance).
+    pub election_min_ms: u64,
+    pub election_jitter_ms: u64,
+    /// PreVote (Raft thesis §9.6): run a non-binding straw poll before
+    /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
+    /// leader on rejoin. Strictly safer on a WAN; on by default.
+    pub pre_vote: bool,
+}
+
+impl Default for RaftTiming {
+    fn default() -> Self {
+        RaftTiming {
+            tick: Duration::from_millis(20),
+            heartbeat: Duration::from_millis(50),
+            election_min_ms: 150,
+            election_jitter_ms: 150,
+            pre_vote: true,
+        }
+    }
+}
+
+impl RaftTiming {
+    /// Read timing from the environment, falling back to the LAN defaults. Logs a
+    /// warning if the election timeout isn't comfortably above the heartbeat
+    /// (a config that would self-inflict spurious elections).
+    pub fn from_env() -> Self {
+        fn ms(var: &str, default: u64) -> u64 {
+            std::env::var(var)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = RaftTiming::default();
+        let timing = RaftTiming {
+            tick: Duration::from_millis(ms("FIDUCIA_RAFT_TICK_MS", d.tick.as_millis() as u64)),
+            heartbeat: Duration::from_millis(ms(
+                "FIDUCIA_RAFT_HEARTBEAT_MS",
+                d.heartbeat.as_millis() as u64,
+            )),
+            election_min_ms: ms("FIDUCIA_RAFT_ELECTION_MIN_MS", d.election_min_ms),
+            election_jitter_ms: ms("FIDUCIA_RAFT_ELECTION_JITTER_MS", d.election_jitter_ms),
+            pre_vote: std::env::var("FIDUCIA_RAFT_PREVOTE")
+                .ok()
+                .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+                .unwrap_or(d.pre_vote),
+        };
+        let heartbeat_ms = timing.heartbeat.as_millis() as u64;
+        if timing.election_min_ms < heartbeat_ms.saturating_mul(3) {
+            tracing::warn!(
+                heartbeat_ms,
+                election_min_ms = timing.election_min_ms,
+                election_jitter_ms = timing.election_jitter_ms,
+                "raft timing: election timeout is not >= 3x the heartbeat — spurious \
+                 elections are likely; raise FIDUCIA_RAFT_ELECTION_MIN_MS for this RTT"
+            );
+        }
+        timing
+    }
+}
 
 /// A node's role *within a single shard's* Raft group. A node holds a `Role` per
 /// shard it replicates — `Leader` for some, `Follower` for others.
