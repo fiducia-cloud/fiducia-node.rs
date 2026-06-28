@@ -802,13 +802,20 @@ impl ShardActor {
             members = self.members,
             "raft: won election — now leader for shard"
         );
-        self.votes.clear();
+        // The peers that just voted for us *are* fresh majority contact, so seed the
+        // leader lease from them — otherwise the very first lease window would look
+        // expired and we'd step down before the first heartbeat round returns.
+        let voters = std::mem::take(&mut self.votes);
+        let now = Instant::now();
         let mut ls = LeaderState::default();
         let next = self.last_log_index() + 1;
         for peer in &self.peers {
             ls.next_index.insert(peer.clone(), next);
             ls.match_index.insert(peer.clone(), 0);
             ls.in_flight.insert(peer.clone(), false);
+            if voters.contains(peer) {
+                ls.last_contact.insert(peer.clone(), now);
+            }
         }
         self.leader = Some(ls);
 
