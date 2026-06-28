@@ -1587,6 +1587,21 @@ impl Node {
             .collect()
     }
 
+    /// Every schedule definition across all shards this node hosts. The firing
+    /// loop reads this, keeps only schedules whose shard it currently leads, and
+    /// fires the due ones.
+    pub async fn list_schedules(&self) -> Vec<Schedule> {
+        self.query_all_shards(|| ReadRequest::ScheduleList)
+            .await
+            .into_iter()
+            .filter_map(|r| match r {
+                ReadResponse::ScheduleList(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Per-shard consensus status across all shards this node hosts.
     pub async fn status(&self) -> NodeStatus {
         let mut shards: Vec<ShardStatus> = Vec::with_capacity(self.shards.len());
