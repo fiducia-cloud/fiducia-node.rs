@@ -1935,6 +1935,7 @@ mod tests {
                     election_min_ms: 1_000,
                     election_jitter_ms: 500,
                     commit_wait_ms: 10_000,
+                    pre_vote: true,
                 },
             },
             Transport::loopback(reg),
