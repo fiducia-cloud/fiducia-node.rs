@@ -526,6 +526,14 @@ impl ShardActor {
     /// Convert to follower at `term`, optionally learning the new leader. Fails
     /// any outstanding client writes so they retry against the real leader.
     fn step_down(&mut self, term: u64, leader: Option<String>) {
+        if self.role != Role::Follower {
+            tracing::info!(
+                shard = ?self.shard_id,
+                node = %self.node_id,
+                term,
+                "raft: stepped down to follower (observed a higher term)"
+            );
+        }
         self.current_term = term;
         self.voted_for = None;
         self.role = Role::Follower;
