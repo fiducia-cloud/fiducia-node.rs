@@ -2172,4 +2172,82 @@ mod tests {
             other => panic!("unexpected read after unresponsive failover: {other:?}"),
         }
     }
+
+    // --- PreVote (anti-disruption straw poll) -----------------------------
+
+    /// Bare follower shard actor (3-member group) for white-box tests of the
+    /// pre-vote decision. Not wired into any cluster.
+    fn follower_actor() -> ShardActor {
+        let reg = LoopbackRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        ShardActor::new(
+            0,
+            "a".to_string(),
+            vec!["b".to_string(), "c".to_string()],
+            Arc::new(Transport::loopback(reg)),
+            tx,
+            RaftTiming::default(),
+        )
+    }
+
+    fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {
+        RequestVoteReq {
+            term,
+            candidate_id: "z".to_string(),
+            last_log_index,
+            last_log_term,
+            pre_vote: true,
+        }
+    }
+
+    /// The anti-disruption property: while a leader is alive (recent contact), a
+    /// pre-vote is denied — so a rejoining node can't bump the cluster's term —
+    /// but with no leader (or stale contact) it is granted so failover proceeds.
+    #[test]
+    fn pre_vote_is_denied_under_a_live_leader_and_granted_otherwise() {
+        let mut a = follower_actor();
+
+        // Cold start: no leader known → granted (the first election must run).
+        assert!(a.leader_id.is_none());
+        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+
+        // Healthy leader, contact fresh → denied; and no state is mutated.
+        a.leader_id = Some("b".to_string());
+        a.last_leader_contact = Instant::now();
+        assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+        assert_eq!(a.current_term, 1);
+        assert_eq!(a.voted_for, None);
+        assert_eq!(a.role, Role::Follower);
+
+        // Leader known but contact stale (missed heartbeats) → granted.
+        a.last_leader_contact = Instant::now() - Duration::from_secs(1);
+        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+    }
+
+    /// Pre-vote still enforces the safety checks: a stale would-be term and a
+    /// behind log are both refused even when no leader is alive.
+    #[test]
+    fn pre_vote_refuses_stale_term_and_behind_log() {
+        let mut a = follower_actor();
+        a.leader_id = None; // remove leader-stickiness from the picture
+
+        // Stale would-be term (< our current term) → denied.
+        assert!(!a.handle_pre_vote(&pre_vote_req(0, 0, 0)).granted);
+
+        // Holding one entry at term 1: a behind candidate is denied, a caught-up
+        // one is granted.
+        a.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: None,
+        });
+        assert!(
+            !a.handle_pre_vote(&pre_vote_req(5, 0, 0)).granted,
+            "behind log must be denied"
+        );
+        assert!(
+            a.handle_pre_vote(&pre_vote_req(5, 1, 1)).granted,
+            "caught-up log granted"
+        );
+    }
 }
