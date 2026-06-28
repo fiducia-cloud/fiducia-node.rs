@@ -1011,7 +1011,7 @@ impl Store {
             }
             let token = self.next_token();
             let sem = self.semaphores.get_mut(key).expect("checked above");
-            let waiter = sem.queue.pop_front().expect("non-empty checked");
+            let (_, waiter) = sem.queue.pop_front().expect("non-empty checked");
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             sem.holders.push(SemaphoreSlot {
                 holder: waiter.holder.clone(),
