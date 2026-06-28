@@ -634,6 +634,11 @@ impl ShardActor {
     /// what stops a partitioned node — whose term has run ahead while it was
     /// isolated — from forcing a healthy leader to step down when it reconnects.
     fn start_pre_election(&mut self) {
+        // Run the straw poll strictly as a follower: abandon any failed candidacy
+        // so a late vote-reply from the prior term can't complete a stale election
+        // while this pre-poll is in flight. The term is *not* bumped here.
+        self.role = Role::Follower;
+        self.votes.clear();
         self.reset_election_deadline();
         let would_be_term = self.current_term + 1;
         self.pre_vote_term = would_be_term;
