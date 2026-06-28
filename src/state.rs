@@ -208,6 +208,8 @@ impl Command {
             Command::RateLimitCheck { .. } => "ratelimit.check",
             Command::ScheduleUpsert { .. } => "schedule.upsert",
             Command::ScheduleRecordRun { .. } => "schedule.record_run",
+            Command::ScheduleClaimFire { .. } => "schedule.claim_fire",
+            Command::ScheduleRecordResult { .. } => "schedule.record_result",
             Command::ElectionCampaign { .. } => "election.campaign",
             Command::ElectionRenew { .. } => "election.renew",
             Command::ElectionResign { .. } => "election.resign",
