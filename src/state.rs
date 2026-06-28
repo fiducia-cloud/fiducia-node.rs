@@ -918,7 +918,7 @@ impl Store {
             .or_insert_with(|| Semaphore {
                 limit: limit.max(1),
                 holders: Vec::new(),
-                queue: VecDeque::new(),
+                queue: IndexedQueue::new(),
             });
         // Let callers re-tune the cap; shrinking just stops new grants until it
         // drains back under the new limit.
