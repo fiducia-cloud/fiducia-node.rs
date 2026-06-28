@@ -974,6 +974,9 @@ impl ShardActor {
         }
         let mut more = false;
         if let Some(ls) = self.leader.as_mut() {
+            // Any reply at our term is proof this peer still sees us as leader —
+            // refresh the lease clock regardless of log success/mismatch.
+            ls.last_contact.insert(from.clone(), Instant::now());
             if resp.success {
                 ls.match_index.insert(from.clone(), up_to);
                 ls.next_index.insert(from.clone(), up_to + 1);
