@@ -849,7 +849,7 @@ impl ShardActor {
                 shard = ?self.shard_id,
                 node = %self.node_id,
                 term,
-                "raft: stepped down to follower (observed a higher term)"
+                "raft: stepped down to follower"
             );
         }
         self.current_term = term;
