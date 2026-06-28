@@ -630,6 +630,12 @@ impl ShardActor {
                     self.heartbeat_deadline = now + self.timing.heartbeat;
                     self.broadcast_append_entries();
                 }
+                // CheckQuorum: a leader that can no longer reach a majority steps
+                // down so it can't keep accepting doomed writes or answering stale
+                // reads while a new leader forms on the majority side.
+                if self.timing.check_quorum && self.members > 1 && !self.leader_lease_held() {
+                    self.relinquish_no_quorum();
+                }
             }
             Role::Follower | Role::Candidate => {
                 if now >= self.election_deadline {
