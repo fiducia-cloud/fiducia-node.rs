@@ -1412,6 +1412,8 @@ pub struct Node {
     /// Shard actor handles — used by `shutdown` (failover tests / graceful stop).
     #[allow(dead_code)]
     tasks: Vec<JoinHandle<()>>,
+    /// In-process per-operation latency + outcome metrics (see `/v1/observe/metrics`).
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Node {
