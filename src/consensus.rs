@@ -884,6 +884,7 @@ impl ShardActor {
         self.leader_id = Some(leader);
         self.leader = None;
         self.votes.clear();
+        self.last_leader_contact = Instant::now(); // heard from the leader
         self.reset_election_deadline();
         // Anything we were leading is no longer ours to commit.
         self.fail_pending();
