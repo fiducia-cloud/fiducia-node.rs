@@ -430,6 +430,8 @@ impl ShardActor {
             commit_index: 0,
             last_applied: 0,
             votes: HashSet::new(),
+            pre_votes: HashSet::new(),
+            pre_vote_term: 0,
             leader: if single {
                 Some(LeaderState::default())
             } else {
@@ -437,6 +439,7 @@ impl ShardActor {
             },
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
+            last_leader_contact: Instant::now(),
             rng: Rng::seeded(&node_id, shard_id),
             pending: HashMap::new(),
             changes,
