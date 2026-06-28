@@ -405,6 +405,15 @@ pub struct Leadership {
     pub metadata: HashMap<String, String>,
 }
 
+/// One named election and its current leadership — a row of the election
+/// inventory surfaced by `/v1/observe/elections`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ElectionEntry {
+    pub name: String,
+    #[serde(flatten)]
+    pub leadership: Leadership,
+}
+
 /// A KV entry paired with its key — one row of a prefix listing.
 #[derive(Debug, Clone, Serialize)]
 pub struct KvListItem {
