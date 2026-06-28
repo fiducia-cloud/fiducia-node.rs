@@ -880,8 +880,8 @@ impl Store {
     /// promoted and the token they were granted.
     fn lock_promote(&mut self, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
-        while let Some(idx) = self.lock_first_grantable() {
-            let waiter = self.locks.queue.remove(idx).expect("index from scan");
+        while let Some(id) = self.lock_first_grantable() {
+            let waiter = self.locks.queue.remove(&id).expect("key from scan");
             let token = self.next_token();
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             promoted.push(json!({
