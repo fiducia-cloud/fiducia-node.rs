@@ -370,6 +370,7 @@ impl ShardActor {
         peers: Vec<String>,
         transport: Arc<Transport>,
         self_tx: mpsc::Sender<ShardMsg>,
+        timing: RaftTiming,
     ) -> Self {
         let members = peers.len() + 1;
         let single = members == 1;
