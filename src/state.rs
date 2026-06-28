@@ -1897,6 +1897,98 @@ mod tests {
     }
 
     #[test]
+    fn claim_fire_advances_the_cursor_and_dedups_a_second_claim() {
+        let sm = StateMachine::new();
+        // Daily at midnight, anchored at epoch 0 → first fire is day 1 midnight.
+        sm.apply(Command::ScheduleUpsert {
+            name: "nightly".to_string(),
+            cron: Some("0 0 * * *".to_string()),
+            one_shot_at_ms: None,
+            target: ScheduleTarget::Webhook {
+                url: "https://example.com/hook".to_string(),
+            },
+            delivery: DeliverySemantics::AtLeastOnce,
+            max_retries: 3,
+            now_ms: 0,
+        });
+        let day = 86_400_000u64;
+        let first_fire = sm.schedule_get("nightly").unwrap().next_fire_ms.unwrap();
+        assert_eq!(first_fire, day, "first daily fire is day 1 midnight");
+
+        // Claiming it succeeds and advances the cursor to the next occurrence.
+        let claim = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "nightly".to_string(),
+                fire_id_ms: first_fire,
+            })
+            .output;
+        assert_eq!(claim["claimed"], true);
+        assert_eq!(
+            sm.schedule_get("nightly").unwrap().next_fire_ms,
+            Some(2 * day),
+            "cursor advanced to the following day",
+        );
+
+        // Claiming the SAME fire again fails — this is the no-duplicate-fires dedup.
+        let dup = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "nightly".to_string(),
+                fire_id_ms: first_fire,
+            })
+            .output;
+        assert_eq!(dup["claimed"], false);
+        assert_eq!(dup["reason"], "stale_or_duplicate");
+
+        // The claim recorded a Pending run; recording the result resolves it.
+        let history = sm.schedule_history("nightly");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, RunStatus::Pending);
+        sm.apply(Command::ScheduleRecordResult {
+            name: "nightly".to_string(),
+            fire_id_ms: first_fire,
+            delivered: true,
+            attempts: 2,
+            error: None,
+        });
+        let resolved = &sm.schedule_history("nightly")[0];
+        assert_eq!(resolved.status, RunStatus::Delivered);
+        assert_eq!(resolved.attempts, 2);
+    }
+
+    #[test]
+    fn one_shot_fires_once_then_is_exhausted() {
+        let sm = StateMachine::new();
+        sm.apply(Command::ScheduleUpsert {
+            name: "once".to_string(),
+            cron: None,
+            one_shot_at_ms: Some(5_000),
+            target: ScheduleTarget::Queue {
+                name: "https://queue.local/ingress".to_string(),
+            },
+            delivery: DeliverySemantics::ExactlyOnce,
+            max_retries: 0,
+            now_ms: 0,
+        });
+        assert_eq!(sm.schedule_get("once").unwrap().next_fire_ms, Some(5_000));
+        let claim = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "once".to_string(),
+                fire_id_ms: 5_000,
+            })
+            .output;
+        assert_eq!(claim["claimed"], true);
+        // A one-shot has no next fire once claimed.
+        assert_eq!(sm.schedule_get("once").unwrap().next_fire_ms, None);
+        let dup = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "once".to_string(),
+                fire_id_ms: 5_000,
+            })
+            .output;
+        assert_eq!(dup["claimed"], false, "exhausted one-shot can't re-fire");
+    }
+
+    #[test]
     fn service_registration_carries_metadata_and_heartbeat_ttl() {
         let sm = StateMachine::new();
         let mut metadata = HashMap::new();
