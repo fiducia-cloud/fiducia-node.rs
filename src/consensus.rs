@@ -2031,6 +2031,144 @@ mod tests {
         assert!(out.output["ok"].as_bool().unwrap());
     }
 
+    /// Cluster-wide: poll until **every** shard in `0..shard_count` has settled on
+    /// exactly one leader across `nodes`, or panic. Returns each shard's leader idx.
+    async fn await_all_shards_converged(
+        nodes: &[&Node],
+        shard_count: u32,
+        tries: u32,
+    ) -> Vec<usize> {
+        for _ in 0..tries {
+            // Snapshot every node once per round (status is a per-shard scan).
+            let statuses: Vec<NodeStatus> = {
+                let mut v = Vec::with_capacity(nodes.len());
+                for n in nodes {
+                    v.push(n.status().await);
+                }
+                v
+            };
+            let mut leaders = Vec::with_capacity(shard_count as usize);
+            let mut all_single = true;
+            for shard in 0..shard_count {
+                let holders: Vec<usize> = statuses
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, st)| {
+                        st.shards
+                            .iter()
+                            .any(|s| s.shard_id == shard && s.role == Role::Leader)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if holders.len() == 1 {
+                    leaders.push(holders[0]);
+                } else {
+                    all_single = false;
+                    break;
+                }
+            }
+            if all_single {
+                return leaders;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("cluster did not converge to one leader per shard");
+    }
+
+    /// The headline multi-Raft property the node exists to provide: a **single
+    /// process** (one [`Node`]) is simultaneously the **leader of 2+ shards** and a
+    /// **follower of 2+ other shards**, each shard an independent Raft group with
+    /// its own term/log/leader. This is what "1+ leaders and 1+ followers in one
+    /// process" means; the test pins it so a refactor can't quietly collapse the
+    /// per-shard isolation back into a single global Raft group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_process_simultaneously_leads_and_follows_multiple_shards() {
+        let reg = LoopbackRegistry::new();
+        // 12 shards over 3 nodes: concentration of all leadership on one node
+        // (the only split with zero mixed-role nodes) has probability
+        // 3·(1/3)^12 ≈ 6e-6, so a mixed-role node is observed deterministically
+        // in practice while the elections stay genuinely independent per shard.
+        let shard_count = 12;
+        let a = node("a", &["b", "c"], shard_count, &reg);
+        let b = node("b", &["a", "c"], shard_count, &reg);
+        let c = node("c", &["a", "b"], shard_count, &reg);
+        let nodes = [&a, &b, &c];
+
+        let leader_of_shard = await_all_shards_converged(&nodes, shard_count, 400).await;
+
+        // (1) Exactly one leader per shard, cluster-wide (guaranteed by Raft; the
+        //     convergence helper already enforced it — assert the count again).
+        assert_eq!(leader_of_shard.len(), shard_count as usize);
+
+        // (2) Each node hosts every shard, in exactly one of {leader, follower}
+        //     once converged (no shard left perpetually mid-election).
+        let mut mixed_role_nodes = 0;
+        for n in &nodes {
+            let st = n.status().await;
+            assert_eq!(
+                st.leader_count + st.follower_count,
+                shard_count as usize,
+                "node {} must host all {shard_count} shards as leader or follower",
+                st.node_id,
+            );
+            assert_eq!(
+                st.leading_shards.len(),
+                st.leader_count,
+                "leading_shards must match leader_count"
+            );
+            assert_eq!(
+                st.following_shards.len(),
+                st.follower_count,
+                "following_shards must match follower_count"
+            );
+            if st.leader_count >= 2 && st.follower_count >= 2 {
+                mixed_role_nodes += 1;
+            }
+        }
+        // (3) The headline assertion: at least one single process holds multiple
+        //     leader roles AND multiple follower roles at the same time.
+        assert!(
+            mixed_role_nodes >= 1,
+            "expected a node leading >=2 shards while following >=2 others"
+        );
+
+        // (4) Writes routed to keys owned by different shards each commit through
+        //     that shard's own leader — proving the mixed roles are functional,
+        //     not just a status artifact. Drive enough distinct keys to touch at
+        //     least two different shards led by (potentially) different nodes.
+        let mut shards_written: HashSet<ShardId> = HashSet::new();
+        for i in 0..(shard_count * 2) {
+            let key = format!("orders/{i}");
+            let shard = a.shard_for(&key);
+            let leader_idx = leader_of_shard[shard as usize];
+            let out = nodes[leader_idx]
+                .propose(put(&key, "v"))
+                .await
+                .expect("write commits via the owning shard's leader");
+            assert_eq!(out.shard, shard);
+            assert!(out.output["ok"].as_bool().unwrap());
+            shards_written.insert(shard);
+        }
+        assert!(
+            shards_written.len() >= 2,
+            "writes must commit across multiple independent shards"
+        );
+
+        // (5) A write sent to a NON-leader of its shard is redirected, not served
+        //     by the wrong replica — per-shard leadership is enforced per shard.
+        let shard0_leader = leader_of_shard[0];
+        let key0 = (0..)
+            .map(|i| format!("k/{i}"))
+            .find(|k| a.shard_for(k) == 0)
+            .unwrap();
+        let non_leader = (0..3).find(|i| *i != shard0_leader).unwrap();
+        let err = nodes[non_leader]
+            .propose(put(&key0, "v"))
+            .await
+            .expect_err("a non-leader of shard 0 must redirect");
+        assert!(matches!(err, ProposeError::NotLeader { shard: 0, .. }));
+    }
+
     // --- WAN timing + PreVote ---------------------------------------------
 
     /// Unset env must reproduce the original LAN constants exactly, so a node that
