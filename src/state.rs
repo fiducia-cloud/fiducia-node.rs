@@ -1616,17 +1616,20 @@ mod tests {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             ttl_ms: 30_000,
+            metadata: HashMap::new(),
         });
         let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
         let stale_renew = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             fencing_token: token + 1,
+            ttl_ms: None,
         });
         let renewed = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             fencing_token: token,
+            ttl_ms: None,
         });
         let resigned = sm.apply(Command::ElectionResign {
             name: "scheduler".to_string(),
