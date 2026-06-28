@@ -518,6 +518,32 @@ impl ShardActor {
         self.members / 2 + 1
     }
 
+    /// PreVote straw poll: ask peers whether they *would* vote for us at
+    /// `current_term + 1`, **without adopting that term or changing any state**.
+    /// Only a majority of grants escalates to a real [`start_election`]. This is
+    /// what stops a partitioned node — whose term has run ahead while it was
+    /// isolated — from forcing a healthy leader to step down when it reconnects.
+    fn start_pre_election(&mut self) {
+        self.reset_election_deadline();
+        let would_be_term = self.current_term + 1;
+        self.pre_vote_term = would_be_term;
+        self.pre_votes.clear();
+        self.pre_votes.insert(self.node_id.clone());
+        tracing::debug!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            would_be_term,
+            members = self.members,
+            "raft: election timeout — starting pre-vote straw poll"
+        );
+        // (Unreachable for members > 1, but keep the single-member invariant.)
+        if self.pre_votes.len() >= self.majority() {
+            self.start_election();
+            return;
+        }
+        self.solicit_votes(would_be_term, true);
+    }
+
     fn start_election(&mut self) {
         self.current_term += 1;
         self.role = Role::Candidate;
@@ -539,12 +565,19 @@ impl ShardActor {
             self.become_leader();
             return;
         }
+        self.solicit_votes(self.current_term, false);
+    }
 
+    /// Send `RequestVote` (real or pre-vote) to every peer for `term`, routing
+    /// each reply back into our own inbox as a `VoteReply` tagged with `pre_vote`
+    /// so it is counted toward the right round.
+    fn solicit_votes(&self, term: u64, pre_vote: bool) {
         let req = RequestVoteReq {
-            term: self.current_term,
+            term,
             candidate_id: self.node_id.clone(),
             last_log_index: self.last_log_index(),
             last_log_term: self.last_log_term(),
+            pre_vote,
         };
         for peer in self.peers.clone() {
             let transport = self.transport.clone();
@@ -553,15 +586,37 @@ impl ShardActor {
             let req = req.clone();
             tokio::spawn(async move {
                 if let Some(resp) = transport.request_vote(&peer, shard, req).await {
-                    let _ = self_tx.send(ShardMsg::VoteReply { from: peer, resp }).await;
+                    let _ = self_tx
+                        .send(ShardMsg::VoteReply {
+                            from: peer,
+                            pre_vote,
+                            resp,
+                        })
+                        .await;
                 }
             });
         }
     }
 
-    fn handle_vote_reply(&mut self, from: String, resp: RequestVoteResp) {
+    fn handle_vote_reply(&mut self, from: String, pre_vote: bool, resp: RequestVoteResp) {
+        // A higher term anywhere means we're behind: adopt it and stand down.
         if resp.term > self.current_term {
             self.step_down(resp.term, None);
+            return;
+        }
+        if pre_vote {
+            // Pre-vote round: we are still a Follower at `current_term`; a majority
+            // of grants for the would-be term promotes us to a real election.
+            // Ignore replies once our term has advanced past this round.
+            if self.pre_vote_term != self.current_term + 1 {
+                return;
+            }
+            if resp.granted {
+                self.pre_votes.insert(from);
+                if self.pre_votes.len() >= self.majority() {
+                    self.start_election();
+                }
+            }
             return;
         }
         if self.role != Role::Candidate || resp.term != self.current_term {
