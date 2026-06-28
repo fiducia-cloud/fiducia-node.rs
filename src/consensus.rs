@@ -1506,6 +1506,7 @@ impl Node {
         }
         .await;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+        self.metrics.record(op, elapsed_ms, result.is_ok());
         match &result {
             Ok(_) => tracing::info!(
                 op,
