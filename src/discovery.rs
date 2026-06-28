@@ -142,7 +142,29 @@ async fn deregister(
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
-async fn watch(State(_node): State<Arc<Node>>, Path(_service): Path<String>) -> Json<Value> {
-    // TODO: SSE subscribed to this service's instance-change events.
-    Json(json!({ "error": "not_implemented", "op": "discovery.watch" }))
+///
+/// Subscribes to the owning shard's change broadcast and emits one SSE event per
+/// committed `register`/`heartbeat`/`deregister` for this service, so clients can
+/// keep a live view of the instance set instead of polling. (TTL-expiry removals
+/// surface on the next read/registration rather than as a push event.)
+async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
+    let Some(rx) = node.watch(&service).await else {
+        return Json(json!({ "error": "unavailable", "op": "discovery.watch", "service": service }))
+            .into_response();
+    };
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let event = item.ok()?; // drop lag/closed notifications
+        if event.scope != "service" || event.key != service {
+            return None;
+        }
+        Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(event.kind)
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
