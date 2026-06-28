@@ -381,6 +381,7 @@ pub enum ReadResponse {
     Service(Vec<ServiceInstance>),
     KvList(Vec<KvListItem>),
     ServiceList(Vec<ServiceSummary>),
+    ScheduleList(Vec<Schedule>),
 }
 
 // ---------------------------------------------------------------------------
