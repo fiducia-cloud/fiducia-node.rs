@@ -2554,6 +2554,7 @@ mod tests {
             election_min_ms: emin,
             election_jitter_ms: 0,
             pre_vote: true,
+            check_quorum: true,
         };
 
         // Zero tick/heartbeat would panic tokio's interval — floored to 1ms.
