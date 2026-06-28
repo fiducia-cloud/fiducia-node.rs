@@ -1671,6 +1671,8 @@ mod tests {
                 node_id: id.to_string(),
                 peers: peers.iter().map(|s| s.to_string()).collect(),
                 shard_count,
+                // In-memory: the loopback cluster tests don't touch disk.
+                data_dir: None,
             },
             Transport::loopback(reg.clone()),
         )
