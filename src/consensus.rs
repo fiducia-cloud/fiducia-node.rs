@@ -252,6 +252,13 @@ pub enum ShardMsg {
         request: ReadRequest,
         resp: oneshot::Sender<Result<ReadResponse, ProposeError>>,
     },
+    /// A serializable (non-leader) read off this shard's local applied state, for
+    /// list/range fan-outs where slightly-stale results are acceptable and no
+    /// single shard is authoritative.
+    QueryLocal {
+        request: ReadRequest,
+        resp: oneshot::Sender<ReadResponse>,
+    },
     /// Inbound `AppendEntries` from a peer leader.
     AppendEntries {
         req: AppendEntriesReq,
