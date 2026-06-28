@@ -1745,19 +1745,18 @@ mod tests {
         assert!(a.leader_id.is_none());
         assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
 
-        // Healthy leader, heartbeat lease still valid → denied (no disruption).
+        // Healthy leader, contact still fresh → denied (no disruption).
         a.leader_id = Some("b".to_string());
-        a.election_deadline = Instant::now() + Duration::from_secs(30);
+        a.last_leader_contact = Instant::now();
         assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
-        // ...and term grants from this round must not have inflated the would-be
-        // term (proven structurally: handle_pre_vote takes &self), but assert the
-        // observable state is untouched too.
+        // ...and the round must not have mutated our state (structurally enforced
+        // by `&self`, but assert the observable bits too).
         assert_eq!(a.current_term, 1);
         assert_eq!(a.voted_for, None);
         assert_eq!(a.role, Role::Follower);
 
-        // Leader known but its lease has lapsed (missed heartbeats) → granted.
-        a.election_deadline = Instant::now() - Duration::from_millis(1);
+        // Leader known but contact has gone stale (missed heartbeats) → granted.
+        a.last_leader_contact = Instant::now() - Duration::from_secs(1);
         assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
     }
 
