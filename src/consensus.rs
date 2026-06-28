@@ -2109,6 +2109,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observability_reads_surface_locks_elections_and_quorum() {
+        let reg = LoopbackRegistry::new();
+        let n = node("solo", &[], 4, &reg);
+
+        // Take a lock and win an election, then read them back through the
+        // observability fan-outs (not the per-key getters).
+        n.propose(Command::LockAcquire {
+            keys: vec!["orders/42".to_string()],
+            holder: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+        })
+        .await
+        .expect("lock commit");
+        n.propose(Command::ElectionCampaign {
+            name: "scheduler".to_string(),
+            candidate: "node-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("campaign commit");
+
+        let inv = n.lock_inventory().await.expect("lock inventory");
+        assert_eq!(inv.held.len(), 1);
+        assert_eq!(inv.held[0].holder, "worker-a");
+
+        let elections = n.list_elections().await;
+        assert_eq!(elections.len(), 1);
+        assert_eq!(elections[0].name, "scheduler");
+        assert_eq!(elections[0].leadership.leader, "node-a");
+
+        // A single-node group is its own majority, so every led shard reports
+        // quorum, and the metrics registry recorded the proposals above.
+        let status = n.status().await;
+        assert!(status.shards.iter().all(|s| s.has_quorum));
+        assert!(status
+            .shards
+            .iter()
+            .all(|s| s.last_applied == s.commit_index));
+        let ops = n.metrics().snapshot();
+        assert!(
+            ops.iter().any(|o| o.op == "lock.acquire" && o.count >= 1),
+            "propose path should have recorded lock.acquire latency"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_state_survives_a_restart_via_the_durable_store() {
         // A single-node group with a real on-disk store. Commit a write, drop the
         // node (simulating a pod restart), boot a fresh node on the SAME data dir,
