@@ -1011,6 +1011,8 @@ impl ShardActor {
         if can_vote && log_ok {
             self.voted_for = Some(req.candidate_id.clone());
             self.reset_election_deadline();
+            // Durable before we tell the candidate it has our vote.
+            self.persist_hard_state();
             RequestVoteResp {
                 term: self.current_term,
                 granted: true,
