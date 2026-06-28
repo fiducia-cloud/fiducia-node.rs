@@ -1462,6 +1462,7 @@ impl Node {
             shards,
             transport,
             tasks,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         }
     }
 
