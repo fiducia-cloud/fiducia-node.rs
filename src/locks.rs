@@ -93,6 +93,9 @@ async fn acquire_union(
         )
             .into_response();
     }
+    if let Err(rejection) = crate::validate::lock_acquire(&keys, &body.holder, body.ttl_ms) {
+        return rejection.into_response();
+    }
     acquire(node, uri, keys, body).await
 }
 
