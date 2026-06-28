@@ -133,6 +133,11 @@ pub struct RaftTiming {
     pub election_jitter_ms: u64,
     /// Client write wait for quorum commit before returning unavailable.
     pub commit_wait_ms: u64,
+    /// PreVote (Raft thesis §9.6): run a non-binding straw poll before
+    /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
+    /// leader on rejoin. Strictly safer on a WAN; on by default. Disable with
+    /// `FIDUCIA_RAFT_PREVOTE=off`.
+    pub pre_vote: bool,
 }
 
 impl RaftTiming {
@@ -189,11 +194,17 @@ impl Default for RaftTiming {
         }
         election_min_ms = election_min_ms.max(heartbeat_ms.saturating_mul(3));
 
+        let pre_vote = std::env::var("FIDUCIA_RAFT_PREVOTE")
+            .ok()
+            .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+
         Self {
             heartbeat_ms,
             election_min_ms,
             election_jitter_ms,
             commit_wait_ms,
+            pre_vote,
         }
     }
 }
@@ -235,7 +246,11 @@ pub enum ShardMsg {
         resp: oneshot::Sender<RequestVoteResp>,
     },
     /// A peer's reply to a `RequestVote` this shard sent (routed back to self).
-    VoteReply { from: String, resp: RequestVoteResp },
+    VoteReply {
+        from: String,
+        pre_vote: bool,
+        resp: RequestVoteResp,
+    },
     /// A peer's reply to an `AppendEntries` this shard sent (routed back to self).
     AppendReply {
         from: String,
@@ -362,12 +377,20 @@ struct ShardActor {
 
     // --- candidate state ---
     votes: HashSet<String>,
+    // --- pre-vote (straw-poll) state, for the would-be term `pre_vote_term` ---
+    pre_votes: HashSet<String>,
+    pre_vote_term: u64,
     // --- leader state ---
     leader: Option<LeaderState>,
 
     // --- timers ---
     election_deadline: Instant,
     heartbeat_deadline: Instant,
+    /// When we last heard from a valid leader (an `AppendEntries`). Tracked
+    /// separately from `election_deadline` (which we reset for our own
+    /// campaigning) so pre-vote's leader-stickiness reflects the *leader's*
+    /// liveness, not our candidacy.
+    last_leader_contact: Instant,
     rng: Rng,
 
     // --- client write waiters: log index → who is blocked on its commit ---
@@ -411,6 +434,8 @@ impl ShardActor {
             commit_index: 0,
             last_applied: 0,
             votes: HashSet::new(),
+            pre_votes: HashSet::new(),
+            pre_vote_term: 0,
             leader: if single {
                 Some(LeaderState::default())
             } else {
@@ -418,6 +443,7 @@ impl ShardActor {
             },
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
+            last_leader_contact: Instant::now(),
             rng: Rng::seeded(&node_id, shard_id),
             pending: HashMap::new(),
             changes,
@@ -458,7 +484,11 @@ impl ShardActor {
                 let out = self.handle_request_vote(req);
                 let _ = resp.send(out);
             }
-            ShardMsg::VoteReply { from, resp } => self.handle_vote_reply(from, resp),
+            ShardMsg::VoteReply {
+                from,
+                pre_vote,
+                resp,
+            } => self.handle_vote_reply(from, pre_vote, resp),
             ShardMsg::AppendReply {
                 from,
                 up_to,
@@ -494,7 +524,15 @@ impl ShardActor {
             }
             Role::Follower | Role::Candidate => {
                 if now >= self.election_deadline {
-                    self.start_election();
+                    // With PreVote, time-out starts a non-binding straw poll first;
+                    // only a pre-vote majority escalates to a real (term-bumping)
+                    // election. Single-member groups never reach here (they lead
+                    // from t=0), so there is always a peer to poll.
+                    if self.timing.pre_vote && self.members > 1 {
+                        self.start_pre_election();
+                    } else {
+                        self.start_election();
+                    }
                 }
             }
         }
@@ -525,6 +563,30 @@ impl ShardActor {
         self.members / 2 + 1
     }
 
+    /// PreVote straw poll: ask peers whether they *would* vote for us at
+    /// `current_term + 1`, **without adopting that term or changing any state**.
+    /// Only a majority of grants escalates to a real [`start_election`]. This is
+    /// what stops a partitioned node — whose term has run ahead while it was
+    /// isolated — from forcing a healthy leader to step down when it reconnects.
+    fn start_pre_election(&mut self) {
+        // Run the straw poll strictly as a follower: abandon any failed candidacy
+        // so a late vote-reply from the prior term can't complete a stale election
+        // while this pre-poll is in flight. The term is *not* bumped here.
+        self.role = Role::Follower;
+        self.votes.clear();
+        self.reset_election_deadline();
+        let would_be_term = self.current_term + 1;
+        self.pre_vote_term = would_be_term;
+        self.pre_votes.clear();
+        self.pre_votes.insert(self.node_id.clone());
+        // (Unreachable for members > 1, but keep the single-member invariant.)
+        if self.pre_votes.len() >= self.majority() {
+            self.start_election();
+            return;
+        }
+        self.solicit_votes(would_be_term, true);
+    }
+
     fn start_election(&mut self) {
         self.current_term += 1;
         self.role = Role::Candidate;
@@ -539,12 +601,19 @@ impl ShardActor {
             self.become_leader();
             return;
         }
+        self.solicit_votes(self.current_term, false);
+    }
 
+    /// Send `RequestVote` (real or pre-vote) to every peer for `term`, routing each
+    /// reply back into our own inbox as a `VoteReply` tagged with `pre_vote` so it
+    /// is counted toward the right round.
+    fn solicit_votes(&self, term: u64, pre_vote: bool) {
         let req = RequestVoteReq {
-            term: self.current_term,
+            term,
             candidate_id: self.node_id.clone(),
             last_log_index: self.last_log_index(),
             last_log_term: self.last_log_term(),
+            pre_vote,
         };
         for peer in self.peers.clone() {
             let transport = self.transport.clone();
@@ -553,15 +622,37 @@ impl ShardActor {
             let req = req.clone();
             tokio::spawn(async move {
                 if let Some(resp) = transport.request_vote(&peer, shard, req).await {
-                    let _ = self_tx.send(ShardMsg::VoteReply { from: peer, resp }).await;
+                    let _ = self_tx
+                        .send(ShardMsg::VoteReply {
+                            from: peer,
+                            pre_vote,
+                            resp,
+                        })
+                        .await;
                 }
             });
         }
     }
 
-    fn handle_vote_reply(&mut self, from: String, resp: RequestVoteResp) {
+    fn handle_vote_reply(&mut self, from: String, pre_vote: bool, resp: RequestVoteResp) {
+        // A higher term anywhere means we're behind: adopt it and stand down.
         if resp.term > self.current_term {
             self.step_down(resp.term, None);
+            return;
+        }
+        if pre_vote {
+            // Pre-vote round: we are still a Follower at `current_term`; a majority
+            // of grants for the would-be term promotes us to a real election.
+            // Ignore replies once our term has advanced past this round.
+            if self.pre_vote_term != self.current_term + 1 {
+                return;
+            }
+            if resp.granted {
+                self.pre_votes.insert(from);
+                if self.pre_votes.len() >= self.majority() {
+                    self.start_election();
+                }
+            }
             return;
         }
         if self.role != Role::Candidate || resp.term != self.current_term {
@@ -852,6 +943,7 @@ impl ShardActor {
         self.leader_id = Some(leader);
         self.leader = None;
         self.votes.clear();
+        self.last_leader_contact = Instant::now(); // heard from the leader
         self.reset_election_deadline();
         // Anything we were leading is no longer ours to commit.
         self.fail_pending();
@@ -874,6 +966,11 @@ impl ShardActor {
     }
 
     fn handle_request_vote(&mut self, req: RequestVoteReq) -> RequestVoteResp {
+        // PreVote is answered without mutating any Raft state (no term bump, no
+        // `voted_for`, no deadline reset) — that read-only-ness is the whole point.
+        if req.pre_vote {
+            return self.handle_pre_vote(&req);
+        }
         if req.term < self.current_term {
             return RequestVoteResp {
                 term: self.current_term,
@@ -905,6 +1002,25 @@ impl ShardActor {
                 term: self.current_term,
                 granted: false,
             }
+        }
+    }
+
+    /// Answer a PreVote straw poll. Pure read: changes nothing. Grant only if the
+    /// candidate's would-be term isn't stale, its log is at least as up-to-date,
+    /// AND we are not currently served by a live leader — i.e. we know of no
+    /// leader, or our last `AppendEntries` is older than an election timeout. That
+    /// leader-stickiness is what makes pre-vote refuse to disrupt a healthy leader;
+    /// at cold start `leader_id` is `None`, so the first election still runs.
+    fn handle_pre_vote(&self, req: &RequestVoteReq) -> RequestVoteResp {
+        let log_ok = (req.last_log_term > self.last_log_term())
+            || (req.last_log_term == self.last_log_term()
+                && req.last_log_index >= self.last_log_index());
+        let leader_alive = self.leader_id.is_some()
+            && self.last_leader_contact.elapsed()
+                < Duration::from_millis(self.timing.election_min_ms);
+        RequestVoteResp {
+            term: self.current_term,
+            granted: req.term >= self.current_term && log_ok && !leader_alive,
         }
     }
 
@@ -1819,6 +1935,7 @@ mod tests {
                     election_min_ms: 1_000,
                     election_jitter_ms: 500,
                     commit_wait_ms: 10_000,
+                    pre_vote: true,
                 },
             },
             Transport::loopback(reg),
@@ -1968,6 +2085,7 @@ mod tests {
                     candidate_id: "stale-candidate".to_string(),
                     last_log_index: 0,
                     last_log_term: 0,
+                    pre_vote: false,
                 },
             )
             .await
@@ -2053,5 +2171,83 @@ mod tests {
             Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "after-unresponsive"),
             other => panic!("unexpected read after unresponsive failover: {other:?}"),
         }
+    }
+
+    // --- PreVote (anti-disruption straw poll) -----------------------------
+
+    /// Bare follower shard actor (3-member group) for white-box tests of the
+    /// pre-vote decision. Not wired into any cluster.
+    fn follower_actor() -> ShardActor {
+        let reg = LoopbackRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        ShardActor::new(
+            0,
+            "a".to_string(),
+            vec!["b".to_string(), "c".to_string()],
+            Arc::new(Transport::loopback(reg)),
+            tx,
+            RaftTiming::default(),
+        )
+    }
+
+    fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {
+        RequestVoteReq {
+            term,
+            candidate_id: "z".to_string(),
+            last_log_index,
+            last_log_term,
+            pre_vote: true,
+        }
+    }
+
+    /// The anti-disruption property: while a leader is alive (recent contact), a
+    /// pre-vote is denied — so a rejoining node can't bump the cluster's term —
+    /// but with no leader (or stale contact) it is granted so failover proceeds.
+    #[test]
+    fn pre_vote_is_denied_under_a_live_leader_and_granted_otherwise() {
+        let mut a = follower_actor();
+
+        // Cold start: no leader known → granted (the first election must run).
+        assert!(a.leader_id.is_none());
+        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+
+        // Healthy leader, contact fresh → denied; and no state is mutated.
+        a.leader_id = Some("b".to_string());
+        a.last_leader_contact = Instant::now();
+        assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+        assert_eq!(a.current_term, 1);
+        assert_eq!(a.voted_for, None);
+        assert_eq!(a.role, Role::Follower);
+
+        // Leader known but contact stale (missed heartbeats) → granted.
+        a.last_leader_contact = Instant::now() - Duration::from_secs(1);
+        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+    }
+
+    /// Pre-vote still enforces the safety checks: a stale would-be term and a
+    /// behind log are both refused even when no leader is alive.
+    #[test]
+    fn pre_vote_refuses_stale_term_and_behind_log() {
+        let mut a = follower_actor();
+        a.leader_id = None; // remove leader-stickiness from the picture
+
+        // Stale would-be term (< our current term) → denied.
+        assert!(!a.handle_pre_vote(&pre_vote_req(0, 0, 0)).granted);
+
+        // Holding one entry at term 1: a behind candidate is denied, a caught-up
+        // one is granted.
+        a.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: None,
+        });
+        assert!(
+            !a.handle_pre_vote(&pre_vote_req(5, 0, 0)).granted,
+            "behind log must be denied"
+        );
+        assert!(
+            a.handle_pre_vote(&pre_vote_req(5, 1, 1)).granted,
+            "caught-up log granted"
+        );
     }
 }
