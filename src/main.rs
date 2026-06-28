@@ -10,6 +10,7 @@
 //! marked with `TODO`s in the respective modules.
 
 mod consensus;
+mod cron;
 mod discovery;
 mod election;
 mod indexed_queue;
