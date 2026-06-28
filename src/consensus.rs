@@ -504,6 +504,9 @@ impl ShardActor {
             ShardMsg::Query { request, resp } => {
                 let _ = resp.send(self.handle_query(request));
             }
+            ShardMsg::QueryLocal { request, resp } => {
+                let _ = resp.send(self.handle_query_local(request));
+            }
             ShardMsg::AppendEntries { req, resp } => {
                 let out = self.handle_append_entries(req);
                 let _ = resp.send(out);
