@@ -279,6 +279,24 @@ pub struct LockWaiter {
     pub requested_ms: u64,
 }
 
+/// One held union-lock grant, as surfaced by the observability inventory: who
+/// holds which key set, under what fencing token, until when.
+#[derive(Debug, Clone, Serialize)]
+pub struct LockHolding {
+    pub holder: String,
+    pub keys: Vec<String>,
+    pub fencing_token: u64,
+    pub lease_expires_ms: u64,
+}
+
+/// A whole-coordinator view of the lock primitive: every active grant plus the
+/// single FIFO wait queue behind them. Built for `/v1/observe/locks`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LockInventory {
+    pub held: Vec<LockHolding>,
+    pub wait_queue: Vec<LockWaiter>,
+}
+
 /// One held union-lock acquisition.
 #[derive(Debug, Clone)]
 struct LockGrant {
