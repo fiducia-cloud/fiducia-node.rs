@@ -1110,7 +1110,7 @@ impl ShardActor {
                 continue; // no-op
             };
             let applied = self.state.apply(command.clone());
-            self.publish_change(&command, applied.revision);
+            self.publish_change(&command, &applied.output, applied.revision);
             if let Some(resp) = self.pending.remove(&i) {
                 let _ = resp.send(Ok(ProposeOutcome {
                     shard: self.shard_id,
