@@ -192,8 +192,7 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/append");
-                client
-                    .post(url)
+                with_internal_auth(client.post(url))
                     .json(&req)
                     .send()
                     .await
