@@ -351,6 +351,26 @@ pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
     pub lease_expires_ms: u64,
+    /// Campaign TTL in ms, retained so a renew without an explicit TTL reuses it.
+    pub ttl_ms: u64,
+    /// Candidate facts (address/region/version/…) — lets observers discover the
+    /// current leader's endpoint, not just its id.
+    pub metadata: HashMap<String, String>,
+}
+
+/// A KV entry paired with its key — one row of a prefix listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct KvListItem {
+    pub key: String,
+    #[serde(flatten)]
+    pub entry: KvEntry,
+}
+
+/// One service in a discovery listing: its name and how many live instances it has.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceSummary {
+    pub service: String,
+    pub instances: usize,
 }
 
 /// A scheduled job definition.
