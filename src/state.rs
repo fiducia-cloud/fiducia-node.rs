@@ -1183,7 +1183,13 @@ impl Store {
         target: ScheduleTarget,
         delivery: DeliverySemantics,
         max_retries: u32,
+        now_ms: u64,
     ) -> Value {
+        // The initial cursor: a one-shot fires at its time; a cron fires at its
+        // first occurrence after now. (`now_ms` is committed in the command, so
+        // every replica computes the same cursor — the state machine stays
+        // deterministic and never reads the wall clock itself.)
+        let next_fire_ms = next_fire_for(&cron, one_shot_at_ms, now_ms);
         let definition = Schedule {
             name: name.clone(),
             cron,
@@ -1192,6 +1198,7 @@ impl Store {
             delivery,
             max_retries,
             enabled: true,
+            next_fire_ms,
         };
         self.schedules
             .entry(name.clone())
@@ -1200,7 +1207,7 @@ impl Store {
                 definition,
                 history: Vec::new(),
             });
-        json!({ "scheduled": true, "name": name })
+        json!({ "scheduled": true, "name": name, "next_fire_ms": next_fire_ms })
     }
 
     fn apply_schedule_record_run(
@@ -1221,9 +1228,83 @@ impl Store {
                 attempts: 1,
                 duplicate: false,
                 target: record.definition.target.clone(),
+                status: RunStatus::Delivered,
+                error: None,
             });
+            trim_history(record);
         }
         json!({ "recorded": !duplicate, "duplicate": duplicate, "name": name, "fire_id": fire_id })
+    }
+
+    /// Claim one due fire for delivery. Succeeds only if `fire_id_ms` is the
+    /// schedule's current expected next fire (the cursor) — so a second claim of
+    /// the same fire fails after the cursor advances, which is the dedup that makes
+    /// firing leader-elected with no duplicates. Records a `Pending` run and
+    /// advances the cursor to the following occurrence.
+    fn apply_schedule_claim_fire(&mut self, name: String, fire_id_ms: u64) -> Value {
+        let Some(record) = self.schedules.get_mut(&name) else {
+            return json!({ "claimed": false, "reason": "not_found", "name": name });
+        };
+        if !record.definition.enabled {
+            return json!({ "claimed": false, "reason": "disabled", "name": name });
+        }
+        if record.definition.next_fire_ms != Some(fire_id_ms) {
+            return json!({
+                "claimed": false,
+                "reason": "stale_or_duplicate",
+                "name": name,
+                "expected": record.definition.next_fire_ms,
+            });
+        }
+        record.history.push(ScheduleRun {
+            fire_id: fire_id_ms.to_string(),
+            fired_at_ms: fire_id_ms,
+            attempts: 0,
+            duplicate: false,
+            target: record.definition.target.clone(),
+            status: RunStatus::Pending,
+            error: None,
+        });
+        trim_history(record);
+        // Advance the cursor: one-shots are now exhausted; crons step to the next.
+        let next = if record.definition.one_shot_at_ms.is_some() {
+            None
+        } else {
+            next_fire_for(&record.definition.cron, None, fire_id_ms)
+        };
+        record.definition.next_fire_ms = next;
+        json!({
+            "claimed": true,
+            "name": name,
+            "fire_id_ms": fire_id_ms,
+            "target": record.definition.target,
+            "delivery": record.definition.delivery,
+            "max_retries": record.definition.max_retries,
+            "next_fire_ms": next,
+        })
+    }
+
+    /// Record the delivery outcome of a claimed fire (after retries).
+    fn apply_schedule_record_result(
+        &mut self,
+        name: String,
+        fire_id_ms: u64,
+        delivered: bool,
+        attempts: u32,
+        error: Option<String>,
+    ) -> Value {
+        let Some(record) = self.schedules.get_mut(&name) else {
+            return json!({ "recorded": false, "reason": "not_found", "name": name });
+        };
+        let fire_id = fire_id_ms.to_string();
+        if let Some(run) = record.history.iter_mut().rev().find(|r| r.fire_id == fire_id) {
+            run.status = if delivered { RunStatus::Delivered } else { RunStatus::Failed };
+            run.attempts = attempts;
+            run.error = error;
+            json!({ "recorded": true, "name": name, "fire_id_ms": fire_id_ms, "delivered": delivered })
+        } else {
+            json!({ "recorded": false, "reason": "no_run", "name": name, "fire_id_ms": fire_id_ms })
+        }
     }
 
     fn apply_election_campaign(
