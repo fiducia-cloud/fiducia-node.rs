@@ -87,7 +87,7 @@ async fn get_or_list(
             Err(err) => read_error_response(err, &uri),
             _ => Json(json!({ "error": "unavailable" })).into_response(),
         },
-        None => list(q.prefix),
+        None => list(node, q.prefix.unwrap_or_default()).await,
     }
 }
 
@@ -125,11 +125,14 @@ async fn delete_key(
     propose_response(result, &uri)
 }
 
-/// `GET /v1/kv?prefix=...` — list keys under a prefix.
-fn list(prefix: Option<String>) -> Response {
-    // TODO: a prefix can span shards, so this fans out across the shards it
-    // touches (a per-shard Query each) and merges the results.
-    Json(json!({ "error": "not_implemented", "op": "kv.list", "prefix": prefix })).into_response()
+/// `GET /v1/kv?prefix=...` — list live keys under a prefix.
+///
+/// A prefix can span shards, so this fans the range read out across every shard
+/// (a serializable per-shard read each) and merges the results, sorted by key.
+/// An empty prefix lists the whole keyspace.
+async fn list(node: Arc<Node>, prefix: String) -> Response {
+    let keys = node.list_kv(&prefix).await;
+    Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response()
 }
 
 /// SSE stream of change events for a key (or, when `prefix`, every key under it).
@@ -144,6 +147,9 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
+        if event.scope != "kv" {
+            return None; // ignore election/service changes on the shared shard stream
+        }
         let matches = if prefix {
             event.key.starts_with(&key)
         } else {

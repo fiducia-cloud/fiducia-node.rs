@@ -17,17 +17,24 @@
 //!   * `GET  /v1/elections/{name}`          — observe the current leader
 //!   * `GET  /v1/elections/{name}/watch`    — SSE stream of leadership changes
 
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::Uri,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
@@ -36,12 +43,25 @@ use crate::state::Command;
 pub struct CampaignBody {
     pub candidate: String,
     pub ttl_ms: u64,
+    /// Optional candidate facts (address, region, version, …) published with the
+    /// leadership so observers/watchers can discover the leader's endpoint.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct HoldBody {
     pub candidate: String,
     pub fencing_token: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenewBody {
+    pub candidate: String,
+    pub fencing_token: u64,
+    /// Optional new lease TTL; when omitted the original campaign TTL is reused.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
 }
 
 pub fn router() -> Router<Arc<Node>> {
@@ -65,6 +85,7 @@ async fn campaign(
             name,
             candidate: body.candidate,
             ttl_ms: body.ttl_ms,
+            metadata: body.metadata,
         })
         .await;
     propose_response(result, &uri)
@@ -75,13 +96,14 @@ async fn renew(
     State(node): State<Arc<Node>>,
     uri: Uri,
     Path(name): Path<String>,
-    Json(body): Json<HoldBody>,
+    Json(body): Json<RenewBody>,
 ) -> Response {
     let result = node
         .propose(Command::ElectionRenew {
             name,
             candidate: body.candidate,
             fencing_token: body.fencing_token,
+            ttl_ms: body.ttl_ms,
         })
         .await;
     propose_response(result, &uri)
@@ -122,7 +144,29 @@ async fn observe(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<Strin
 }
 
 /// `GET /v1/elections/{name}/watch` — SSE stream of leadership changes.
-async fn watch(State(_node): State<Arc<Node>>, Path(_name): Path<String>) -> Json<Value> {
-    // TODO: SSE subscribed to leadership-change events for `name`.
-    Json(json!({ "error": "not_implemented", "op": "election.watch" }))
+///
+/// Subscribes to the owning shard's change broadcast and emits one SSE event per
+/// committed `elected`/`renewed`/`resigned` for this election. A client watches
+/// this to learn, e.g., that the old leader's lease lapsed and a new candidate
+/// won — then re-routes to the new leader without polling.
+async fn watch(State(node): State<Arc<Node>>, Path(name): Path<String>) -> Response {
+    let Some(rx) = node.watch(&name).await else {
+        return Json(json!({ "error": "unavailable", "op": "election.watch", "name": name }))
+            .into_response();
+    };
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let event = item.ok()?; // drop lag/closed notifications
+        if event.scope != "election" || event.key != name {
+            return None;
+        }
+        Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(event.kind)
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }

@@ -16,17 +16,23 @@
 //!   * `GET    /v1/services/{service}/watch`                  — SSE of instance changes
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::Uri,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, put},
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
@@ -55,10 +61,13 @@ pub fn router() -> Router<Arc<Node>> {
         )
 }
 
-/// `GET /v1/services` — list known service names.
-async fn list_services(State(_node): State<Arc<Node>>) -> Json<Value> {
-    // TODO: services span shards, so this fans out across shards and merges.
-    Json(json!({ "error": "not_implemented", "op": "discovery.list_services" }))
+/// `GET /v1/services` — list known service names with their live-instance counts.
+///
+/// Services span shards, so this fans a serializable read out across every shard
+/// and merges the per-shard summaries.
+async fn list_services(State(node): State<Arc<Node>>) -> Response {
+    let services = node.list_services().await;
+    Json(json!({ "count": services.len(), "services": services })).into_response()
 }
 
 /// `GET /v1/services/{service}` — list live (unexpired) instances.
@@ -133,7 +142,29 @@ async fn deregister(
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
-async fn watch(State(_node): State<Arc<Node>>, Path(_service): Path<String>) -> Json<Value> {
-    // TODO: SSE subscribed to this service's instance-change events.
-    Json(json!({ "error": "not_implemented", "op": "discovery.watch" }))
+///
+/// Subscribes to the owning shard's change broadcast and emits one SSE event per
+/// committed `register`/`heartbeat`/`deregister` for this service, so clients can
+/// keep a live view of the instance set instead of polling. (TTL-expiry removals
+/// surface on the next read/registration rather than as a push event.)
+async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
+    let Some(rx) = node.watch(&service).await else {
+        return Json(json!({ "error": "unavailable", "op": "discovery.watch", "service": service }))
+            .into_response();
+    };
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let event = item.ok()?; // drop lag/closed notifications
+        if event.scope != "service" || event.key != service {
+            return None;
+        }
+        Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(event.kind)
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }

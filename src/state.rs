@@ -96,11 +96,19 @@ pub enum Command {
         name: String,
         candidate: String,
         ttl_ms: u64,
+        /// Opaque candidate facts published to observers/watchers (e.g. address,
+        /// region, version) so the leader is *discoverable*, not just named.
+        #[serde(default)]
+        metadata: HashMap<String, String>,
     },
     ElectionRenew {
         name: String,
         candidate: String,
         fencing_token: u64,
+        /// Lease extension; when omitted the leadership's original campaign TTL
+        /// is reused instead of a hard-coded default.
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     ElectionResign {
         name: String,
@@ -160,6 +168,28 @@ impl Command {
             Command::ServiceRegister { service, .. }
             | Command::ServiceHeartbeat { service, .. }
             | Command::ServiceDeregister { service, .. } => service,
+        }
+    }
+
+    /// Short, stable label for this command's operation kind — used as the `op`
+    /// attribute on telemetry spans/events so traces group by primitive.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::KvPut { .. } => "kv.put",
+            Command::KvDelete { .. } => "kv.delete",
+            Command::LockAcquire { .. } => "lock.acquire",
+            Command::LockRelease { .. } => "lock.release",
+            Command::SemaphoreAcquire { .. } => "semaphore.acquire",
+            Command::SemaphoreRelease { .. } => "semaphore.release",
+            Command::RateLimitCheck { .. } => "ratelimit.check",
+            Command::ScheduleUpsert { .. } => "schedule.upsert",
+            Command::ScheduleRecordRun { .. } => "schedule.record_run",
+            Command::ElectionCampaign { .. } => "election.campaign",
+            Command::ElectionRenew { .. } => "election.renew",
+            Command::ElectionResign { .. } => "election.resign",
+            Command::ServiceRegister { .. } => "service.register",
+            Command::ServiceHeartbeat { .. } => "service.heartbeat",
+            Command::ServiceDeregister { .. } => "service.deregister",
         }
     }
 }
@@ -321,6 +351,26 @@ pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
     pub lease_expires_ms: u64,
+    /// Campaign TTL in ms, retained so a renew without an explicit TTL reuses it.
+    pub ttl_ms: u64,
+    /// Candidate facts (address/region/version/…) — lets observers discover the
+    /// current leader's endpoint, not just its id.
+    pub metadata: HashMap<String, String>,
+}
+
+/// A KV entry paired with its key — one row of a prefix listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct KvListItem {
+    pub key: String,
+    #[serde(flatten)]
+    pub entry: KvEntry,
+}
+
+/// One service in a discovery listing: its name and how many live instances it has.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceSummary {
+    pub service: String,
+    pub instances: usize,
 }
 
 /// A scheduled job definition.
@@ -466,12 +516,14 @@ impl StateMachine {
                 name,
                 candidate,
                 ttl_ms,
-            } => store.apply_election_campaign(revision, now, name, candidate, ttl_ms),
+                metadata,
+            } => store.apply_election_campaign(revision, now, name, candidate, ttl_ms, metadata),
             Command::ElectionRenew {
                 name,
                 candidate,
                 fencing_token,
-            } => store.apply_election_renew(now, name, candidate, fencing_token),
+                ttl_ms,
+            } => store.apply_election_renew(now, name, candidate, fencing_token, ttl_ms),
             Command::ElectionResign {
                 name,
                 candidate,
@@ -560,6 +612,39 @@ impl StateMachine {
             .get(service)
             .map(|instances| instances.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Every live KV entry whose key starts with `prefix` (this shard's slice of
+    /// the keyspace). Serializable read off applied state; callers fan this out
+    /// across shards and merge.
+    pub fn kv_list(&self, prefix: &str) -> Vec<KvListItem> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store
+            .kv
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| KvListItem {
+                key: key.clone(),
+                entry: entry.clone(),
+            })
+            .collect()
+    }
+
+    /// Every service that has at least one live instance on this shard, with the
+    /// live-instance count. Callers fan this out across shards and sum.
+    pub fn service_names(&self) -> Vec<ServiceSummary> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store
+            .services
+            .iter()
+            .filter(|(_, instances)| !instances.is_empty())
+            .map(|(service, instances)| ServiceSummary {
+                service: service.clone(),
+                instances: instances.len(),
+            })
+            .collect()
     }
 }
 
@@ -1094,6 +1179,7 @@ impl Store {
         name: String,
         candidate: String,
         ttl_ms: u64,
+        metadata: HashMap<String, String>,
     ) -> Value {
         if self.elections.contains_key(&name) {
             return json!({ "won": false, "name": name, "leader": self.elections.get(&name) });
@@ -1103,6 +1189,8 @@ impl Store {
             leader: candidate.clone(),
             fencing_token: token,
             lease_expires_ms: now.saturating_add(ttl_ms),
+            ttl_ms,
+            metadata,
         };
         self.elections.insert(name.clone(), leadership.clone());
         json!({ "won": true, "name": name, "leadership": leadership, "revision": revision })
@@ -1114,6 +1202,7 @@ impl Store {
         name: String,
         candidate: String,
         fencing_token: u64,
+        ttl_ms: Option<u64>,
     ) -> Value {
         let Some(leadership) = self.elections.get_mut(&name) else {
             return json!({ "renewed": false, "reason": "not_found", "name": name });
@@ -1121,7 +1210,10 @@ impl Store {
         if leadership.leader != candidate || leadership.fencing_token != fencing_token {
             return json!({ "renewed": false, "reason": "not_leader", "name": name });
         }
-        leadership.lease_expires_ms = now.saturating_add(30_000);
+        // Honor an explicit TTL, else reuse the TTL the leader campaigned with.
+        let ttl = ttl_ms.unwrap_or(leadership.ttl_ms);
+        leadership.ttl_ms = ttl;
+        leadership.lease_expires_ms = now.saturating_add(ttl);
         json!({ "renewed": true, "name": name, "leadership": leadership })
     }
 
@@ -1524,17 +1616,20 @@ mod tests {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             ttl_ms: 30_000,
+            metadata: HashMap::new(),
         });
         let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
         let stale_renew = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             fencing_token: token + 1,
+            ttl_ms: None,
         });
         let renewed = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             fencing_token: token,
+            ttl_ms: None,
         });
         let resigned = sm.apply(Command::ElectionResign {
             name: "scheduler".to_string(),
@@ -1605,5 +1700,127 @@ mod tests {
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].metadata["region"], "us-east-1");
         assert!(instances[0].lease_expires_ms >= initial_expiry);
+    }
+
+    #[test]
+    fn election_campaign_publishes_candidate_metadata() {
+        let sm = StateMachine::new();
+        let mut metadata = HashMap::new();
+        metadata.insert("address".to_string(), "10.2.4.18:8080".to_string());
+        metadata.insert("region".to_string(), "us-east-1".to_string());
+        sm.apply(Command::ElectionCampaign {
+            name: "invoice-reconciler/leader".to_string(),
+            candidate: "node-3".to_string(),
+            ttl_ms: 15_000,
+            metadata,
+        });
+        let held = sm.election_get("invoice-reconciler/leader").unwrap();
+        assert_eq!(held.leader, "node-3");
+        assert_eq!(held.metadata["address"], "10.2.4.18:8080");
+        assert_eq!(held.metadata["region"], "us-east-1");
+        assert_eq!(held.ttl_ms, 15_000);
+    }
+
+    #[test]
+    fn election_renew_reuses_campaign_ttl_when_unspecified() {
+        let sm = StateMachine::new();
+        let won = sm.apply(Command::ElectionCampaign {
+            name: "leader".to_string(),
+            candidate: "node-a".to_string(),
+            ttl_ms: 90_000,
+            metadata: HashMap::new(),
+        });
+        let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
+        let campaign_expiry = won.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        // Renew with no explicit TTL: must reuse the 90s campaign TTL, not snap
+        // back to the old hard-coded 30s default (which would shrink the lease).
+        let renewed = sm.apply(Command::ElectionRenew {
+            name: "leader".to_string(),
+            candidate: "node-a".to_string(),
+            fencing_token: token,
+            ttl_ms: None,
+        });
+        let renew_expiry = renewed.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(renewed.output["renewed"], true);
+        assert!(
+            renew_expiry >= campaign_expiry,
+            "renew {renew_expiry} must not shrink lease below campaign {campaign_expiry}"
+        );
+    }
+
+    #[test]
+    fn election_failover_after_lease_expiry() {
+        // Drive the store directly so we control `now` deterministically.
+        let mut store = Store::default();
+        let won_a = store.apply_election_campaign(
+            1,
+            1_000,
+            "leader".to_string(),
+            "node-a".to_string(),
+            5_000, // lease_expires at 6_000
+            HashMap::new(),
+        );
+        assert_eq!(won_a["won"], true);
+        // Before expiry, a rival campaign loses.
+        let lost = store.apply_election_campaign(
+            2,
+            5_000,
+            "leader".to_string(),
+            "node-b".to_string(),
+            5_000,
+            HashMap::new(),
+        );
+        assert_eq!(lost["won"], false);
+        // After the lease lapses, expire_due reaps it and the rival wins.
+        store.expire_due(7_000);
+        let won_b = store.apply_election_campaign(
+            3,
+            7_000,
+            "leader".to_string(),
+            "node-b".to_string(),
+            5_000,
+            HashMap::new(),
+        );
+        assert_eq!(won_b["won"], true);
+        assert_eq!(won_b["leadership"]["leader"], "node-b");
+    }
+
+    #[test]
+    fn kv_list_returns_only_prefixed_live_entries() {
+        let sm = StateMachine::new();
+        for key in ["app/a", "app/b", "other/c"] {
+            sm.apply(Command::KvPut {
+                key: key.to_string(),
+                value: "v".to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            });
+        }
+        let listed = sm.kv_list("app/");
+        let mut keys: Vec<String> = listed.into_iter().map(|item| item.key).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["app/a".to_string(), "app/b".to_string()]);
+    }
+
+    #[test]
+    fn service_names_summarizes_live_instance_counts() {
+        let sm = StateMachine::new();
+        for id in ["i-1", "i-2"] {
+            sm.apply(Command::ServiceRegister {
+                service: "router".to_string(),
+                instance_id: id.to_string(),
+                address: format!("10.0.0.{id}:8080"),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            });
+        }
+        let summaries = sm.service_names();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].service, "router");
+        assert_eq!(summaries[0].instances, 2);
     }
 }
