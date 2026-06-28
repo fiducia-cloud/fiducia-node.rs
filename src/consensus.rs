@@ -1072,6 +1072,8 @@ impl ShardActor {
             index,
             command: Some(command),
         });
+        // Durable before this entry can count toward a commit / be acked.
+        self.persist_log_append();
         // Block the client on this index committing.
         self.pending.insert(index, resp);
 
@@ -1079,6 +1081,7 @@ impl ShardActor {
             // One-member quorum: commit (and apply, which resolves the waiter) now.
             self.commit_index = index;
             self.apply_committed();
+            self.persist_hard_state(); // record the advanced commit pointer
         } else {
             self.broadcast_append_entries();
         }
