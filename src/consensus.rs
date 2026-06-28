@@ -118,6 +118,7 @@ impl Default for RaftTiming {
             election_min_ms: 150,
             election_jitter_ms: 150,
             pre_vote: true,
+            check_quorum: true,
         }
     }
 }
