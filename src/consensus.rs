@@ -884,6 +884,11 @@ impl ShardActor {
     }
 
     fn handle_request_vote(&mut self, req: RequestVoteReq) -> RequestVoteResp {
+        // PreVote is answered without mutating any Raft state (no term bump, no
+        // `voted_for`, no deadline reset) — that read-only-ness is the whole point.
+        if req.pre_vote {
+            return self.handle_pre_vote(&req);
+        }
         if req.term < self.current_term {
             return RequestVoteResp {
                 term: self.current_term,
