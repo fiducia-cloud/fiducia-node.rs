@@ -62,7 +62,8 @@ pub struct AppendEntriesResp {
 /// `RequestVote` — a candidate solicits a vote for one shard's Raft group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteReq {
-    /// Candidate's term.
+    /// Candidate's term. For a **pre-vote** this is the candidate's *would-be*
+    /// term (`current_term + 1`) which it has **not** actually adopted.
     pub term: u64,
     /// Candidate's addressable node id.
     pub candidate_id: String,
@@ -70,6 +71,13 @@ pub struct RequestVoteReq {
     pub last_log_index: u64,
     /// Term of the candidate's last log entry.
     pub last_log_term: u64,
+    /// PreVote round (Raft thesis §9.6): a non-binding straw poll a candidate runs
+    /// *before* incrementing its term, so a partitioned node that keeps timing out
+    /// can't inflate its term and force a healthy leader to step down on rejoin. A
+    /// voter granting a pre-vote changes **no** state. `#[serde(default)]` keeps it
+    /// wire-compatible with peers that never send it.
+    #[serde(default)]
+    pub pre_vote: bool,
 }
 
 /// Reply to [`RequestVoteReq`].

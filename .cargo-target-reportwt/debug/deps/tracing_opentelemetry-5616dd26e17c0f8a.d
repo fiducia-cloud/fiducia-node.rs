@@ -1,0 +1,13 @@
+/Users/maca5/codes/fiducia.cloud/fiducia-node-reportwt/.cargo-target-reportwt/debug/deps/tracing_opentelemetry-5616dd26e17c0f8a.d: /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/lib.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/metrics.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/layer.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/span_ext.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/tracer.rs
+
+/Users/maca5/codes/fiducia.cloud/fiducia-node-reportwt/.cargo-target-reportwt/debug/deps/libtracing_opentelemetry-5616dd26e17c0f8a.rlib: /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/lib.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/metrics.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/layer.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/span_ext.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/tracer.rs
+
+/Users/maca5/codes/fiducia.cloud/fiducia-node-reportwt/.cargo-target-reportwt/debug/deps/libtracing_opentelemetry-5616dd26e17c0f8a.rmeta: /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/lib.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/metrics.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/layer.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/span_ext.rs /Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/tracer.rs
+
+/Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/lib.rs:
+/Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/metrics.rs:
+/Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/layer.rs:
+/Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/span_ext.rs:
+/Users/maca5/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.28.0/src/tracer.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.28.0
