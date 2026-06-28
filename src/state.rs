@@ -546,6 +546,7 @@ impl StateMachine {
                 target,
                 delivery,
                 max_retries,
+                now_ms,
             } => store.apply_schedule_upsert(
                 name,
                 cron,
@@ -553,12 +554,23 @@ impl StateMachine {
                 target,
                 delivery,
                 max_retries,
+                now_ms,
             ),
             Command::ScheduleRecordRun {
                 name,
                 fire_id,
                 fired_at_ms,
             } => store.apply_schedule_record_run(name, fire_id, fired_at_ms),
+            Command::ScheduleClaimFire { name, fire_id_ms } => {
+                store.apply_schedule_claim_fire(name, fire_id_ms)
+            }
+            Command::ScheduleRecordResult {
+                name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                error,
+            } => store.apply_schedule_record_result(name, fire_id_ms, delivered, attempts, error),
             Command::ElectionCampaign {
                 name,
                 candidate,
