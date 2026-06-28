@@ -1473,13 +1473,77 @@ impl Node {
         rx.await.ok()
     }
 
-    /// Subscribe to the change stream of the shard owning `key` (for a KV watch).
+    /// Subscribe to the change stream of the shard owning `key` (for a watch).
+    /// Works for any primitive routed by name: a KV key, an election name, or a
+    /// service name all hash to one shard, and the caller filters by scope+key.
     pub async fn watch(&self, key: &str) -> Option<broadcast::Receiver<ChangeEvent>> {
         let shard = self.shard_for(key);
         let tx = self.sender(shard)?;
         let (resp, rx) = oneshot::channel();
         tx.send(ShardMsg::Subscribe { resp }).await.ok()?;
         rx.await.ok()
+    }
+
+    /// Fan a serializable read out across **every shard this node hosts**, then
+    /// merge. `make` builds a fresh request per shard ([`ReadRequest`] isn't
+    /// `Clone`). Used for list/range operations that no single shard owns.
+    async fn query_all_shards(
+        &self,
+        make: impl Fn() -> ReadRequest,
+    ) -> Vec<ReadResponse> {
+        let mut out = Vec::with_capacity(self.shards.len());
+        for tx in self.shards.values() {
+            let (resp, rx) = oneshot::channel();
+            if tx
+                .send(ShardMsg::QueryLocal {
+                    request: make(),
+                    resp,
+                })
+                .await
+                .is_ok()
+            {
+                if let Ok(response) = rx.await {
+                    out.push(response);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every live KV entry under `prefix`, merged across shards and sorted by key.
+    pub async fn list_kv(&self, prefix: &str) -> Vec<KvListItem> {
+        let mut items: Vec<KvListItem> = self
+            .query_all_shards(|| ReadRequest::KvList {
+                prefix: prefix.to_string(),
+            })
+            .await
+            .into_iter()
+            .filter_map(|r| match r {
+                ReadResponse::KvList(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        items.sort_by(|a, b| a.key.cmp(&b.key));
+        items
+    }
+
+    /// Every service with live instances, merged across shards. A service name
+    /// routes to a single shard, so counts don't need de-duping across shards,
+    /// but we still merge defensively in case a name appears more than once.
+    pub async fn list_services(&self) -> Vec<ServiceSummary> {
+        let mut merged: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for response in self.query_all_shards(|| ReadRequest::ServiceList).await {
+            if let ReadResponse::ServiceList(summaries) = response {
+                for summary in summaries {
+                    *merged.entry(summary.service).or_default() += summary.instances;
+                }
+            }
+        }
+        merged
+            .into_iter()
+            .map(|(service, instances)| ServiceSummary { service, instances })
+            .collect()
     }
 
     /// Per-shard consensus status across all shards this node hosts.
