@@ -32,7 +32,7 @@ mod validate;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{routing::get, Json, Router};
+use axum::{middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
 use tower_http::{catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
