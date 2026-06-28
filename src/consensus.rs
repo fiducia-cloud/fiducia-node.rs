@@ -99,10 +99,11 @@ pub struct LogEntry {
     pub command: Option<Command>,
 }
 
-/// A change applied to a shard's state machine, broadcast to KV watchers.
+/// A change applied to a shard's state machine, broadcast to watch clients.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeEvent {
-    /// `"put"` or `"delete"`.
+    /// Domain-specific event name, such as `"put"`, `"election_campaign"`, or
+    /// `"service_register"`.
     pub kind: &'static str,
     pub key: String,
     pub revision: u64,
@@ -187,9 +188,11 @@ pub enum ShardMsg {
     Status { resp: oneshot::Sender<ShardStatus> },
 }
 
-/// A single-key read, routed to its owning shard.
+/// A read routed to its owning shard, except prefix reads which are fanned out
+/// across every hosted shard by [`Node::query_kv_prefix`].
 pub enum ReadRequest {
     Kv { key: String },
+    KvPrefix { prefix: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
@@ -205,7 +208,7 @@ impl ReadRequest {
     /// to the same lock-coordinator shard as their writes (see [`Command::routing_key`]).
     pub fn routing_key(&self) -> &str {
         match self {
-            ReadRequest::Kv { key } => key,
+            ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
@@ -219,6 +222,7 @@ impl ReadRequest {
 #[derive(Debug)]
 pub enum ReadResponse {
     Kv(Option<KvEntry>),
+    KvPrefix(Vec<(String, KvEntry)>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
@@ -819,6 +823,36 @@ impl ShardActor {
                 key: key.clone(),
                 revision,
             }),
+            Command::ElectionCampaign { name, .. } => Some(ChangeEvent {
+                kind: "election_campaign",
+                key: name.clone(),
+                revision,
+            }),
+            Command::ElectionRenew { name, .. } => Some(ChangeEvent {
+                kind: "election_renew",
+                key: name.clone(),
+                revision,
+            }),
+            Command::ElectionResign { name, .. } => Some(ChangeEvent {
+                kind: "election_resign",
+                key: name.clone(),
+                revision,
+            }),
+            Command::ServiceRegister { service, .. } => Some(ChangeEvent {
+                kind: "service_register",
+                key: service.clone(),
+                revision,
+            }),
+            Command::ServiceHeartbeat { service, .. } => Some(ChangeEvent {
+                kind: "service_heartbeat",
+                key: service.clone(),
+                revision,
+            }),
+            Command::ServiceDeregister { service, .. } => Some(ChangeEvent {
+                kind: "service_deregister",
+                key: service.clone(),
+                revision,
+            }),
             _ => None,
         };
         if let Some(event) = event {
@@ -826,9 +860,13 @@ impl ShardActor {
         }
     }
 
-    /// Serve a read off applied state — leader only, for linearizability.
+    /// Serve a read off applied state.
+    ///
+    /// Single-shard reads stay leader-only for linearizability. A prefix read
+    /// spans shards, so it is served from this node's locally committed shard
+    /// snapshots and merged by [`Node::query_kv_prefix`].
     fn handle_query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
-        if self.role != Role::Leader {
+        if !matches!(&request, ReadRequest::KvPrefix { .. }) && self.role != Role::Leader {
             return Err(ProposeError::NotLeader {
                 shard: self.shard_id,
                 leader: self.leader_id.clone(),
@@ -836,6 +874,9 @@ impl ShardActor {
         }
         match request {
             ReadRequest::Kv { key } => Ok(ReadResponse::Kv(self.state.kv_get(&key))),
+            ReadRequest::KvPrefix { prefix } => {
+                Ok(ReadResponse::KvPrefix(self.state.kv_prefix(&prefix)))
+            }
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
@@ -966,6 +1007,33 @@ impl Node {
         rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }))
     }
 
+    /// Query every hosted shard for entries under a prefix and merge the partial
+    /// results in key order.
+    pub async fn query_kv_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<Vec<(String, KvEntry)>, ProposeError> {
+        let mut entries = Vec::new();
+        for (shard, tx) in &self.shards {
+            let (resp, rx) = oneshot::channel();
+            let request = ReadRequest::KvPrefix {
+                prefix: prefix.clone(),
+            };
+            if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
+                return Err(ProposeError::Unavailable { shard: *shard });
+            }
+            match rx
+                .await
+                .unwrap_or(Err(ProposeError::Unavailable { shard: *shard }))?
+            {
+                ReadResponse::KvPrefix(mut shard_entries) => entries.append(&mut shard_entries),
+                _ => return Err(ProposeError::Unavailable { shard: *shard }),
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+
     /// Deliver an inbound `AppendEntries` to the owning shard actor.
     pub async fn append_entries(
         &self,
@@ -997,6 +1065,21 @@ impl Node {
         let (resp, rx) = oneshot::channel();
         tx.send(ShardMsg::Subscribe { resp }).await.ok()?;
         rx.await.ok()
+    }
+
+    /// Subscribe to every shard hosted by this node. Used by prefix watches
+    /// because keys under one prefix can hash to many shards.
+    pub async fn watch_all(&self) -> Vec<broadcast::Receiver<ChangeEvent>> {
+        let mut receivers = Vec::with_capacity(self.shards.len());
+        for tx in self.shards.values() {
+            let (resp, rx) = oneshot::channel();
+            if tx.send(ShardMsg::Subscribe { resp }).await.is_ok() {
+                if let Ok(receiver) = rx.await {
+                    receivers.push(receiver);
+                }
+            }
+        }
+        receivers
     }
 
     /// Per-shard consensus status across all shards this node hosts.
@@ -1362,6 +1445,110 @@ mod tests {
             Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "on"),
             other => panic!("unexpected read: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn kv_prefix_query_fans_out_across_shards() {
+        let reg = LoopbackRegistry::new();
+        let n = node("solo-prefix", &[], 8, &reg);
+        let mut selected = Vec::new();
+        for i in 0..1_000 {
+            let key = format!("flags/key-{i}");
+            let shard = n.shard_for(&key);
+            if selected
+                .first()
+                .map(|(first_shard, _): &(ShardId, String)| *first_shard != shard)
+                .unwrap_or(true)
+            {
+                selected.push((shard, key));
+            }
+            if selected.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            selected.len(),
+            2,
+            "expected two prefix keys on different shards"
+        );
+
+        for (_, key) in &selected {
+            n.propose(put(key, "kept")).await.expect("commit");
+        }
+        n.propose(put("other/key", "ignored"))
+            .await
+            .expect("commit");
+
+        let entries = n
+            .query_kv_prefix("flags/".to_string())
+            .await
+            .expect("prefix read");
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+        let shards: std::collections::HashSet<_> =
+            entries.iter().map(|(key, _)| n.shard_for(key)).collect();
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|key| key.starts_with("flags/")));
+        assert_eq!(shards.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_prefix_query_reads_committed_snapshots_on_followers() {
+        let reg = LoopbackRegistry::new();
+        let a = node("a", &["b", "c"], 4, &reg);
+        let b = node("b", &["a", "c"], 4, &reg);
+        let c = node("c", &["a", "b"], 4, &reg);
+        let nodes = [&a, &b, &c];
+        let mut selected = Vec::new();
+        for i in 0..1_000 {
+            let key = format!("flags/multi-{i}");
+            let shard = a.shard_for(&key);
+            if selected
+                .first()
+                .map(|(first_shard, _): &(ShardId, String)| *first_shard != shard)
+                .unwrap_or(true)
+            {
+                selected.push((shard, key));
+            }
+            if selected.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(selected.len(), 2);
+
+        for (shard, key) in &selected {
+            let leader_idx = await_leader(&nodes, *shard, 150).await;
+            nodes[leader_idx]
+                .propose(put(key, "kept"))
+                .await
+                .expect("commit prefix key");
+        }
+
+        for n in nodes {
+            let entries = await_prefix_entries(n, "flags/", 2).await;
+            let shards: std::collections::HashSet<_> =
+                entries.iter().map(|(key, _)| n.shard_for(key)).collect();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(shards.len(), 2);
+        }
+    }
+
+    async fn await_prefix_entries(
+        node: &Node,
+        prefix: &str,
+        expected_len: usize,
+    ) -> Vec<(String, KvEntry)> {
+        for _ in 0..100 {
+            let entries = node
+                .query_kv_prefix(prefix.to_string())
+                .await
+                .expect("prefix query should not require every shard to lead locally");
+            if entries.len() == expected_len {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("prefix query did not observe {expected_len} entries");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

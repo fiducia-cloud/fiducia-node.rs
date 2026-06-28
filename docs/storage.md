@@ -10,11 +10,10 @@ It is not backed by Postgres, Supabase, Redis, or a single central database.
 Postgres/Supabase are for the business/control plane: orgs, projects, users,
 API keys, audit, billing, and dashboard metadata.
 
-## Current Skeleton
+## Current State
 
-Today `StateMachine` keeps the applied state in memory. That is only the
-single-node development skeleton. The public contract already follows the
-production path:
+Today `StateMachine` keeps the applied materialized state in memory while the
+public contract follows the production path:
 
 1. A request is routed by key to a shard.
 2. The shard leader appends the mutation as a `Command`.

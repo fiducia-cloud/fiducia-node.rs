@@ -1,8 +1,9 @@
 //! The replicated state machine.
 //!
 //! Every mutation exposed by Fiducia is represented as a [`Command`] and is applied
-//! in committed-log order. In this single-node skeleton the log is local, but the
-//! state-machine semantics are the same ones the replicated path will use.
+//! in committed-log order. The storage in this build is local to the node
+//! process, but the state-machine semantics are the same ones the replicated path
+//! uses.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -516,6 +517,19 @@ impl StateMachine {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
         store.kv.get(key).cloned()
+    }
+
+    pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut entries: Vec<_> = store
+            .kv
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     pub fn lock_get(&self, key: &str) -> LockState {
@@ -1693,6 +1707,29 @@ mod tests {
         assert_eq!(stale.output["reason"], "cas_mismatch");
         assert_eq!(updated.output["ok"], true);
         assert_eq!(sm.kv_get("flags/new-checkout").unwrap().value, "off");
+    }
+
+    #[test]
+    fn kv_prefix_lists_matching_keys_in_order() {
+        let sm = StateMachine::new();
+        for (key, value) in [
+            ("flags/new-checkout", "on"),
+            ("flags/search", "off"),
+            ("config/theme", "blue"),
+        ] {
+            sm.apply(Command::KvPut {
+                key: key.to_string(),
+                value: value.to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            });
+        }
+
+        let entries = sm.kv_prefix("flags/");
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+
+        assert_eq!(keys, vec!["flags/new-checkout", "flags/search"]);
+        assert_eq!(entries[0].1.value, "on");
     }
 
     #[test]
