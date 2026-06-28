@@ -385,3 +385,275 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set FIDUCIA_LIVE_BASE_URL to a deployed fiducia-load-balance or fiducia-node HTTP endpoint"]
+async fn live_coordination_primitives_smoke() -> TestResult {
+    let Some(base) = live_base_url() else {
+        eprintln!("skipping live smoke: FIDUCIA_LIVE_BASE_URL is not set");
+        return Ok(());
+    };
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let prefix = unique_prefix();
+
+    let kv_key = format!("{prefix}-config");
+    let created = call(
+        &client,
+        &base,
+        Method::PUT,
+        &format!("/v1/kv?key={kv_key}"),
+        Some(json!({ "value": "on", "prev_revision": 0 })),
+    )
+    .await?;
+    assert_eq!(created["ok"], true);
+    let created_revision = created["revision"]
+        .as_u64()
+        .ok_or("kv create response missed revision")?;
+
+    let kv = call(
+        &client,
+        &base,
+        Method::GET,
+        &format!("/v1/kv?key={kv_key}"),
+        None,
+    )
+    .await?;
+    assert_eq!(kv["found"], true);
+    assert_eq!(kv["entry"]["value"], "on");
+
+    let stale = call(
+        &client,
+        &base,
+        Method::PUT,
+        &format!("/v1/kv?key={kv_key}"),
+        Some(json!({ "value": "off", "prev_revision": 0 })),
+    )
+    .await?;
+    assert_eq!(stale["ok"], false);
+    assert_eq!(stale["reason"], "cas_mismatch");
+
+    let updated = call(
+        &client,
+        &base,
+        Method::PUT,
+        &format!("/v1/kv?key={kv_key}"),
+        Some(json!({ "value": "off", "prev_revision": created_revision })),
+    )
+    .await?;
+    assert_eq!(updated["ok"], true);
+
+    let tenant = format!("{prefix}-tenant");
+    let limit_key = format!("{prefix}-checkout");
+    let first_limit = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/rate-limit/{tenant}/{limit_key}/check"),
+        Some(json!({
+            "algorithm": "sliding_window",
+            "limit": 1,
+            "window_ms": 60_000,
+            "cost": 1
+        })),
+    )
+    .await?;
+    let second_limit = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/rate-limit/{tenant}/{limit_key}/check"),
+        Some(json!({
+            "algorithm": "sliding_window",
+            "limit": 1,
+            "window_ms": 60_000,
+            "cost": 1
+        })),
+    )
+    .await?;
+    assert_eq!(first_limit["allowed"], true);
+    assert_eq!(second_limit["allowed"], false);
+    let limit_state = call(
+        &client,
+        &base,
+        Method::GET,
+        &format!("/v1/rate-limit/{tenant}/{limit_key}"),
+        None,
+    )
+    .await?;
+    assert_eq!(limit_state["found"], true);
+    assert_eq!(limit_state["limit"]["remaining"], 0);
+
+    let schedule = format!("{prefix}-nightly");
+    let scheduled = call(
+        &client,
+        &base,
+        Method::PUT,
+        &format!("/v1/cron/schedules/{schedule}"),
+        Some(json!({
+            "cron": "0 0 * * *",
+            "target": { "kind": "webhook", "url": "https://example.test/hook" },
+            "delivery": "exactly_once",
+            "max_retries": 2
+        })),
+    )
+    .await?;
+    assert_eq!(scheduled["scheduled"], true);
+
+    let schedule_state = call(
+        &client,
+        &base,
+        Method::GET,
+        &format!("/v1/cron/schedules/{schedule}"),
+        None,
+    )
+    .await?;
+    assert_eq!(schedule_state["found"], true);
+    assert_eq!(schedule_state["schedule"]["delivery"], "exactly_once");
+
+    let fire_id = format!("{prefix}-fire");
+    let first_run = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/cron/schedules/{schedule}/runs"),
+        Some(json!({ "fire_id": fire_id, "fired_at_ms": 1 })),
+    )
+    .await?;
+    let duplicate_run = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/cron/schedules/{schedule}/runs"),
+        Some(json!({ "fire_id": fire_id, "fired_at_ms": 2 })),
+    )
+    .await?;
+    assert_eq!(first_run["recorded"], true);
+    assert_eq!(duplicate_run["duplicate"], true);
+    let history = call(
+        &client,
+        &base,
+        Method::GET,
+        &format!("/v1/cron/schedules/{schedule}/history"),
+        None,
+    )
+    .await?;
+    assert_eq!(history["history"].as_array().map(Vec::len), Some(1));
+
+    let election = format!("{prefix}-leader");
+    let won = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/elections/{election}/campaign"),
+        Some(json!({ "candidate": "node-a", "ttl_ms": 30_000 })),
+    )
+    .await?;
+    assert_eq!(won["won"], true);
+    let token = won["leadership"]["fencing_token"]
+        .as_u64()
+        .ok_or("election campaign response missed fencing token")?;
+
+    let blocked = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/elections/{election}/campaign"),
+        Some(json!({ "candidate": "node-b", "ttl_ms": 30_000 })),
+    )
+    .await?;
+    assert_eq!(blocked["won"], false);
+
+    let observed = call(
+        &client,
+        &base,
+        Method::GET,
+        &format!("/v1/elections/{election}"),
+        None,
+    )
+    .await?;
+    assert_eq!(observed["held"], true);
+    assert_eq!(observed["leadership"]["leader"], "node-a");
+
+    let renewed = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/elections/{election}/renew"),
+        Some(json!({ "candidate": "node-a", "fencing_token": token })),
+    )
+    .await?;
+    assert_eq!(renewed["renewed"], true);
+
+    let resigned = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/elections/{election}/resign"),
+        Some(json!({ "candidate": "node-a", "fencing_token": token })),
+    )
+    .await?;
+    assert_eq!(resigned["resigned"], true);
+
+    let service = format!("{prefix}-api");
+    let registered = call(
+        &client,
+        &base,
+        Method::PUT,
+        &format!("/v1/services/{service}/instances/i-1"),
+        Some(json!({
+            "address": "10.0.0.1:9000",
+            "ttl_ms": 30_000,
+            "metadata": { "az": "a" }
+        })),
+    )
+    .await?;
+    assert_eq!(registered["registered"], true);
+
+    let instances = call(
+        &client,
+        &base,
+        Method::GET,
+        &format!("/v1/services/{service}"),
+        None,
+    )
+    .await?;
+    assert_eq!(instances["instances"][0]["instance_id"], "i-1");
+    assert_eq!(instances["instances"][0]["metadata"]["az"], "a");
+
+    let services = call(&client, &base, Method::GET, "/v1/services", None).await?;
+    assert!(services["services"]
+        .as_array()
+        .map(|items| items.iter().any(|item| item == &json!(service)))
+        .unwrap_or(false));
+
+    let heartbeat = call(
+        &client,
+        &base,
+        Method::POST,
+        &format!("/v1/services/{service}/instances/i-1/heartbeat"),
+        Some(json!({ "ttl_ms": 45_000 })),
+    )
+    .await?;
+    assert_eq!(heartbeat["heartbeat"], true);
+
+    let deregistered = call(
+        &client,
+        &base,
+        Method::DELETE,
+        &format!("/v1/services/{service}/instances/i-1"),
+        None,
+    )
+    .await?;
+    assert_eq!(deregistered["deregistered"], true);
+
+    call(
+        &client,
+        &base,
+        Method::DELETE,
+        &format!("/v1/kv?key={kv_key}"),
+        None,
+    )
+    .await?;
+
+    Ok(())
+}
