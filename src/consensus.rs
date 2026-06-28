@@ -2595,6 +2595,91 @@ mod tests {
         )
     }
 
+    /// A 3-member actor forced into the leader role with empty replication state,
+    /// for exercising the leader lease / CheckQuorum logic without a live cluster.
+    fn leader_actor() -> ShardActor {
+        let mut a = follower_actor();
+        a.role = Role::Leader;
+        a.leader_id = Some("a".to_string());
+        let mut ls = LeaderState::default();
+        for p in &a.peers {
+            ls.next_index.insert(p.clone(), 1);
+            ls.match_index.insert(p.clone(), 0);
+            ls.in_flight.insert(p.clone(), false);
+        }
+        a.leader = Some(ls);
+        a
+    }
+
+    /// CheckQuorum/leader-lease: a leader holds the lease only while a *majority*
+    /// has contacted it within an election timeout. Once the lease lapses it must
+    /// refuse linearizable reads and (on the next tick) step down — closing the
+    /// stale-leader read hole where a partitioned old leader answers authoritatively
+    /// after a new leader has formed on the majority side.
+    #[test]
+    fn leader_lease_gates_reads_and_steps_down_on_lost_quorum() {
+        let mut a = leader_actor();
+        let read = || ReadRequest::Kv {
+            key: "k".to_string(),
+        };
+
+        // No peer has acked yet: self alone is a minority of 3 → lease not held, and
+        // a linearizable read is refused (retryable Unavailable, not a stale answer).
+        assert!(!a.leader_lease_held());
+        assert!(matches!(
+            a.handle_query(read()),
+            Err(ProposeError::Unavailable { .. })
+        ));
+
+        // One peer acks → self + b = majority → lease held → read served.
+        a.leader
+            .as_mut()
+            .unwrap()
+            .last_contact
+            .insert("b".to_string(), Instant::now());
+        assert!(a.leader_lease_held());
+        assert!(a.handle_query(read()).is_ok());
+
+        // That contact ages past the election timeout → lease lapses → read refused.
+        a.leader.as_mut().unwrap().last_contact.insert(
+            "b".to_string(),
+            Instant::now() - Duration::from_millis(a.timing.election_min_ms + 50),
+        );
+        assert!(!a.leader_lease_held());
+        assert!(matches!(
+            a.handle_query(read()),
+            Err(ProposeError::Unavailable { .. })
+        ));
+
+        // A tick with the lease lapsed steps the leader down (no higher term seen —
+        // it simply lost contact). Keep the heartbeat deadline in the future so the
+        // tick exercises only the lease check, not network I/O.
+        a.heartbeat_deadline = Instant::now() + Duration::from_secs(60);
+        a.on_tick();
+        assert_eq!(a.role, Role::Follower);
+        assert!(a.leader.is_none());
+    }
+
+    /// With CheckQuorum disabled the lease logic is byte-identical to the old
+    /// behaviour: a leader with zero majority contact still serves reads and never
+    /// steps down for want of acks (it only steps down on a higher term).
+    #[test]
+    fn check_quorum_off_preserves_old_unconfirmed_leader_behaviour() {
+        let mut a = leader_actor();
+        a.timing.check_quorum = false;
+
+        assert!(a.leader_lease_held(), "disabled ⇒ always held");
+        assert!(a
+            .handle_query(ReadRequest::Kv {
+                key: "k".to_string()
+            })
+            .is_ok());
+
+        a.heartbeat_deadline = Instant::now() + Duration::from_secs(60);
+        a.on_tick();
+        assert_eq!(a.role, Role::Leader, "no step-down when check-quorum is off");
+    }
+
     fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {
         RequestVoteReq {
             term,
