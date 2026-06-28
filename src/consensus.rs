@@ -345,6 +345,9 @@ pub enum ReadRequest {
     /// Every service with live instances on one shard. Fanned out by
     /// [`Node::list_services`] and served serializably.
     ServiceList,
+    /// Every schedule definition on one shard. Fanned out by
+    /// [`Node::list_schedules`] for the firing loop to find due fires.
+    ScheduleList,
 }
 
 impl ReadRequest {
