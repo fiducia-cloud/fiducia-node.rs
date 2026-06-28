@@ -433,7 +433,11 @@ impl ShardActor {
                 let out = self.handle_request_vote(req);
                 let _ = resp.send(out);
             }
-            ShardMsg::VoteReply { from, resp } => self.handle_vote_reply(from, resp),
+            ShardMsg::VoteReply {
+                from,
+                pre_vote,
+                resp,
+            } => self.handle_vote_reply(from, pre_vote, resp),
             ShardMsg::AppendReply { from, up_to, resp } => {
                 self.handle_append_reply(from, up_to, resp)
             }
