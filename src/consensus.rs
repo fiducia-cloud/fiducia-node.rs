@@ -602,6 +602,8 @@ impl ShardActor {
         self.votes.clear();
         self.votes.insert(self.node_id.clone());
         self.reset_election_deadline();
+        // Durable before we ask anyone for a vote in this term.
+        self.persist_hard_state();
 
         if self.votes.len() >= self.majority() {
             // Single-member group: we already have a majority.
