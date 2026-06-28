@@ -1298,6 +1298,7 @@ impl ShardActor {
         match request {
             ReadRequest::KvList { prefix } => ReadResponse::KvList(self.state.kv_list(&prefix)),
             ReadRequest::ServiceList => ReadResponse::ServiceList(self.state.service_names()),
+            ReadRequest::ScheduleList => ReadResponse::ScheduleList(self.state.schedule_list()),
             // A single-key read arriving on the local path: serve it off applied
             // state too rather than erroring.
             ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
