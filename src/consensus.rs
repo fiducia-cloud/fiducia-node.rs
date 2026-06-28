@@ -2222,6 +2222,44 @@ mod tests {
         assert_eq!(t.election_min_ms, 150);
         assert_eq!(t.election_jitter_ms, 150);
         assert!(t.pre_vote, "pre-vote on by default");
+        // Defaults are already sane: sanitize is a no-op on them.
+        let s = t.sanitized();
+        assert_eq!(s.tick, t.tick);
+        assert_eq!(s.heartbeat, t.heartbeat);
+        assert_eq!(s.election_min_ms, t.election_min_ms);
+    }
+
+    /// Operator-typo guards: `sanitized` must never return a config that panics
+    /// `tokio::time::interval` or that can't hold a stable leader.
+    #[test]
+    fn raft_timing_sanitized_clamps_degenerate_values() {
+        let timing = |tick, hb, emin| RaftTiming {
+            tick: Duration::from_millis(tick),
+            heartbeat: Duration::from_millis(hb),
+            election_min_ms: emin,
+            election_jitter_ms: 0,
+            pre_vote: true,
+        };
+
+        // Zero tick/heartbeat would panic tokio's interval — floored to 1ms.
+        let t = timing(0, 0, 0).sanitized();
+        assert_eq!(t.tick, Duration::from_millis(1));
+        assert_eq!(t.heartbeat, Duration::from_millis(1));
+        assert!(t.election_min_ms >= 2, "election clamped to >= 2x heartbeat");
+
+        // Tick coarser than the heartbeat is clamped down to the heartbeat.
+        let t = timing(500, 150, 1000).sanitized();
+        assert_eq!(t.tick, Duration::from_millis(150));
+        assert_eq!(t.election_min_ms, 1000, "a sane election timeout is preserved");
+
+        // Election timeout below 2x the heartbeat is clamped up.
+        let t = timing(20, 150, 100).sanitized();
+        assert_eq!(t.election_min_ms, 300, "clamped to 2x heartbeat");
+
+        // A realistic WAN config passes through untouched.
+        let t = timing(20, 150, 1000).sanitized();
+        assert_eq!(t.tick, Duration::from_millis(20));
+        assert_eq!(t.election_min_ms, 1000);
     }
 
     /// Build a bare follower shard actor (3-member group) for white-box tests of
