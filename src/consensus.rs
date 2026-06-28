@@ -432,6 +432,12 @@ struct LeaderState {
     /// Whether an `AppendEntries` is already outstanding to a peer (so we don't
     /// pile on duplicates, which would over-rewind `next_index`).
     in_flight: HashMap<String, bool>,
+    /// When we last received a reply from each peer *at our current term* — proof
+    /// the peer still acknowledges us as leader. Drives CheckQuorum / the leader
+    /// lease: if a majority's most-recent contact has aged past one election
+    /// timeout, we may have been partitioned and must step down (see
+    /// [`RaftTiming::check_quorum`]).
+    last_contact: HashMap<String, Instant>,
 }
 
 // ---------------------------------------------------------------------------
