@@ -68,12 +68,15 @@ const COMMIT_WAIT: Duration = Duration::from_secs(5);
 /// Capacity of each shard's change-event broadcast (feeds KV watches).
 const CHANGE_BUFFER: usize = 256;
 
-/// Raft timing knobs. The defaults are the original **LAN** values, so a node
-/// started with none of the env vars set behaves byte-for-byte as before. For a
-/// cross-cloud (WAN) deployment these must be sized **above** the inter-cloud
+/// Raft timing knobs. The timer *durations* default to the original **LAN**
+/// values, so an unconfigured node keeps the same heartbeat/election cadence as
+/// before; the one behaviour change with no env set is that PreVote is **on** by
+/// default (strictly safer — see [`RaftTiming::pre_vote`]). For a cross-cloud
+/// (WAN) deployment the durations must be sized **above** the inter-cloud
 /// round-trip + jitter, or transatlantic latency triggers spurious elections and
 /// leadership flapping — set e.g. `FIDUCIA_RAFT_HEARTBEAT_MS=150`,
 /// `FIDUCIA_RAFT_ELECTION_MIN_MS=1000`, `FIDUCIA_RAFT_ELECTION_JITTER_MS=1000`.
+/// PreVote can be disabled with `FIDUCIA_RAFT_PREVOTE=off`.
 #[derive(Debug, Clone, Copy)]
 pub struct RaftTiming {
     /// How often a shard actor wakes to check election/heartbeat deadlines.
