@@ -1144,6 +1144,7 @@ impl Store {
         name: String,
         candidate: String,
         ttl_ms: u64,
+        metadata: HashMap<String, String>,
     ) -> Value {
         if self.elections.contains_key(&name) {
             return json!({ "won": false, "name": name, "leader": self.elections.get(&name) });
@@ -1153,6 +1154,8 @@ impl Store {
             leader: candidate.clone(),
             fencing_token: token,
             lease_expires_ms: now.saturating_add(ttl_ms),
+            ttl_ms,
+            metadata,
         };
         self.elections.insert(name.clone(), leadership.clone());
         json!({ "won": true, "name": name, "leadership": leadership, "revision": revision })
@@ -1164,6 +1167,7 @@ impl Store {
         name: String,
         candidate: String,
         fencing_token: u64,
+        ttl_ms: Option<u64>,
     ) -> Value {
         let Some(leadership) = self.elections.get_mut(&name) else {
             return json!({ "renewed": false, "reason": "not_found", "name": name });
@@ -1171,7 +1175,10 @@ impl Store {
         if leadership.leader != candidate || leadership.fencing_token != fencing_token {
             return json!({ "renewed": false, "reason": "not_leader", "name": name });
         }
-        leadership.lease_expires_ms = now.saturating_add(30_000);
+        // Honor an explicit TTL, else reuse the TTL the leader campaigned with.
+        let ttl = ttl_ms.unwrap_or(leadership.ttl_ms);
+        leadership.ttl_ms = ttl;
+        leadership.lease_expires_ms = now.saturating_add(ttl);
         json!({ "renewed": true, "name": name, "leadership": leadership })
     }
 
