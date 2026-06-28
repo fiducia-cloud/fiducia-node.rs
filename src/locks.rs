@@ -71,6 +71,11 @@ async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<KeyPa
 }
 
 /// `POST /v1/locks/acquire` — acquire the union of `keys` (or a single `key`).
+#[tracing::instrument(
+    name = "http.lock.acquire",
+    skip(node, uri, body),
+    fields(holder = ?body.holder, keys = ?body.keys, key = ?body.key, ttl_ms = ?body.ttl_ms, wait = ?body.wait)
+)]
 async fn acquire_union(
     State(node): State<Arc<Node>>,
     uri: Uri,
