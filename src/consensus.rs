@@ -461,8 +461,9 @@ impl ShardActor {
     // --- timing -----------------------------------------------------------
 
     fn reset_election_deadline(&mut self) {
-        let jitter = self.rng.below(ELECTION_JITTER_MS);
-        self.election_deadline = Instant::now() + Duration::from_millis(ELECTION_MIN_MS + jitter);
+        let jitter = self.rng.below(self.timing.election_jitter_ms);
+        self.election_deadline =
+            Instant::now() + Duration::from_millis(self.timing.election_min_ms + jitter);
     }
 
     /// Periodic tick: leaders heartbeat; everyone else campaigns once their
