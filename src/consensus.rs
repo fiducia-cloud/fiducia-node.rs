@@ -741,11 +741,6 @@ impl ShardActor {
         self.heartbeat_deadline = Instant::now() + self.timing.heartbeat;
         self.maybe_advance_commit(); // single-node commits the no-op immediately
         self.broadcast_append_entries();
-        tracing::info!(
-            shard = self.shard_id,
-            term = self.current_term,
-            "became leader"
-        );
     }
 
     /// Convert to follower at `term`, optionally learning the new leader. Fails
