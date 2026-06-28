@@ -349,7 +349,11 @@ struct ShardActor {
     /// back in as `VoteReply` / `AppendReply`.
     self_tx: mpsc::Sender<ShardMsg>,
 
-    // --- persistent-ish Raft state (in-memory in this build) ---
+    // --- Raft state. `current_term`, `voted_for`, and `log` are the bits Raft
+    //     must persist before acting on them; `store`, when present, is their
+    //     durable home (see `crate::persist`). `commit_index`/`last_applied` are
+    //     volatile but recoverable by replaying the log up to the persisted
+    //     commit point. `None` store = in-memory only (loopback tests). ---
     role: Role,
     current_term: u64,
     voted_for: Option<String>,
@@ -357,6 +361,8 @@ struct ShardActor {
     log: Vec<LogEntry>,
     commit_index: u64,
     last_applied: u64,
+    /// Durable backing for term/vote/log, or `None` for an in-memory shard.
+    store: Option<ShardStore>,
 
     // --- candidate state ---
     votes: HashSet<String>,
