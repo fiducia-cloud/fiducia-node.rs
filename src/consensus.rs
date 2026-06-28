@@ -342,10 +342,14 @@ struct ShardActor {
 
     // --- candidate state ---
     votes: HashSet<String>,
+    // --- pre-vote (straw-poll) state, for the would-be term `pre_vote_term` ---
+    pre_votes: HashSet<String>,
+    pre_vote_term: u64,
     // --- leader state ---
     leader: Option<LeaderState>,
 
     // --- timers ---
+    timing: RaftTiming,
     election_deadline: Instant,
     heartbeat_deadline: Instant,
     rng: Rng,
