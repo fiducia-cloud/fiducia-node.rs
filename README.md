@@ -21,6 +21,7 @@ All over HTTP (`/v1`):
 |----------------------|---------------------|----------------------------------------------------------------|
 | **Locks (multi-key)** | `/v1/locks/*`      | Mutual exclusion over a **union** of keys — the flagship. Atomic all-or-nothing, FIFO, deadlock-free, fencing tokens, TTL leases. |
 | **Semaphores**        | `/v1/semaphores/*` | Counting locks: up to `limit` concurrent holders, FIFO queue beyond the cap. |
+| **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
 | **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
@@ -108,12 +109,16 @@ curl -XPOST localhost:8090/v1/services/payments-api/instances/pod-a/heartbeat \
 
 ```bash
 curl localhost:8090/v1/services/payments-api
+curl 'localhost:8090/v1/services/payments-api?metadata.region=us-east&metadata.cloud=aws'
 curl -N localhost:8090/v1/services/payments-api/watch
 ```
 
-4. For ordinary stateless traffic, the client or load balancer can pick any live
+4. Metadata filters are exact-match AND filters over live instances, so callers
+   can resolve only endpoints in a region, cloud, version, shard, or customer
+   cell without pulling the whole registry client-side.
+5. For ordinary stateless traffic, the client or load balancer can pick any live
    healthy instance, usually preferring the same region.
-5. For primary traffic, combine discovery with election metadata: instances
+6. For primary traffic, combine discovery with election metadata: instances
    register as live, campaign for a named role, and clients follow the current
    election leader. The leader's metadata can include its routable address,
    region, cloud provider, version, or shard ownership.
@@ -156,6 +161,22 @@ model, made linearizable by Raft):
 curl -XPOST localhost:8090/v1/semaphores/acquire \
   -d '{"key":"db-pool","holder":"conn-1","limit":10,"ttl_ms":30000,"wait":true}'
 ```
+
+**Idempotency keys** dedupe retry-prone work such as webhook handling, order
+fulfillment, and "run this job once" APIs:
+
+```bash
+curl -XPOST localhost:8090/v1/idempotency/claim \
+  -d '{"key":"stripe-webhook/event_123","owner":"worker-a","ttl":"24h","metadata":{"source":"stripe"}}'
+curl -XPOST localhost:8090/v1/idempotency/complete \
+  -d '{"key":"stripe-webhook/event_123","owner":"worker-a","fencing_token":7,"result":{"status":"ok"}}'
+curl 'localhost:8090/v1/idempotency?key=stripe-webhook/event_123'
+```
+
+The first active claim receives a fencing token and stores the owner/metadata
+until the TTL expires. Duplicates return the retained record. Completion requires
+the original owner and fencing token, and duplicate completions replay the stored
+result.
 
 **Keys are never in the URL path** — they go in `?key=` (or, for the multi-key
 lock acquire/release, the JSON body). So they're free of any path grammar and may
@@ -233,6 +254,19 @@ Correctness-sensitive reads stay leader-only in this node. Do not serve locks,
 fencing tokens, cron claims, or authoritative KV state from a random follower:
 a lagging follower can be missing a committed entry until it catches up.
 
+That makes topology a product choice:
+
+- use cross-cloud RF=3 for premium/global-critical coordination where surviving
+  a provider outage matters more than low write latency;
+- use same-region or same-metro RF=3 for latency-sensitive locks, semaphores,
+  rate limits, and cron claims;
+- use customer-region shards when you need both: place the shard leader near the
+  customer's traffic and choose followers from nearby failure domains.
+
+Do not blindly put every customer lock group across AWS + GCP + Hetzner. A
+healthy leader still waits for the fastest remote quorum member on every
+committed write, and p99s jump when that normally-fast follower has jitter.
+
 Tune Raft timing from measured inter-cloud RTT:
 
 ```bash
@@ -293,6 +327,7 @@ projects, users, API keys, audit, billing — never the coordination store.)
 | `src/state.rs`     | replicated state machine: `Command`s, **union locks**, semaphores, KV, … |
 | `src/locks.rs`     | multi-key union lock handlers                                        |
 | `src/semaphore.rs` | counting-semaphore handlers                                          |
+| `src/idempotency.rs` | idempotency claim / completion handlers                            |
 | `src/kv.rs`        | config KV + SSE watch handlers                                       |
 | `src/rate_limit.rs`, `src/schedule.rs`, `src/election.rs`, `src/discovery.rs` | the other primitives |
 

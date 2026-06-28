@@ -48,8 +48,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::state::{
-    Command, KvEntry, Leadership, LockState, RateLimitSnapshot, Schedule, ScheduleRun,
-    SemaphoreState, ServiceInstance, StateMachine,
+    Command, IdempotencyRecord, KvEntry, Leadership, LockState, RateLimitSnapshot, Schedule,
+    ScheduleRun, SemaphoreState, ServiceInstance, StateMachine,
 };
 use crate::transport::{
     AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
@@ -262,6 +262,7 @@ pub enum ReadRequest {
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
+    Idempotency { key: String },
     Schedule { name: String },
     ScheduleHistory { name: String },
     Election { name: String },
@@ -276,7 +277,7 @@ impl ReadRequest {
         match self {
             ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
-            ReadRequest::RateLimit { key, .. } => key,
+            ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
             ReadRequest::Services | ReadRequest::Service { .. } => crate::state::SERVICE_DOMAIN,
@@ -292,6 +293,7 @@ pub enum ReadResponse {
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
+    Idempotency(Option<IdempotencyRecord>),
     Schedule(Option<Schedule>),
     ScheduleHistory(Vec<ScheduleRun>),
     Election(Option<Leadership>),
@@ -994,6 +996,18 @@ impl ShardActor {
                 revision,
                 data: output.clone(),
             }),
+            Command::IdempotencyClaim { key, .. } => Some(ChangeEvent {
+                kind: "idempotency_claim",
+                key: key.clone(),
+                revision,
+                data: output.clone(),
+            }),
+            Command::IdempotencyComplete { key, .. } => Some(ChangeEvent {
+                kind: "idempotency_complete",
+                key: key.clone(),
+                revision,
+                data: output.clone(),
+            }),
             Command::ElectionCampaign { name, .. } => Some(ChangeEvent {
                 kind: "election_campaign",
                 key: name.clone(),
@@ -1061,6 +1075,9 @@ impl ShardActor {
             ReadRequest::RateLimit { tenant, key } => Ok(ReadResponse::RateLimit(
                 self.state.rate_limit_get(&tenant, &key),
             )),
+            ReadRequest::Idempotency { key } => {
+                Ok(ReadResponse::Idempotency(self.state.idempotency_get(&key)))
+            }
             ReadRequest::Schedule { name } => {
                 Ok(ReadResponse::Schedule(self.state.schedule_get(&name)))
             }
@@ -1499,7 +1516,7 @@ fn leader_location(leader: &str, uri: &Uri) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::to_bytes;
 
     // --- response-shaping unit test (no cluster) --------------------------
 
@@ -1569,9 +1586,7 @@ mod tests {
             "http://leader-a:8090/v1/kv/orders/checkout?wait=true"
         );
 
-        let body = to_bytes(Body::from(response.into_body()), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["reason"], "not_leader");
         assert_eq!(json["error"]["leader"], "http://leader-a:8090");
