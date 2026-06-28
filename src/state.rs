@@ -949,19 +949,18 @@ impl Store {
             });
         }
 
-        let already = sem.queue.iter().any(|q| q.holder == holder);
+        let already = sem.queue.contains(&holder);
         if wait && !already {
-            sem.queue.push_back(QueuedPermit {
-                holder: holder.clone(),
-                ttl_ms,
-                requested_ms: now,
-            });
+            sem.queue.push_back(
+                holder.clone(),
+                QueuedPermit {
+                    holder: holder.clone(),
+                    ttl_ms,
+                    requested_ms: now,
+                },
+            );
         }
-        let position = sem
-            .queue
-            .iter()
-            .position(|q| q.holder == holder)
-            .map(|idx| idx + 1);
+        let position = sem.queue.position(&holder).map(|idx| idx + 1);
         json!({
             "acquired": false,
             "queued": wait && position.is_some(),
