@@ -859,15 +859,15 @@ impl Store {
     /// Index of the first queue entry whose whole key set is free, treating the
     /// key sets of earlier still-queued entries as reserved (so a later request
     /// can't barge ahead of an earlier overlapping one — FIFO, no starvation).
-    fn lock_first_grantable(&self) -> Option<usize> {
+    fn lock_first_grantable(&self) -> Option<(String, Vec<String>)> {
         let mut reserved: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for (idx, q) in self.locks.queue.iter().enumerate() {
+        for (id, q) in self.locks.queue.iter() {
             let blocked = q
                 .keys
                 .iter()
                 .any(|k| self.locks.held.contains_key(k) || reserved.contains(k.as_str()));
             if !blocked {
-                return Some(idx);
+                return Some(id.clone());
             }
             for k in &q.keys {
                 reserved.insert(k.as_str());
