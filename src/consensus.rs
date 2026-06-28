@@ -1539,15 +1539,20 @@ impl Node {
     pub async fn query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
         let routing_key = request.routing_key().to_string();
         let shard = self.shard_for(&routing_key);
+        let started = std::time::Instant::now();
         let Some(tx) = self.sender(shard) else {
             tracing::debug!(shard = ?shard, key = %routing_key, "query unavailable: shard not hosted here");
+            self.metrics.record("read", started.elapsed().as_secs_f64() * 1e3, false);
             return Err(ProposeError::Unavailable { shard });
         };
         let (resp, rx) = oneshot::channel();
         if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
+            self.metrics.record("read", started.elapsed().as_secs_f64() * 1e3, false);
             return Err(ProposeError::Unavailable { shard });
         }
         let result = rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }));
+        self.metrics
+            .record("read", started.elapsed().as_secs_f64() * 1e3, result.is_ok());
         tracing::debug!(
             shard = ?shard,
             key = %routing_key,
