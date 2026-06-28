@@ -20,6 +20,7 @@ mod persist;
 mod raft_api;
 mod rate_limit;
 mod schedule;
+mod schedule_runner;
 mod semaphore;
 mod state;
 mod transport;
