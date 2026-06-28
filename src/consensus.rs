@@ -414,7 +414,7 @@ impl ShardActor {
     /// The shard's event loop: drain the inbox and fire the election/heartbeat
     /// tick until every sender is dropped (node shutdown).
     async fn run(mut self, mut inbox: mpsc::Receiver<ShardMsg>) {
-        let mut tick = tokio::time::interval(TICK);
+        let mut tick = tokio::time::interval(self.timing.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
