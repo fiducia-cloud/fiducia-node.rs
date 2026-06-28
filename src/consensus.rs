@@ -473,13 +473,21 @@ impl ShardActor {
         match self.role {
             Role::Leader => {
                 if now >= self.heartbeat_deadline {
-                    self.heartbeat_deadline = now + HEARTBEAT;
+                    self.heartbeat_deadline = now + self.timing.heartbeat;
                     self.broadcast_append_entries();
                 }
             }
             Role::Follower | Role::Candidate => {
                 if now >= self.election_deadline {
-                    self.start_election();
+                    // With PreVote, time-out starts a non-binding straw poll first;
+                    // only a pre-vote majority escalates to a real (term-bumping)
+                    // election. Single-member groups never reach here (they lead
+                    // from t=0), so there is always a peer to poll.
+                    if self.timing.pre_vote && self.members > 1 {
+                        self.start_pre_election();
+                    } else {
+                        self.start_election();
+                    }
                 }
             }
         }
