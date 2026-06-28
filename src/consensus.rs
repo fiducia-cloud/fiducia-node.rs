@@ -1731,6 +1731,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn committed_state_survives_a_restart_via_the_durable_store() {
+        // A single-node group with a real on-disk store. Commit a write, drop the
+        // node (simulating a pod restart), boot a fresh node on the SAME data dir,
+        // and prove the committed value is recovered by log replay — the whole
+        // point of persisting term/vote/log instead of running in memory.
+        let dir = std::env::temp_dir().join(format!(
+            "fiducia-node-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = || NodeConfig {
+            node_id: "solo".to_string(),
+            peers: vec![],
+            shard_count: 1,
+            data_dir: Some(dir.clone()),
+        };
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            let out = n.propose(put("orders/42", "paid")).await.expect("commit");
+            assert!(out.output["ok"].as_bool().unwrap());
+            n.shutdown(None); // simulate the process going away
+        }
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            match n
+                .query(ReadRequest::Kv {
+                    key: "orders/42".to_string(),
+                })
+                .await
+            {
+                Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "paid"),
+                other => panic!("committed write was not recovered after restart: {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_group_elects_one_leader_and_replicates() {
         let reg = LoopbackRegistry::new();
