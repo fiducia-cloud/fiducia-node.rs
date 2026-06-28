@@ -415,7 +415,6 @@ pub struct Schedule {
     /// The next time (epoch ms) this schedule should fire — the durable cursor the
     /// firing loop reads and the state machine advances on each claim. `None` when
     /// the schedule is exhausted (a delivered one-shot, or a cron that won't fire).
-    #[serde(default)]
     pub next_fire_ms: Option<u64>,
 }
 
