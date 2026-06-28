@@ -1338,7 +1338,7 @@ impl Store {
             wait_queue: sem
                 .queue
                 .iter()
-                .map(|q| LockWaiter {
+                .map(|(_, q)| LockWaiter {
                     holder: q.holder.clone(),
                     keys: vec![key.to_string()],
                     requested_ms: q.requested_ms,
