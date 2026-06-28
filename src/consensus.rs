@@ -1681,4 +1681,98 @@ mod tests {
             .expect("new leader commits on the surviving quorum");
         assert!(out.output["ok"].as_bool().unwrap());
     }
+
+    // --- WAN timing + PreVote ---------------------------------------------
+
+    /// Unset env must reproduce the original LAN constants exactly, so a node that
+    /// configures nothing behaves byte-for-byte as before this change.
+    #[test]
+    fn raft_timing_defaults_match_the_original_lan_constants() {
+        let t = RaftTiming::default();
+        assert_eq!(t.tick, Duration::from_millis(20));
+        assert_eq!(t.heartbeat, Duration::from_millis(50));
+        assert_eq!(t.election_min_ms, 150);
+        assert_eq!(t.election_jitter_ms, 150);
+        assert!(t.pre_vote, "pre-vote on by default");
+    }
+
+    /// Build a bare follower shard actor (3-member group) for white-box tests of
+    /// the pre-vote decision. Not wired into any cluster.
+    fn follower_actor() -> ShardActor {
+        let reg = LoopbackRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        ShardActor::new(
+            0,
+            "a".to_string(),
+            vec!["b".to_string(), "c".to_string()],
+            Arc::new(Transport::loopback(reg)),
+            tx,
+            RaftTiming::default(),
+        )
+    }
+
+    fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {
+        RequestVoteReq {
+            term,
+            candidate_id: "z".to_string(),
+            last_log_index,
+            last_log_term,
+            pre_vote: true,
+        }
+    }
+
+    /// The anti-disruption property: while a leader is alive (election deadline in
+    /// the future), a pre-vote is **denied** — so a rejoining node can never bump
+    /// the cluster's term. With no leader (or a lapsed deadline) it is granted, so
+    /// genuine elections still proceed.
+    #[test]
+    fn pre_vote_is_denied_under_a_live_leader_and_granted_otherwise() {
+        let mut a = follower_actor();
+
+        // Cold start: no leader known → granted (first election must be able to run).
+        assert!(a.leader_id.is_none());
+        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+
+        // Healthy leader, heartbeat lease still valid → denied (no disruption).
+        a.leader_id = Some("b".to_string());
+        a.election_deadline = Instant::now() + Duration::from_secs(30);
+        assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+        // ...and term grants from this round must not have inflated the would-be
+        // term (proven structurally: handle_pre_vote takes &self), but assert the
+        // observable state is untouched too.
+        assert_eq!(a.current_term, 1);
+        assert_eq!(a.voted_for, None);
+        assert_eq!(a.role, Role::Follower);
+
+        // Leader known but its lease has lapsed (missed heartbeats) → granted.
+        a.election_deadline = Instant::now() - Duration::from_millis(1);
+        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
+    }
+
+    /// Pre-vote still enforces the two safety checks: a stale would-be term and a
+    /// behind log are both refused even when no leader is alive.
+    #[test]
+    fn pre_vote_refuses_stale_term_and_behind_log() {
+        let mut a = follower_actor();
+        a.leader_id = None; // remove the leader-stickiness clause from the picture
+
+        // Stale would-be term (< our current term) → denied.
+        assert!(!a.handle_pre_vote(&pre_vote_req(0, 0, 0)).granted);
+
+        // We now hold one entry at term 1: a candidate behind on the log is denied,
+        // a caught-up one is granted.
+        a.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: None,
+        });
+        assert!(
+            !a.handle_pre_vote(&pre_vote_req(5, 0, 0)).granted,
+            "behind log must be denied"
+        );
+        assert!(
+            a.handle_pre_vote(&pre_vote_req(5, 1, 1)).granted,
+            "caught-up log granted"
+        );
+    }
 }
