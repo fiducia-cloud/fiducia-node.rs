@@ -96,10 +96,11 @@ pub struct LogEntry {
     pub command: Option<Command>,
 }
 
-/// A change applied to a shard's state machine, broadcast to watch streams.
+/// A change applied to a shard's state machine, broadcast to watch clients.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeEvent {
-    /// Event type, for example `"put"`, `"election_campaign"`, or `"service_register"`.
+    /// Domain-specific event name, such as `"put"`, `"election_campaign"`, or
+    /// `"service_register"`.
     pub kind: &'static str,
     pub key: String,
     pub revision: u64,
@@ -253,7 +254,8 @@ pub enum ShardMsg {
     Status { resp: oneshot::Sender<ShardStatus> },
 }
 
-/// A single-key read, routed to its owning shard.
+/// A read routed to its owning shard, except prefix reads which are fanned out
+/// across every hosted shard by [`Node::query_kv_prefix`].
 pub enum ReadRequest {
     Kv { key: String },
     KvPrefix { prefix: String },
@@ -1185,9 +1187,8 @@ impl Node {
         rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }))
     }
 
-    /// Serve a prefix read by asking every local shard actor and merging the
-    /// leader-only shard snapshots. This is used for key ranges that cannot be
-    /// routed to one shard by hashing a single key.
+    /// Query every hosted shard for entries under a prefix and merge the partial
+    /// results in deterministic key order.
     pub async fn query_kv_prefix(
         &self,
         prefix: String,
@@ -1250,7 +1251,8 @@ impl Node {
         rx.await.ok()
     }
 
-    /// Subscribe to every local shard's committed-change stream.
+    /// Subscribe to every shard hosted by this node. Used by prefix watches
+    /// because keys under one prefix can hash to many shards.
     pub async fn watch_all(&self) -> Vec<broadcast::Receiver<ChangeEvent>> {
         let mut receivers = Vec::with_capacity(self.shards.len());
         let mut shards: Vec<_> = self.shards.iter().map(|(shard, tx)| (*shard, tx)).collect();
