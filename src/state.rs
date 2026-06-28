@@ -437,14 +437,8 @@ pub struct ScheduleRun {
     pub attempts: u32,
     pub duplicate: bool,
     pub target: ScheduleTarget,
-    #[serde(default = "default_run_status")]
     pub status: RunStatus,
-    #[serde(default)]
     pub error: Option<String>,
-}
-
-fn default_run_status() -> RunStatus {
-    RunStatus::Delivered
 }
 
 #[derive(Debug, Clone)]
