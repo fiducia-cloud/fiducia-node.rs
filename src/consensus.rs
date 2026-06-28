@@ -1761,7 +1761,7 @@ fn now_nanos() -> u64 {
 // Status + result types.
 // ---------------------------------------------------------------------------
 
-/// Per-shard consensus status, surfaced by `/v1/status`.
+/// Per-shard consensus status, surfaced by `/v1/status` and `/v1/observe/shards`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardStatus {
     pub shard_id: ShardId,
@@ -1769,7 +1769,30 @@ pub struct ShardStatus {
     pub term: u64,
     pub leader_id: Option<String>,
     pub commit_index: u64,
+    /// Highest log index applied to the state machine (≤ `commit_index`); the gap
+    /// is apply lag.
+    pub last_applied: u64,
     pub last_log_index: u64,
+    /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
+    pub healthy_replicas: usize,
+    /// Whether a majority of the group is caught up — i.e. the shard can survive
+    /// the loss of one more member without losing quorum. Leader-only.
+    pub has_quorum: bool,
+    /// Per-peer replication progress. Populated only while this node leads.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replication: Vec<PeerReplication>,
+}
+
+/// One follower's replication progress, as seen by the shard leader.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerReplication {
+    pub peer: String,
+    /// Highest log index the leader knows this peer has stored.
+    pub match_index: u64,
+    /// How far behind the leader's log tail this peer is (`last_log_index - match`).
+    pub lag: u64,
+    /// Whether an `AppendEntries` to this peer is currently outstanding.
+    pub in_flight: bool,
 }
 
 /// Whole-node status: identity, membership, and a row per hosted shard.
