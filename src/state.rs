@@ -96,11 +96,19 @@ pub enum Command {
         name: String,
         candidate: String,
         ttl_ms: u64,
+        /// Opaque candidate facts published to observers/watchers (e.g. address,
+        /// region, version) so the leader is *discoverable*, not just named.
+        #[serde(default)]
+        metadata: HashMap<String, String>,
     },
     ElectionRenew {
         name: String,
         candidate: String,
         fencing_token: u64,
+        /// Lease extension; when omitted the leadership's original campaign TTL
+        /// is reused instead of a hard-coded default.
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     ElectionResign {
         name: String,
