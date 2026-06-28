@@ -281,8 +281,10 @@ struct LockManager {
     held: HashMap<String, u64>,
     /// fencing token → grant.
     grants: HashMap<u64, LockGrant>,
-    /// FIFO queue of requests waiting for their full union to be free.
-    queue: VecDeque<QueuedLock>,
+    /// FIFO queue of requests waiting for their full union to be free. Indexed by
+    /// `(holder, key-set)` so an "already queued?" check and a cancel/lease-expiry
+    /// removal from the middle of the queue are O(1) (see [`crate::indexed_queue`]).
+    queue: IndexedQueue<(String, Vec<String>), QueuedLock>,
 }
 
 /// Read view of a counting semaphore.
