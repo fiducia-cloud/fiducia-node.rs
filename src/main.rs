@@ -14,6 +14,7 @@ mod cron;
 mod discovery;
 mod election;
 mod indexed_queue;
+mod internal_auth;
 mod kv;
 mod locks;
 mod metrics;
