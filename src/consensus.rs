@@ -246,7 +246,11 @@ pub enum ShardMsg {
         resp: oneshot::Sender<RequestVoteResp>,
     },
     /// A peer's reply to a `RequestVote` this shard sent (routed back to self).
-    VoteReply { from: String, resp: RequestVoteResp },
+    VoteReply {
+        from: String,
+        pre_vote: bool,
+        resp: RequestVoteResp,
+    },
     /// A peer's reply to an `AppendEntries` this shard sent (routed back to self).
     AppendReply {
         from: String,
