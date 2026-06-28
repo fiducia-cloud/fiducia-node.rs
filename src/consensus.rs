@@ -1021,6 +1021,54 @@ impl ShardActor {
         }
     }
 
+    // --- CheckQuorum / leader lease ---------------------------------------
+
+    /// Whether this leader has confirmed contact with a majority of the group
+    /// within the last election timeout — i.e. holds a valid leader lease and may
+    /// safely act as leader (serve a linearizable read, stay leader).
+    ///
+    /// Returns `true` when CheckQuorum is disabled or this is a single-member group
+    /// (the node alone *is* the majority), so the feature is byte-identical to the
+    /// old behaviour when off.
+    fn leader_lease_held(&self) -> bool {
+        if !self.timing.check_quorum || self.members == 1 {
+            return true;
+        }
+        let Some(ls) = self.leader.as_ref() else {
+            return false; // not actually leading
+        };
+        // Most-recent-contact instant per member: `now` for self, last reply for
+        // each peer (absent ⇒ never). The majority-th most recent of these is the
+        // latest moment at which a majority was in contact; the lease holds for one
+        // election timeout past it.
+        let now = Instant::now();
+        let never = now.checked_sub(Duration::from_secs(86_400)).unwrap_or(now);
+        let mut contacts: Vec<Instant> = Vec::with_capacity(self.members);
+        contacts.push(now); // self
+        for peer in &self.peers {
+            contacts.push(ls.last_contact.get(peer).copied().unwrap_or(never));
+        }
+        contacts.sort_unstable_by(|a, b| b.cmp(a)); // most-recent first
+        let majority_contact = contacts[self.majority() - 1];
+        majority_contact.elapsed() < Duration::from_millis(self.timing.election_min_ms)
+    }
+
+    /// Step down because the leader lease lapsed (CheckQuorum). We keep the same
+    /// term — we have *not* observed a newer one, we have simply lost contact — and
+    /// become a follower so we stop serving authoritative reads/writes. The normal
+    /// election timeout then governs whether we (or someone with quorum) campaign.
+    fn relinquish_no_quorum(&mut self) {
+        tracing::warn!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            term = self.current_term,
+            "raft: leader lease lapsed (no majority contact within an election timeout) \
+             — stepping down to avoid split-brain / stale reads (check-quorum)"
+        );
+        let term = self.current_term;
+        self.step_down(term, None);
+    }
+
     // --- replication (follower side) --------------------------------------
 
     fn handle_append_entries(&mut self, req: AppendEntriesReq) -> AppendEntriesResp {
