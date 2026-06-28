@@ -147,6 +147,9 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
+        if event.scope != "kv" {
+            return None; // ignore election/service changes on the shared shard stream
+        }
         let matches = if prefix {
             event.key.starts_with(&key)
         } else {
