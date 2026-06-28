@@ -30,6 +30,94 @@ All over HTTP (`/v1`):
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
 internal `/raft/{shard}/{append,vote}` peer endpoints.
 
+## B2B coordination flows
+
+A B2B customer uses fiducia.cloud when they have many replicas of their own
+service, but some decisions must have exactly one authoritative owner at a time.
+Common failures this prevents:
+
+- two cron runners sending the same invoices or payouts;
+- two workers claiming the same tenant, shard, job, or migration;
+- clients routing to stale service instances after a pod or VM dies;
+- manual failover where people update config during an incident;
+- split-brain primaries where old and new leaders both keep writing.
+
+The control plane handles orgs, projects, environments, API keys, billing, and
+placement. The node API below is the data-plane contract those customer replicas
+use after the control plane has issued credentials and an endpoint.
+
+### Leader election
+
+Use this when exactly one replica may perform a critical action: run a scheduler,
+own a tenant shard, coordinate a migration, drain a queue partition, or act as a
+regional primary.
+
+1. Pick a stable election name, for example `prod/invoice-reconciler/leader`.
+2. Every replica campaigns with its own candidate id, lease TTL, and metadata:
+
+```bash
+curl -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/campaign \
+  -d '{"candidate":"pod-a","ttl_ms":30000,"metadata":{"region":"us-east","address":"https://pod-a.internal","version":"2026.06.27"}}'
+```
+
+3. The winner receives `won: true` plus a `leadership` object containing
+   `leader`, `lease_expires_ms`, `metadata`, and a monotonic `fencing_token`.
+   Losers receive the current leader.
+4. Only the winner performs the exclusive work. It renews before the lease
+   expires:
+
+```bash
+curl -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/renew \
+  -d '{"candidate":"pod-a","fencing_token":41}'
+```
+
+5. If renew fails, times out beyond the customer's safety threshold, or returns
+   `not_leader`, the replica must stop doing leader-only work.
+6. The customer passes the `fencing_token` into any downstream stateful system
+   that can enforce it. For example, a database row, storage object, or payment
+   processor idempotency table should reject writes from an older token. That is
+   what prevents a slow old leader from causing damage after failover.
+7. Other processes can read or watch the leader:
+
+```bash
+curl localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader
+curl -N localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/watch
+```
+
+### Service discovery
+
+Use this when clients need a live list of service instances instead of hardcoded
+endpoints or stale DNS answers.
+
+1. Each instance registers itself under a service name with an address, TTL, and
+   metadata:
+
+```bash
+curl -XPUT localhost:8090/v1/services/payments-api/instances/pod-a \
+  -d '{"address":"https://pod-a.internal:8443","ttl_ms":30000,"metadata":{"region":"us-east","cloud":"aws","version":"2026.06.27"}}'
+```
+
+2. The instance heartbeats before its TTL expires:
+
+```bash
+curl -XPOST localhost:8090/v1/services/payments-api/instances/pod-a/heartbeat \
+  -d '{"ttl_ms":30000}'
+```
+
+3. Clients resolve only live instances:
+
+```bash
+curl localhost:8090/v1/services/payments-api
+curl -N localhost:8090/v1/services/payments-api/watch
+```
+
+4. For ordinary stateless traffic, the client or load balancer can pick any live
+   healthy instance, usually preferring the same region.
+5. For primary traffic, combine discovery with election metadata: instances
+   register as live, campaign for a named role, and clients follow the current
+   election leader. The leader's metadata can include its routable address,
+   region, cloud provider, version, or shard ownership.
+
 ## The flagship: multi-key UNION locks + semaphores
 
 Fiducia's most valuable primitive is the distributed lock — and not just one key
@@ -133,6 +221,31 @@ inbox message, so a slow peer can't stall the shard.
 tests — so a whole multi-node cluster (election + replication + failover) runs
 deterministically in one process with no sockets. See the `consensus` tests.
 
+### Cross-cloud RF=3 timing
+
+The intended multi-cloud baseline is **RF=3 voters per shard**: one node in each
+Kubernetes cluster / cloud provider, for example AWS + GCP + Hetzner. A committed
+write waits for the leader plus one follower, so normal customer writes pay the
+fastest remote follower RTT. The third follower may lag; that is safe as long as
+clients only treat writes as successful after quorum commit.
+
+Correctness-sensitive reads stay leader-only in this node. Do not serve locks,
+fencing tokens, cron claims, or authoritative KV state from a random follower:
+a lagging follower can be missing a committed entry until it catches up.
+
+Tune Raft timing from measured inter-cloud RTT:
+
+```bash
+FIDUCIA_RAFT_RTT_MS=95              # optional helper: election >= 10x RTT
+FIDUCIA_RAFT_HEARTBEAT_MS=100
+FIDUCIA_RAFT_ELECTION_MIN_MS=1000
+FIDUCIA_RAFT_ELECTION_JITTER_MS=500
+FIDUCIA_RAFT_COMMIT_WAIT_MS=10000
+```
+
+`/v1/status` reports the active timing and per-shard metrics including append
+RTT, quorum commit RTT, max follower lag, and observed leadership transfers.
+
 ## Durability — what "backs" the store?
 
 **There is no external database.** Like etcd, Consul, and TiKV, Fiducia *is* the
@@ -150,8 +263,10 @@ database: the **replicated log + the deterministic state machine** are the store
   compacted).
 
 Today the per-shard log and state machine are **in-memory** (durability comes
-from replication across nodes). The seam to add on-disk durability is narrow and
-deliberate:
+from replication across nodes). That is not enough for production Kubernetes
+unless every Raft member has stable persistent storage: losing a pod's ephemeral
+disk can silently erase one of the durable copies. The seam to add on-disk
+durability is narrow and deliberate:
 
 | Piece | Status | On-disk path |
 |-------|--------|--------------|

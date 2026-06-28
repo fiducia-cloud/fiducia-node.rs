@@ -1,8 +1,8 @@
 //! The replicated state machine.
 //!
 //! Every mutation exposed by Fiducia is represented as a [`Command`] and is applied
-//! in committed-log order. In this single-node skeleton the log is local, but the
-//! state-machine semantics are the same ones the replicated path will use.
+//! in committed-log order. The log may be local in single-node development, but
+//! the state-machine semantics are the same ones the replicated path uses.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -96,6 +96,7 @@ pub enum Command {
         name: String,
         candidate: String,
         ttl_ms: u64,
+        metadata: HashMap<String, String>,
     },
     ElectionRenew {
         name: String,
@@ -330,6 +331,9 @@ pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
     pub lease_expires_ms: u64,
+    pub metadata: HashMap<String, String>,
+    #[serde(skip)]
+    lease_ttl_ms: u64,
 }
 
 /// A scheduled job definition.
@@ -475,7 +479,8 @@ impl StateMachine {
                 name,
                 candidate,
                 ttl_ms,
-            } => store.apply_election_campaign(revision, now, name, candidate, ttl_ms),
+                metadata,
+            } => store.apply_election_campaign(revision, now, name, candidate, ttl_ms, metadata),
             Command::ElectionRenew {
                 name,
                 candidate,
@@ -516,6 +521,19 @@ impl StateMachine {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
         store.kv.get(key).cloned()
+    }
+
+    pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut entries: Vec<_> = store
+            .kv
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
     }
 
     pub fn lock_get(&self, key: &str) -> LockState {
@@ -1112,6 +1130,7 @@ impl Store {
         name: String,
         candidate: String,
         ttl_ms: u64,
+        metadata: HashMap<String, String>,
     ) -> Value {
         if self.elections.contains_key(&name) {
             return json!({ "won": false, "name": name, "leader": self.elections.get(&name) });
@@ -1121,6 +1140,8 @@ impl Store {
             leader: candidate.clone(),
             fencing_token: token,
             lease_expires_ms: now.saturating_add(ttl_ms),
+            metadata,
+            lease_ttl_ms: ttl_ms,
         };
         self.elections.insert(name.clone(), leadership.clone());
         json!({ "won": true, "name": name, "leadership": leadership, "revision": revision })
@@ -1139,7 +1160,7 @@ impl Store {
         if leadership.leader != candidate || leadership.fencing_token != fencing_token {
             return json!({ "renewed": false, "reason": "not_leader", "name": name });
         }
-        leadership.lease_expires_ms = now.saturating_add(30_000);
+        leadership.lease_expires_ms = now.saturating_add(leadership.lease_ttl_ms);
         json!({ "renewed": true, "name": name, "leadership": leadership })
     }
 
@@ -1696,14 +1717,45 @@ mod tests {
     }
 
     #[test]
+    fn kv_prefix_lists_matching_keys_in_order() {
+        let sm = StateMachine::new();
+        for (key, value) in [
+            ("flags/new-checkout", "on"),
+            ("flags/search", "off"),
+            ("config/theme", "blue"),
+        ] {
+            sm.apply(Command::KvPut {
+                key: key.to_string(),
+                value: value.to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            });
+        }
+
+        let entries = sm.kv_prefix("flags/");
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+
+        assert_eq!(keys, vec!["flags/new-checkout", "flags/search"]);
+        assert_eq!(entries[0].1.value, "on");
+    }
+
+    #[test]
     fn election_uses_fencing_tokens_for_campaign_renew_and_resign() {
         let sm = StateMachine::new();
+        let metadata = HashMap::from([
+            ("region".to_string(), "us-east".to_string()),
+            ("address".to_string(), "https://node-a.internal".to_string()),
+        ]);
         let won = sm.apply(Command::ElectionCampaign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
-            ttl_ms: 30_000,
+            ttl_ms: 120_000,
+            metadata,
         });
         let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
+        let initial_expiry = won.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
         let stale_renew = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
@@ -1714,6 +1766,7 @@ mod tests {
             candidate: "node-a".to_string(),
             fencing_token: token,
         });
+        let stored_metadata = sm.election_get("scheduler").unwrap().metadata;
         let resigned = sm.apply(Command::ElectionResign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
@@ -1721,8 +1774,14 @@ mod tests {
         });
 
         assert_eq!(won.output["won"], true);
+        assert_eq!(won.output["leadership"]["metadata"]["region"], "us-east");
+        assert_eq!(stored_metadata["address"], "https://node-a.internal");
         assert_eq!(stale_renew.output["renewed"], false);
         assert_eq!(renewed.output["renewed"], true);
+        let renewed_expiry = renewed.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(renewed_expiry >= initial_expiry.saturating_sub(1_000));
         assert_eq!(resigned.output["resigned"], true);
         assert!(sm.election_get("scheduler").is_none());
     }

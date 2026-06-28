@@ -16,20 +16,26 @@
 //!   * `GET    /v1/services/{service}/watch`                  — SSE of instance changes
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::Uri,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, put},
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
-use crate::state::Command;
+use crate::state::{Command, SERVICE_DOMAIN};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
@@ -138,7 +144,26 @@ async fn deregister(
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
-async fn watch(State(_node): State<Arc<Node>>, Path(_service): Path<String>) -> Json<Value> {
-    // TODO: SSE subscribed to this service's instance-change events.
-    Json(json!({ "error": "not_implemented", "op": "discovery.watch" }))
+async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
+    let Some(rx) = node.watch(SERVICE_DOMAIN).await else {
+        return Json(
+            json!({ "error": "unavailable", "op": "discovery.watch", "service": service }),
+        )
+        .into_response();
+    };
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let event = item.ok()?;
+        if event.key != service {
+            return None;
+        }
+        Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(event.kind)
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
