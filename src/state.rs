@@ -613,6 +613,39 @@ impl StateMachine {
             .map(|instances| instances.values().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Every live KV entry whose key starts with `prefix` (this shard's slice of
+    /// the keyspace). Serializable read off applied state; callers fan this out
+    /// across shards and merge.
+    pub fn kv_list(&self, prefix: &str) -> Vec<KvListItem> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store
+            .kv
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| KvListItem {
+                key: key.clone(),
+                entry: entry.clone(),
+            })
+            .collect()
+    }
+
+    /// Every service that has at least one live instance on this shard, with the
+    /// live-instance count. Callers fan this out across shards and sum.
+    pub fn service_names(&self) -> Vec<ServiceSummary> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store
+            .services
+            .iter()
+            .filter(|(_, instances)| !instances.is_empty())
+            .map(|(service, instances)| ServiceSummary {
+                service: service.clone(),
+                instances: instances.len(),
+            })
+            .collect()
+    }
 }
 
 impl Store {
