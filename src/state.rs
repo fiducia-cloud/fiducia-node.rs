@@ -412,6 +412,23 @@ pub struct Schedule {
     pub delivery: DeliverySemantics,
     pub max_retries: u32,
     pub enabled: bool,
+    /// The next time (epoch ms) this schedule should fire — the durable cursor the
+    /// firing loop reads and the state machine advances on each claim. `None` when
+    /// the schedule is exhausted (a delivered one-shot, or a cron that won't fire).
+    #[serde(default)]
+    pub next_fire_ms: Option<u64>,
+}
+
+/// Lifecycle of one fire's delivery, recorded durably in the schedule's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// Claimed and being delivered (or interrupted before the result was recorded).
+    Pending,
+    /// Delivered successfully.
+    Delivered,
+    /// Gave up after exhausting retries.
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -421,6 +438,14 @@ pub struct ScheduleRun {
     pub attempts: u32,
     pub duplicate: bool,
     pub target: ScheduleTarget,
+    #[serde(default = "default_run_status")]
+    pub status: RunStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+fn default_run_status() -> RunStatus {
+    RunStatus::Delivered
 }
 
 #[derive(Debug, Clone)]
