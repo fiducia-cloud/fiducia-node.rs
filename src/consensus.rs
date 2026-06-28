@@ -194,11 +194,17 @@ impl Default for RaftTiming {
         }
         election_min_ms = election_min_ms.max(heartbeat_ms.saturating_mul(3));
 
+        let pre_vote = std::env::var("FIDUCIA_RAFT_PREVOTE")
+            .ok()
+            .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+
         Self {
             heartbeat_ms,
             election_min_ms,
             election_jitter_ms,
             commit_wait_ms,
+            pre_vote,
         }
     }
 }
