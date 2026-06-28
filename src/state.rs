@@ -663,6 +663,17 @@ impl StateMachine {
             .unwrap_or_default()
     }
 
+    /// Every schedule definition on this shard (for the firing loop to scan).
+    pub fn schedule_list(&self) -> Vec<Schedule> {
+        self.store
+            .lock()
+            .unwrap()
+            .schedules
+            .values()
+            .map(|record| record.definition.clone())
+            .collect()
+    }
+
     pub fn service_list(&self, service: &str) -> Vec<ServiceInstance> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
