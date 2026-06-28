@@ -755,7 +755,7 @@ impl Store {
             .locks
             .queue
             .iter()
-            .flat_map(|q| q.keys.iter().map(|k| k.as_str()))
+            .flat_map(|(_, q)| q.keys.iter().map(|k| k.as_str()))
             .collect();
         let blocked_by_queue = keys.iter().any(|k| reserved.contains(k.as_str()));
 
