@@ -63,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The cron firing loop: fires due schedules on the shards this node leads.
     schedule_runner::spawn(node.clone());
 
+    // Log whether the internal trust boundary (LB→node, node→node) is enforced.
+    internal_auth::init_and_log();
+
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
@@ -78,9 +81,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        .nest("/v1", v1)
+        // `/v1` (client data plane, reached via the LB) and `/raft` (peer RPC) are
+        // cluster-internal: when FIDUCIA_INTERNAL_SECRET is set, both require the
+        // trusted-hop header. Health probes stay open for k8s. The guard is a
+        // no-op when the secret is unset (dev / single-node), so this is additive.
+        .nest("/v1", v1.layer(middleware::from_fn(internal_auth::guard)))
         // Internal node↔node Raft RPC (peer transport server side); not under /v1.
-        .nest("/raft", raft_api::router())
+        .nest(
+            "/raft",
+            raft_api::router().layer(middleware::from_fn(internal_auth::guard)),
+        )
         .with_state(node)
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.
