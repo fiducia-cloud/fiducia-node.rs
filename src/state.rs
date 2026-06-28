@@ -1524,6 +1524,28 @@ pub fn valid_cron_expression(value: &str) -> bool {
     crate::cron::CronSchedule::parse(value).is_ok()
 }
 
+/// The next fire time for a schedule given a cursor: a one-shot fires once at its
+/// appointed time; a cron at its first occurrence strictly after `after_ms`.
+fn next_fire_for(cron: &Option<String>, one_shot_at_ms: Option<u64>, after_ms: u64) -> Option<u64> {
+    if let Some(at) = one_shot_at_ms {
+        return Some(at);
+    }
+    cron.as_deref()
+        .and_then(|expr| crate::cron::CronSchedule::parse(expr).ok())
+        .and_then(|c| c.next_after(after_ms))
+}
+
+/// Cap on retained run history per schedule (bounds memory + the WAL; full
+/// retention is the durability follow-up in future-work.md).
+const MAX_SCHEDULE_HISTORY: usize = 100;
+
+fn trim_history(record: &mut ScheduleRecord) {
+    let len = record.history.len();
+    if len > MAX_SCHEDULE_HISTORY {
+        record.history.drain(0..len - MAX_SCHEDULE_HISTORY);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
