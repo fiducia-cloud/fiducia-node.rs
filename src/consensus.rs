@@ -934,6 +934,8 @@ impl ShardActor {
 
         // Append, truncating on the first conflicting term.
         let mut idx = req.prev_log_index;
+        let mut truncated = false;
+        let mut grew = false;
         for entry in req.entries {
             idx += 1;
             match self.log.get((idx - 1) as usize) {
@@ -941,14 +943,26 @@ impl ShardActor {
                 Some(_) => {
                     self.log.truncate((idx - 1) as usize);
                     self.log.push(entry);
+                    truncated = true;
                 }
-                None => self.log.push(entry),
+                None => {
+                    self.log.push(entry);
+                    grew = true;
+                }
             }
+        }
+        // Persist the log change before acking success: a full rewrite if we
+        // truncated a conflicting suffix, otherwise just the appended tail.
+        if truncated {
+            self.persist_log_rewrite();
+        } else if grew {
+            self.persist_log_append();
         }
 
         if req.leader_commit > self.commit_index {
             self.commit_index = req.leader_commit.min(self.last_log_index());
             self.apply_committed();
+            self.persist_hard_state(); // record the advanced commit pointer
         }
 
         AppendEntriesResp {
