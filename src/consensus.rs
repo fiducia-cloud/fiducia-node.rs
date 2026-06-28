@@ -1243,6 +1243,41 @@ impl ShardActor {
             ReadRequest::Service { service } => {
                 Ok(ReadResponse::Service(self.state.service_list(&service)))
             }
+            // List reads are served serializably; route them through the local
+            // path even if they reach here.
+            list @ (ReadRequest::KvList { .. } | ReadRequest::ServiceList) => {
+                Ok(self.handle_query_local(list))
+            }
+        }
+    }
+
+    /// Serializable read off local applied state — used for list/range fan-outs.
+    /// No leader gate: every shard replica can answer for its own slice, and the
+    /// fan-out merges them. Only list variants are expected here.
+    fn handle_query_local(&self, request: ReadRequest) -> ReadResponse {
+        match request {
+            ReadRequest::KvList { prefix } => ReadResponse::KvList(self.state.kv_list(&prefix)),
+            ReadRequest::ServiceList => ReadResponse::ServiceList(self.state.service_names()),
+            // A single-key read arriving on the local path: serve it off applied
+            // state too rather than erroring.
+            ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
+            ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
+            ReadRequest::Semaphore { key } => {
+                ReadResponse::Semaphore(self.state.semaphore_get(&key))
+            }
+            ReadRequest::RateLimit { tenant, key } => {
+                ReadResponse::RateLimit(self.state.rate_limit_get(&tenant, &key))
+            }
+            ReadRequest::Schedule { name } => ReadResponse::Schedule(self.state.schedule_get(&name)),
+            ReadRequest::ScheduleHistory { name } => {
+                ReadResponse::ScheduleHistory(self.state.schedule_history(&name))
+            }
+            ReadRequest::Election { name } => {
+                ReadResponse::Election(self.state.election_get(&name))
+            }
+            ReadRequest::Service { service } => {
+                ReadResponse::Service(self.state.service_list(&service))
+            }
         }
     }
 
