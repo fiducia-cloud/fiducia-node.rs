@@ -76,6 +76,9 @@ async fn upsert(
             target: body.target,
             delivery: body.delivery.unwrap_or(DeliverySemantics::AtLeastOnce),
             max_retries: body.max_retries.unwrap_or(3),
+            // Stamp the clock here (the proposer), so the state machine computes the
+            // initial next-fire deterministically on every replica.
+            now_ms: now_ms(),
         })
         .await;
     propose_response(result, &uri)
