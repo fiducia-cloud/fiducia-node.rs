@@ -212,6 +212,14 @@ impl Default for NodeConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(16),
+            // Default to the conventional PVC mount; a deployment can override
+            // with FIDUCIA_DATA_DIR. The directory must be writable (the pod
+            // mounts a PersistentVolume there).
+            data_dir: Some(
+                std::env::var("FIDUCIA_DATA_DIR")
+                    .unwrap_or_else(|_| "/var/lib/fiducia".to_string())
+                    .into(),
+            ),
         }
     }
 }
