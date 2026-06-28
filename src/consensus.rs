@@ -1366,6 +1366,25 @@ impl ShardActor {
                 leader: self.leader_id.clone(),
             });
         }
+        // Linearizable read gate (leader lease): a leader that hasn't confirmed a
+        // majority within the last election timeout might already be deposed, so it
+        // must not answer authoritatively. Closes the sub-tick window before
+        // CheckQuorum's `on_tick` step-down fires. The client retries (503) and is
+        // rerouted to whoever actually holds quorum. Serializable list/fan-out reads
+        // (handle_query_local) deliberately skip this — stale results are allowed
+        // there by contract.
+        if !matches!(
+            request,
+            ReadRequest::KvList { .. }
+                | ReadRequest::ServiceList
+                | ReadRequest::ScheduleList
+                | ReadRequest::ElectionList
+        ) && !self.leader_lease_held()
+        {
+            return Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            });
+        }
         match request {
             ReadRequest::Kv { key } => Ok(ReadResponse::Kv(self.state.kv_get(&key))),
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
