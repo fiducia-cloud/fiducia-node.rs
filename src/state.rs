@@ -516,12 +516,14 @@ impl StateMachine {
                 name,
                 candidate,
                 ttl_ms,
-            } => store.apply_election_campaign(revision, now, name, candidate, ttl_ms),
+                metadata,
+            } => store.apply_election_campaign(revision, now, name, candidate, ttl_ms, metadata),
             Command::ElectionRenew {
                 name,
                 candidate,
                 fencing_token,
-            } => store.apply_election_renew(now, name, candidate, fencing_token),
+                ttl_ms,
+            } => store.apply_election_renew(now, name, candidate, fencing_token, ttl_ms),
             Command::ElectionResign {
                 name,
                 candidate,
