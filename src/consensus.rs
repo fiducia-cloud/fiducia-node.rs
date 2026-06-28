@@ -660,7 +660,7 @@ impl ShardActor {
             command: None,
         });
 
-        self.heartbeat_deadline = Instant::now() + HEARTBEAT;
+        self.heartbeat_deadline = Instant::now() + self.timing.heartbeat;
         self.maybe_advance_commit(); // single-node commits the no-op immediately
         self.broadcast_append_entries();
         tracing::info!(
