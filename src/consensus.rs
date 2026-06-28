@@ -315,6 +315,9 @@ impl ReadRequest {
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
             ReadRequest::Service { service } => service,
+            // List reads fan out across all shards rather than routing to one.
+            ReadRequest::KvList { prefix } => prefix,
+            ReadRequest::ServiceList => "",
         }
     }
 }
