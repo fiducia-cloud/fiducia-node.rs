@@ -966,6 +966,11 @@ impl ShardActor {
     }
 
     fn handle_request_vote(&mut self, req: RequestVoteReq) -> RequestVoteResp {
+        // PreVote is answered without mutating any Raft state (no term bump, no
+        // `voted_for`, no deadline reset) — that read-only-ness is the whole point.
+        if req.pre_vote {
+            return self.handle_pre_vote(&req);
+        }
         if req.term < self.current_term {
             return RequestVoteResp {
                 term: self.current_term,
@@ -997,6 +1002,25 @@ impl ShardActor {
                 term: self.current_term,
                 granted: false,
             }
+        }
+    }
+
+    /// Answer a PreVote straw poll. Pure read: changes nothing. Grant only if the
+    /// candidate's would-be term isn't stale, its log is at least as up-to-date,
+    /// AND we are not currently served by a live leader — i.e. we know of no
+    /// leader, or our last `AppendEntries` is older than an election timeout. That
+    /// leader-stickiness is what makes pre-vote refuse to disrupt a healthy leader;
+    /// at cold start `leader_id` is `None`, so the first election still runs.
+    fn handle_pre_vote(&self, req: &RequestVoteReq) -> RequestVoteResp {
+        let log_ok = (req.last_log_term > self.last_log_term())
+            || (req.last_log_term == self.last_log_term()
+                && req.last_log_index >= self.last_log_index());
+        let leader_alive = self.leader_id.is_some()
+            && self.last_leader_contact.elapsed()
+                < Duration::from_millis(self.timing.election_min_ms);
+        RequestVoteResp {
+            term: self.current_term,
+            granted: req.term >= self.current_term && log_ok && !leader_alive,
         }
     }
 
