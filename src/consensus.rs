@@ -1090,6 +1090,7 @@ impl Node {
     /// Must be called from within a Tokio runtime (it spawns the actor tasks).
     pub fn bootstrap(config: NodeConfig, transport: Transport) -> Self {
         let transport = Arc::new(transport);
+        let timing = RaftTiming::from_env();
         let mut shards = HashMap::new();
         let mut tasks = Vec::new();
         for shard_id in 0..config.shard_count {
@@ -1103,6 +1104,7 @@ impl Node {
                 config.peers.clone(),
                 transport.clone(),
                 tx.clone(),
+                timing,
             );
             tasks.push(tokio::spawn(actor.run(rx)));
             shards.insert(shard_id, tx);
