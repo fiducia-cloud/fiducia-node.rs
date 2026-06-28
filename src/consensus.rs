@@ -48,6 +48,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
+use crate::persist::{Recovered, ShardStore};
 use crate::state::{
     Command, KvEntry, Leadership, LockState, RateLimitSnapshot, Schedule, ScheduleRun,
     SemaphoreState, ServiceInstance, StateMachine,
