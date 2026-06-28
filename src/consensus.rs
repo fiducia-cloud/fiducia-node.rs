@@ -169,13 +169,23 @@ pub struct LogEntry {
     pub command: Option<Command>,
 }
 
-/// A change applied to a shard's state machine, broadcast to KV watchers.
+/// A change applied to a shard's state machine, broadcast to watchers (KV,
+/// elections, discovery). `scope` lets a watcher ignore changes from a different
+/// primitive that happens to share a name with what it's watching.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeEvent {
-    /// `"put"` or `"delete"`.
+    /// Which primitive changed: `"kv"`, `"election"`, or `"service"`.
+    pub scope: &'static str,
+    /// Domain verb: kv `put`/`delete`; election `elected`/`renewed`/`resigned`;
+    /// service `register`/`heartbeat`/`deregister`.
     pub kind: &'static str,
+    /// The watched name: kv key, election name, or service name.
     pub key: String,
     pub revision: u64,
+    /// Optional payload (the new `Leadership` or `ServiceInstance`) so watchers
+    /// can act on a single event without a follow-up read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Static identity + cluster membership for this physical node.
