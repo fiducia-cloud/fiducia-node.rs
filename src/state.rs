@@ -1659,6 +1659,78 @@ mod tests {
     }
 
     #[test]
+    fn lock_inventory_lists_every_grant_and_the_whole_wait_queue() {
+        let sm = StateMachine::new();
+        // Two independent grants on disjoint key sets, plus one waiter blocked on
+        // a set that overlaps the first grant.
+        acquire(&sm, &["orders/42"], "worker-a", false);
+        acquire(&sm, &["inventory/sku-7"], "worker-b", false);
+        let queued = acquire(&sm, &["orders/42", "inventory/sku-9"], "worker-c", true);
+        assert_eq!(queued["queued"], true);
+
+        let inv = sm.lock_inventory();
+        assert_eq!(inv.held.len(), 2, "two active grants");
+        // Sorted by fencing token, so worker-a (acquired first) comes first.
+        assert_eq!(inv.held[0].holder, "worker-a");
+        assert_eq!(inv.held[1].holder, "worker-b");
+        assert!(inv.held[0].fencing_token < inv.held[1].fencing_token);
+        assert_eq!(inv.wait_queue.len(), 1, "one waiter");
+        assert_eq!(inv.wait_queue[0].holder, "worker-c");
+        assert_eq!(
+            inv.wait_queue[0].keys,
+            vec!["inventory/sku-9".to_string(), "orders/42".to_string()]
+        );
+    }
+
+    #[test]
+    fn semaphore_inventory_snapshots_each_semaphore_sorted_by_key() {
+        let sm = StateMachine::new();
+        let acquire_permit = |key: &str, holder: &str| {
+            sm.apply(Command::SemaphoreAcquire {
+                key: key.to_string(),
+                holder: holder.to_string(),
+                limit: 1,
+                ttl_ms: 30_000,
+                wait: true,
+            })
+        };
+        acquire_permit("db/pool-z", "h1"); // holds the single permit
+        acquire_permit("db/pool-z", "h2"); // queues
+        acquire_permit("db/pool-a", "h3"); // holds the single permit
+
+        let inv = sm.semaphore_inventory();
+        assert_eq!(inv.len(), 2);
+        // Sorted by key: pool-a before pool-z.
+        assert_eq!(inv[0].key, "db/pool-a");
+        assert_eq!(inv[1].key, "db/pool-z");
+        assert_eq!(inv[1].holders.len(), 1);
+        assert_eq!(inv[1].available, 0);
+        assert_eq!(inv[1].wait_queue.len(), 1);
+    }
+
+    #[test]
+    fn election_inventory_lists_current_leaders_sorted_by_name() {
+        let sm = StateMachine::new();
+        let campaign = |name: &str, candidate: &str| {
+            sm.apply(Command::ElectionCampaign {
+                name: name.to_string(),
+                candidate: candidate.to_string(),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            })
+        };
+        campaign("scheduler", "node-z");
+        campaign("gc-leader", "node-a");
+
+        let inv = sm.election_inventory();
+        assert_eq!(inv.len(), 2);
+        assert_eq!(inv[0].name, "gc-leader");
+        assert_eq!(inv[0].leadership.leader, "node-a");
+        assert_eq!(inv[1].name, "scheduler");
+        assert_eq!(inv[1].leadership.leader, "node-z");
+    }
+
+    #[test]
     fn single_key_lock_queues_and_transfers_with_monotonic_fencing_tokens() {
         let sm = StateMachine::new();
         let first = acquire(&sm, &["orders/checkout"], "worker-a", false);
