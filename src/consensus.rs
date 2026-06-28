@@ -915,6 +915,8 @@ impl ShardActor {
         if req.term > self.current_term {
             self.current_term = req.term;
             self.voted_for = None;
+            // Durable before we answer this RPC (even the reject path below).
+            self.persist_hard_state();
         }
         self.become_follower_of(req.leader_id.clone());
 
