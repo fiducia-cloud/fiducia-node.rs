@@ -94,6 +94,20 @@ pub struct RaftTiming {
     /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
     /// leader on rejoin. Strictly safer on a WAN; on by default.
     pub pre_vote: bool,
+    /// CheckQuorum + leader lease (Raft thesis §6.2 / §6.4). A leader that has not
+    /// heard back from a majority of the group within one `election_min_ms` window
+    /// must assume it may have been partitioned away and a new leader elected
+    /// elsewhere, so it (a) steps down on the next tick and (b) refuses to serve a
+    /// linearizable read in the meantime. Without this, a partitioned-but-unaware
+    /// leader keeps `role == Leader` (it only steps down on seeing a *higher* term)
+    /// and can answer a stale read — e.g. "lock L is free" after a new leader on the
+    /// majority side already granted it. The lease is correct only under bounded
+    /// clock drift: it is sized at `election_min_ms`, i.e. no longer than a
+    /// follower's own election timeout, so a fresh leader cannot have committed
+    /// before the old lease expires. On by default (strictly safer); the one
+    /// liveness cost is that an isolated leader gives up leadership a lease sooner.
+    /// Disable with `FIDUCIA_RAFT_CHECK_QUORUM=off`.
+    pub check_quorum: bool,
 }
 
 impl Default for RaftTiming {
