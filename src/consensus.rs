@@ -34,6 +34,7 @@
 //! `fiducia-brain`'s job and is not done here.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
