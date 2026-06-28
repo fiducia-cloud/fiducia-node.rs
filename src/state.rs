@@ -743,6 +743,66 @@ impl StateMachine {
             })
             .collect()
     }
+
+    /// Every live lock grant plus the FIFO wait queue — the observability view of
+    /// the whole lock coordinator (all lock state lives on one shard, so this is a
+    /// single-shard read). Expired grants/waiters are dropped first so the
+    /// inventory reflects only live state. Grants are sorted by fencing token and
+    /// the queue by request time, so the output is deterministic for tests/diffs.
+    pub fn lock_inventory(&self) -> LockInventory {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut held: Vec<LockHolding> = store
+            .locks
+            .grants
+            .values()
+            .map(|g| LockHolding {
+                holder: g.holder.clone(),
+                keys: g.keys.clone(),
+                fencing_token: g.fencing_token,
+                lease_expires_ms: g.lease_expires_ms,
+            })
+            .collect();
+        held.sort_by_key(|h| h.fencing_token);
+        let wait_queue: Vec<LockWaiter> = store
+            .locks
+            .queue
+            .iter()
+            .map(|(_, q)| LockWaiter {
+                holder: q.holder.clone(),
+                keys: q.keys.clone(),
+                requested_ms: q.requested_ms,
+            })
+            .collect();
+        LockInventory { held, wait_queue }
+    }
+
+    /// A snapshot of every counting semaphore on this shard (holders, free
+    /// permits, wait queue). Sorted by key for deterministic output.
+    pub fn semaphore_inventory(&self) -> Vec<SemaphoreState> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut keys: Vec<String> = store.semaphores.keys().cloned().collect();
+        keys.sort();
+        keys.iter().map(|k| store.semaphore_snapshot(k)).collect()
+    }
+
+    /// Every named election with live leadership on this shard, sorted by name.
+    /// Callers fan this out across shards (elections route by name) and merge.
+    pub fn election_inventory(&self) -> Vec<ElectionEntry> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut out: Vec<ElectionEntry> = store
+            .elections
+            .iter()
+            .map(|(name, leadership)| ElectionEntry {
+                name: name.clone(),
+                leadership: leadership.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
 }
 
 impl Store {
