@@ -780,25 +780,21 @@ impl Store {
         }
 
         // Not grantable. Queue it (idempotently) when the caller wants to wait.
-        let already = self
-            .locks
-            .queue
-            .iter()
-            .any(|q| q.holder == holder && q.keys == keys);
+        // Identity is (holder, key-set), so the dedup and place-in-line are O(1).
+        let id = (holder.clone(), keys.clone());
+        let already = self.locks.queue.contains(&id);
         if wait && !already {
-            self.locks.queue.push_back(QueuedLock {
-                holder: holder.clone(),
-                keys: keys.clone(),
-                ttl_ms,
-                requested_ms: now,
-            });
+            self.locks.queue.push_back(
+                id.clone(),
+                QueuedLock {
+                    holder: holder.clone(),
+                    keys: keys.clone(),
+                    ttl_ms,
+                    requested_ms: now,
+                },
+            );
         }
-        let position = self
-            .locks
-            .queue
-            .iter()
-            .position(|q| q.holder == holder && q.keys == keys)
-            .map(|idx| idx + 1);
+        let position = self.locks.queue.position(&id).map(|idx| idx + 1);
         let conflicts: Vec<String> = keys
             .iter()
             .filter(|k| self.locks.held.contains_key(*k))
