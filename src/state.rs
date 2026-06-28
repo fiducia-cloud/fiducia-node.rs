@@ -1701,4 +1701,126 @@ mod tests {
         assert_eq!(instances[0].metadata["region"], "us-east-1");
         assert!(instances[0].lease_expires_ms >= initial_expiry);
     }
+
+    #[test]
+    fn election_campaign_publishes_candidate_metadata() {
+        let sm = StateMachine::new();
+        let mut metadata = HashMap::new();
+        metadata.insert("address".to_string(), "10.2.4.18:8080".to_string());
+        metadata.insert("region".to_string(), "us-east-1".to_string());
+        sm.apply(Command::ElectionCampaign {
+            name: "invoice-reconciler/leader".to_string(),
+            candidate: "node-3".to_string(),
+            ttl_ms: 15_000,
+            metadata,
+        });
+        let held = sm.election_get("invoice-reconciler/leader").unwrap();
+        assert_eq!(held.leader, "node-3");
+        assert_eq!(held.metadata["address"], "10.2.4.18:8080");
+        assert_eq!(held.metadata["region"], "us-east-1");
+        assert_eq!(held.ttl_ms, 15_000);
+    }
+
+    #[test]
+    fn election_renew_reuses_campaign_ttl_when_unspecified() {
+        let sm = StateMachine::new();
+        let won = sm.apply(Command::ElectionCampaign {
+            name: "leader".to_string(),
+            candidate: "node-a".to_string(),
+            ttl_ms: 90_000,
+            metadata: HashMap::new(),
+        });
+        let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
+        let campaign_expiry = won.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        // Renew with no explicit TTL: must reuse the 90s campaign TTL, not snap
+        // back to the old hard-coded 30s default (which would shrink the lease).
+        let renewed = sm.apply(Command::ElectionRenew {
+            name: "leader".to_string(),
+            candidate: "node-a".to_string(),
+            fencing_token: token,
+            ttl_ms: None,
+        });
+        let renew_expiry = renewed.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(renewed.output["renewed"], true);
+        assert!(
+            renew_expiry >= campaign_expiry,
+            "renew {renew_expiry} must not shrink lease below campaign {campaign_expiry}"
+        );
+    }
+
+    #[test]
+    fn election_failover_after_lease_expiry() {
+        // Drive the store directly so we control `now` deterministically.
+        let mut store = Store::default();
+        let won_a = store.apply_election_campaign(
+            1,
+            1_000,
+            "leader".to_string(),
+            "node-a".to_string(),
+            5_000, // lease_expires at 6_000
+            HashMap::new(),
+        );
+        assert_eq!(won_a["won"], true);
+        // Before expiry, a rival campaign loses.
+        let lost = store.apply_election_campaign(
+            2,
+            5_000,
+            "leader".to_string(),
+            "node-b".to_string(),
+            5_000,
+            HashMap::new(),
+        );
+        assert_eq!(lost["won"], false);
+        // After the lease lapses, expire_due reaps it and the rival wins.
+        store.expire_due(7_000);
+        let won_b = store.apply_election_campaign(
+            3,
+            7_000,
+            "leader".to_string(),
+            "node-b".to_string(),
+            5_000,
+            HashMap::new(),
+        );
+        assert_eq!(won_b["won"], true);
+        assert_eq!(won_b["leadership"]["leader"], "node-b");
+    }
+
+    #[test]
+    fn kv_list_returns_only_prefixed_live_entries() {
+        let sm = StateMachine::new();
+        for key in ["app/a", "app/b", "other/c"] {
+            sm.apply(Command::KvPut {
+                key: key.to_string(),
+                value: "v".to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            });
+        }
+        let listed = sm.kv_list("app/");
+        let mut keys: Vec<String> = listed.into_iter().map(|item| item.key).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["app/a".to_string(), "app/b".to_string()]);
+    }
+
+    #[test]
+    fn service_names_summarizes_live_instance_counts() {
+        let sm = StateMachine::new();
+        for id in ["i-1", "i-2"] {
+            sm.apply(Command::ServiceRegister {
+                service: "router".to_string(),
+                instance_id: id.to_string(),
+                address: format!("10.0.0.{id}:8080"),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            });
+        }
+        let summaries = sm.service_names();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].service, "router");
+        assert_eq!(summaries[0].instances, 2);
+    }
 }
