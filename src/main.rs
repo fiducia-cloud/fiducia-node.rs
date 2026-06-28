@@ -16,6 +16,8 @@ mod election;
 mod indexed_queue;
 mod kv;
 mod locks;
+mod metrics;
+mod observe;
 mod persist;
 mod raft_api;
 mod rate_limit;
