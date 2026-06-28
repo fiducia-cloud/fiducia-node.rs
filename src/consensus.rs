@@ -2085,6 +2085,7 @@ mod tests {
                     candidate_id: "stale-candidate".to_string(),
                     last_log_index: 0,
                     last_log_term: 0,
+                    pre_vote: false,
                 },
             )
             .await
