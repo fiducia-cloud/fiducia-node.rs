@@ -86,11 +86,30 @@ pub enum Command {
         target: ScheduleTarget,
         delivery: DeliverySemantics,
         max_retries: u32,
+        /// Proposer-stamped wall clock, so every replica computes the same initial
+        /// `next_fire` deterministically (the state machine must not read the clock).
+        now_ms: u64,
     },
     ScheduleRecordRun {
         name: String,
         fire_id: String,
         fired_at_ms: u64,
+    },
+    /// Claim one due fire for delivery. Committed through Raft, so exactly one
+    /// claim per `fire_id_ms` wins even across a leader change — this is what makes
+    /// firing leader-elected with no duplicates. The state machine validates the
+    /// fire is the schedule's legitimate next fire and advances the cursor.
+    ScheduleClaimFire {
+        name: String,
+        fire_id_ms: u64,
+    },
+    /// Record the outcome of delivering a claimed fire (after retries).
+    ScheduleRecordResult {
+        name: String,
+        fire_id_ms: u64,
+        delivered: bool,
+        attempts: u32,
+        error: Option<String>,
     },
 
     // --- Leader election ---------------------------------------------------
