@@ -16,17 +16,23 @@
 //!   * `GET    /v1/services/{service}/watch`                  — SSE of instance changes
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::Uri,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, put},
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
