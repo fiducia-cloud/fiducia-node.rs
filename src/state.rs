@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::indexed_queue::IndexedQueue;
+
 /// Every mutation in the system, as it travels through the replicated log.
 ///
 /// Read operations never become commands. They are served directly off applied
