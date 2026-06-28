@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/ratelimit", rate_limit::router())
         .nest("/cron", schedule::router())
         .nest("/elections", election::router())
-        .nest("/services", discovery::router());
+        .nest("/services", discovery::router())
+        .nest("/observe", observe::router());
 
     let app = Router::new()
         .route("/healthz", get(health))
