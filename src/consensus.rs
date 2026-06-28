@@ -486,6 +486,14 @@ impl ShardActor {
     fn become_leader(&mut self) {
         self.role = Role::Leader;
         self.leader_id = Some(self.node_id.clone());
+        tracing::info!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            term = self.current_term,
+            votes = self.votes.len(),
+            members = self.members,
+            "raft: won election — now leader for shard"
+        );
         self.votes.clear();
         let mut ls = LeaderState::default();
         let next = self.last_log_index() + 1;
