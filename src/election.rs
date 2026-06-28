@@ -85,6 +85,7 @@ async fn campaign(
             name,
             candidate: body.candidate,
             ttl_ms: body.ttl_ms,
+            metadata: body.metadata,
         })
         .await;
     propose_response(result, &uri)
@@ -95,13 +96,14 @@ async fn renew(
     State(node): State<Arc<Node>>,
     uri: Uri,
     Path(name): Path<String>,
-    Json(body): Json<HoldBody>,
+    Json(body): Json<RenewBody>,
 ) -> Response {
     let result = node
         .propose(Command::ElectionRenew {
             name,
             candidate: body.candidate,
             fencing_token: body.fencing_token,
+            ttl_ms: body.ttl_ms,
         })
         .await;
     propose_response(result, &uri)
