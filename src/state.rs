@@ -1482,6 +1482,60 @@ mod tests {
     }
 
     #[test]
+    fn wait_queue_is_recreated_by_replaying_the_log_after_a_restart() {
+        // The wait queue is derived state inside the replicated state machine, so a
+        // node that goes down recovers it by **replaying its committed log** — there
+        // is nothing extra to persist. Apply a command log to one machine, then
+        // replay the identical log into a fresh one (the restart) and confirm the
+        // rebuilt machine holds the same grant and the same FIFO wait queue order.
+        let log = vec![
+            Command::LockAcquire {
+                keys: vec!["x".to_string()],
+                holder: "holder-1".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            Command::LockAcquire {
+                keys: vec!["x".to_string()],
+                holder: "holder-2".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            Command::LockAcquire {
+                keys: vec!["x".to_string()],
+                holder: "holder-3".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+        ];
+
+        let crashed = StateMachine::new();
+        for command in &log {
+            crashed.apply(command.clone());
+        }
+        // holder-1 holds {x}; holder-2 then holder-3 wait behind it.
+        let before = crashed.lock_get("x");
+        assert_eq!(before.holder.as_deref(), Some("holder-1"));
+        assert_eq!(before.wait_queue.len(), 2);
+
+        // Restart: a fresh state machine replays the same committed log.
+        let recovered = StateMachine::new();
+        for command in &log {
+            recovered.apply(command.clone());
+        }
+
+        let after = recovered.lock_get("x");
+        assert_eq!(after.holder.as_deref(), Some("holder-1"), "grant recovered");
+        let recovered_waiters: Vec<String> =
+            after.wait_queue.iter().map(|w| w.holder.clone()).collect();
+        assert_eq!(
+            recovered_waiters,
+            vec!["holder-2".to_string(), "holder-3".to_string()],
+            "the FIFO wait queue is rebuilt in order by log replay"
+        );
+    }
+
+    #[test]
     fn semaphore_caps_concurrent_holders_and_admits_in_fifo() {
         let sm = StateMachine::new();
         let acq = |holder: &str, wait: bool| {
