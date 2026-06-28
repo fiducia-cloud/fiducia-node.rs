@@ -1285,9 +1285,9 @@ impl ShardActor {
             }
             // List reads are served serializably; route them through the local
             // path even if they reach here.
-            list @ (ReadRequest::KvList { .. } | ReadRequest::ServiceList) => {
-                Ok(self.handle_query_local(list))
-            }
+            list @ (ReadRequest::KvList { .. }
+            | ReadRequest::ServiceList
+            | ReadRequest::ScheduleList) => Ok(self.handle_query_local(list)),
         }
     }
 
