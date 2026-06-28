@@ -26,6 +26,7 @@ mod schedule_runner;
 mod semaphore;
 mod state;
 mod transport;
+mod validate;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
