@@ -108,9 +108,9 @@ impl Default for RaftTiming {
 }
 
 impl RaftTiming {
-    /// Read timing from the environment, falling back to the LAN defaults. Logs a
-    /// warning if the election timeout isn't comfortably above the heartbeat
-    /// (a config that would self-inflict spurious elections).
+    /// Read timing from the environment, falling back to the LAN defaults, then
+    /// run it through [`sanitized`](Self::sanitized) so an operator typo can never
+    /// produce a panicking or self-flapping configuration.
     pub fn from_env() -> Self {
         fn ms(var: &str, default: u64) -> u64 {
             std::env::var(var)
@@ -119,7 +119,7 @@ impl RaftTiming {
                 .unwrap_or(default)
         }
         let d = RaftTiming::default();
-        let timing = RaftTiming {
+        RaftTiming {
             tick: Duration::from_millis(ms("FIDUCIA_RAFT_TICK_MS", d.tick.as_millis() as u64)),
             heartbeat: Duration::from_millis(ms(
                 "FIDUCIA_RAFT_HEARTBEAT_MS",
@@ -131,18 +131,54 @@ impl RaftTiming {
                 .ok()
                 .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
                 .unwrap_or(d.pre_vote),
-        };
-        let heartbeat_ms = timing.heartbeat.as_millis() as u64;
-        if timing.election_min_ms < heartbeat_ms.saturating_mul(3) {
+        }
+        .sanitized()
+    }
+
+    /// Clamp degenerate / unsafe values into a working range. Guards against
+    /// operator typos that would otherwise be fatal or self-defeating:
+    ///   * a **zero** `tick` or `heartbeat` panics `tokio::time::interval`;
+    ///   * a `tick` coarser than the `heartbeat` makes the actor notice deadlines
+    ///     late, so heartbeats and elections fire behind schedule;
+    ///   * an election timeout **below** the heartbeat guarantees a leader can
+    ///     never out-heartbeat its own election timer → perpetual flapping.
+    ///
+    /// Pure (only side effect is a warning log), so it is unit-tested directly.
+    pub fn sanitized(mut self) -> RaftTiming {
+        if self.tick.is_zero() {
+            self.tick = Duration::from_millis(1);
+        }
+        if self.heartbeat.is_zero() {
+            self.heartbeat = Duration::from_millis(1);
+        }
+        // Deadlines are only re-checked once per tick, so the tick must be at least
+        // as fine as the heartbeat.
+        if self.tick > self.heartbeat {
+            self.tick = self.heartbeat;
+        }
+        let heartbeat_ms = self.heartbeat.as_millis() as u64;
+        // Hard floor: election timeout must be at least 2x the heartbeat or the
+        // cluster cannot hold a stable leader. Clamp up if misconfigured.
+        let floor = heartbeat_ms.saturating_mul(2).max(1);
+        if self.election_min_ms < floor {
             tracing::warn!(
                 heartbeat_ms,
-                election_min_ms = timing.election_min_ms,
-                election_jitter_ms = timing.election_jitter_ms,
-                "raft timing: election timeout is not >= 3x the heartbeat — spurious \
-                 elections are likely; raise FIDUCIA_RAFT_ELECTION_MIN_MS for this RTT"
+                requested_election_min_ms = self.election_min_ms,
+                clamped_to_ms = floor,
+                "raft timing: election timeout below 2x the heartbeat — clamped up to \
+                 avoid guaranteed leadership flapping"
+            );
+            self.election_min_ms = floor;
+        } else if self.election_min_ms < heartbeat_ms.saturating_mul(3) {
+            // Soft guidance: 3x is the comfortable margin on a lossy / WAN link.
+            tracing::warn!(
+                heartbeat_ms,
+                election_min_ms = self.election_min_ms,
+                "raft timing: election timeout is under 3x the heartbeat — spurious \
+                 elections are likely on a WAN; consider raising FIDUCIA_RAFT_ELECTION_MIN_MS"
             );
         }
-        timing
+        self
     }
 }
 
