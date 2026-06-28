@@ -1298,11 +1298,20 @@ impl ShardActor {
             ReadRequest::Service { service } => {
                 Ok(ReadResponse::Service(self.state.service_list(&service)))
             }
+            // Lock/semaphore inventory is a linearizable read of the single
+            // coordinator shard, so it stays leader-gated like the per-key reads.
+            ReadRequest::LockInventory => {
+                Ok(ReadResponse::LockInventory(self.state.lock_inventory()))
+            }
+            ReadRequest::SemaphoreInventory => Ok(ReadResponse::SemaphoreInventory(
+                self.state.semaphore_inventory(),
+            )),
             // List reads are served serializably; route them through the local
             // path even if they reach here.
             list @ (ReadRequest::KvList { .. }
             | ReadRequest::ServiceList
-            | ReadRequest::ScheduleList) => Ok(self.handle_query_local(list)),
+            | ReadRequest::ScheduleList
+            | ReadRequest::ElectionList) => Ok(self.handle_query_local(list)),
         }
     }
 
