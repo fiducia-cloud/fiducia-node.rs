@@ -923,6 +923,28 @@ impl ShardActor {
         }
     }
 
+    /// Answer a PreVote straw poll. Pure read: changes nothing. Grant only if
+    ///   * the candidate's would-be term isn't stale (`req.term >= current_term`),
+    ///   * its log is at least as up-to-date as ours, **and**
+    ///   * we are not currently being served by a live leader — i.e. we know of no
+    ///     leader, or our own election timeout has already lapsed.
+    ///
+    /// That last clause is the leader-stickiness that makes pre-vote *refuse* to
+    /// disrupt a healthy leader: while heartbeats keep arriving, `election_deadline`
+    /// stays in the future, so a rejoining/partitioned node's pre-vote is denied
+    /// and it can never bump the cluster's term. At cold start `leader_id` is
+    /// `None`, so the first election is still granted immediately.
+    fn handle_pre_vote(&self, req: &RequestVoteReq) -> RequestVoteResp {
+        let log_ok = (req.last_log_term > self.last_log_term())
+            || (req.last_log_term == self.last_log_term()
+                && req.last_log_index >= self.last_log_index());
+        let leader_alive = self.leader_id.is_some() && Instant::now() < self.election_deadline;
+        RequestVoteResp {
+            term: self.current_term,
+            granted: req.term >= self.current_term && log_ok && !leader_alive,
+        }
+    }
+
     // --- client proposals + applying --------------------------------------
 
     fn on_propose(
