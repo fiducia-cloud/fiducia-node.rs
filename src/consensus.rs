@@ -188,6 +188,11 @@ pub struct NodeConfig {
     pub peers: Vec<String>,
     /// Number of shards the keyspace is partitioned into.
     pub shard_count: u32,
+    /// Directory for durable per-shard Raft state (term/vote/log). `None` runs
+    /// fully in-memory — the mode used by the in-process loopback tests; a real
+    /// deployment points this at a persistent volume so a pod restart can't drop
+    /// a member's log.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for NodeConfig {
