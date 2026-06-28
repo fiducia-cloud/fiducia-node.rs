@@ -1011,15 +1011,24 @@ impl Node {
 
     /// Serve a single-key read from the owning shard.
     pub async fn query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
-        let shard = self.shard_for(request.routing_key());
+        let routing_key = request.routing_key().to_string();
+        let shard = self.shard_for(&routing_key);
         let Some(tx) = self.sender(shard) else {
+            tracing::debug!(shard = ?shard, key = %routing_key, "query unavailable: shard not hosted here");
             return Err(ProposeError::Unavailable { shard });
         };
         let (resp, rx) = oneshot::channel();
         if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
             return Err(ProposeError::Unavailable { shard });
         }
-        rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }))
+        let result = rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }));
+        tracing::debug!(
+            shard = ?shard,
+            key = %routing_key,
+            ok = result.is_ok(),
+            "query served"
+        );
+        result
     }
 
     /// Deliver an inbound `AppendEntries` to the owning shard actor.
