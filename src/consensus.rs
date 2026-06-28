@@ -446,6 +446,11 @@ impl ShardActor {
             state: StateMachine::new(),
         };
         actor.reset_election_deadline();
+        // Rebuild the in-memory state machine from the recovered log up to the
+        // committed point (the state machine itself is not persisted).
+        if actor.commit_index > 0 {
+            actor.apply_committed();
+        }
         actor
     }
 
