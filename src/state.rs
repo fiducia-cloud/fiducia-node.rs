@@ -1867,6 +1867,7 @@ mod tests {
             },
             delivery: DeliverySemantics::ExactlyOnce,
             max_retries: 3,
+            now_ms: 0,
         });
         let first = sm.apply(Command::ScheduleRecordRun {
             name: "nightly".to_string(),
