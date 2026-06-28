@@ -14,6 +14,7 @@ mod discovery;
 mod election;
 mod kv;
 mod locks;
+mod persist;
 mod raft_api;
 mod rate_limit;
 mod schedule;
