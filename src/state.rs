@@ -324,7 +324,8 @@ struct QueuedPermit {
 struct Semaphore {
     limit: u32,
     holders: Vec<SemaphoreSlot>,
-    queue: VecDeque<QueuedPermit>,
+    /// FIFO queue of waiters, indexed by holder for O(1) dedup and removal.
+    queue: IndexedQueue<String, QueuedPermit>,
 }
 
 /// Distributed rate-limit snapshot.
