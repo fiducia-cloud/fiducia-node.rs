@@ -333,6 +333,8 @@ pub enum ReadResponse {
     ScheduleHistory(Vec<ScheduleRun>),
     Election(Option<Leadership>),
     Service(Vec<ServiceInstance>),
+    KvList(Vec<KvListItem>),
+    ServiceList(Vec<ServiceSummary>),
 }
 
 // ---------------------------------------------------------------------------
