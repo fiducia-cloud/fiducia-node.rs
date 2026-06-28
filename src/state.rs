@@ -1386,7 +1386,7 @@ fn now_ms() -> u64 {
 }
 
 pub fn valid_cron_expression(value: &str) -> bool {
-    value.split_whitespace().count() == 5
+    crate::cron::CronSchedule::parse(value).is_ok()
 }
 
 #[cfg(test)]
