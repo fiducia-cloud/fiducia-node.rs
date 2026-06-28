@@ -1356,13 +1356,43 @@ impl ShardActor {
     }
 
     fn status(&self) -> ShardStatus {
+        // Quorum + replication are leader-side knowledge: only the leader tracks
+        // each peer's match_index. A follower reports an empty replication view and
+        // `has_quorum = false` (it cannot vouch for the group's health).
+        let (replication, healthy_replicas, has_quorum) = if self.role == Role::Leader {
+            let last = self.last_log_index();
+            let mut reps = Vec::with_capacity(self.peers.len());
+            let mut caught_up = 1usize; // self always has the committed prefix
+            if let Some(ls) = &self.leader {
+                for peer in &self.peers {
+                    let match_index = ls.match_index.get(peer).copied().unwrap_or(0);
+                    if match_index >= self.commit_index {
+                        caught_up += 1;
+                    }
+                    reps.push(PeerReplication {
+                        peer: peer.clone(),
+                        match_index,
+                        lag: last.saturating_sub(match_index),
+                        in_flight: ls.in_flight.get(peer).copied().unwrap_or(false),
+                    });
+                }
+            }
+            reps.sort_by(|a, b| a.peer.cmp(&b.peer));
+            (reps, caught_up, caught_up >= self.majority())
+        } else {
+            (Vec::new(), 0, false)
+        };
         ShardStatus {
             shard_id: self.shard_id,
             role: self.role,
             term: self.current_term,
             leader_id: self.leader_id.clone(),
             commit_index: self.commit_index,
+            last_applied: self.last_applied,
             last_log_index: self.last_log_index(),
+            healthy_replicas,
+            has_quorum,
+            replication,
         }
     }
 }
