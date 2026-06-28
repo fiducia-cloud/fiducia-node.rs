@@ -1295,8 +1295,8 @@ impl Store {
             .locks
             .queue
             .iter()
-            .filter(|q| q.keys.iter().any(|k| k == key))
-            .map(|q| LockWaiter {
+            .filter(|(_, q)| q.keys.iter().any(|k| k == key))
+            .map(|(_, q)| LockWaiter {
                 holder: q.holder.clone(),
                 keys: q.keys.clone(),
                 requested_ms: q.requested_ms,
