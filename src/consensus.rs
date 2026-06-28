@@ -1208,6 +1208,18 @@ impl Node {
             if let Some(reg) = transport.loopback_registry() {
                 reg.register(&config.node_id, shard_id, tx.clone());
             }
+            // Open durable storage when a data dir is configured. Failing closed
+            // here (panic) is deliberate: a coordination engine that silently
+            // ran without durability would be worse than a visible crashloop.
+            let (store, recovered) = match &config.data_dir {
+                Some(dir) => {
+                    let (s, r) = ShardStore::open(dir, shard_id).unwrap_or_else(|e| {
+                        panic!("fiducia-node: cannot open durable store for shard {shard_id} under {dir:?}: {e}")
+                    });
+                    (Some(s), r)
+                }
+                None => (None, Recovered::default()),
+            };
             let actor = ShardActor::new(
                 shard_id,
                 config.node_id.clone(),
@@ -1215,6 +1227,8 @@ impl Node {
                 transport.clone(),
                 tx.clone(),
                 timing,
+                store,
+                recovered,
             );
             tasks.push(tokio::spawn(actor.run(rx)));
             shards.insert(shard_id, tx);
