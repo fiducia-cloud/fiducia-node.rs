@@ -296,6 +296,12 @@ pub enum ReadRequest {
     ScheduleHistory { name: String },
     Election { name: String },
     Service { service: String },
+    /// Range read: every KV key under `prefix` on one shard. Fanned out across
+    /// shards by [`Node::list_kv`] and served serializably (no leader gate).
+    KvList { prefix: String },
+    /// Every service with live instances on one shard. Fanned out by
+    /// [`Node::list_services`] and served serializably.
+    ServiceList,
 }
 
 impl ReadRequest {
