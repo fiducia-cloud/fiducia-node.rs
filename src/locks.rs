@@ -109,6 +109,11 @@ async fn acquire(node: Arc<Node>, uri: Uri, keys: Vec<String>, body: AcquireBody
 }
 
 /// `POST /v1/locks/release` — release a (possibly multi-key) grant by token.
+#[tracing::instrument(
+    name = "http.lock.release",
+    skip(node, uri, body),
+    fields(holder = %body.holder, fencing_token = body.fencing_token)
+)]
 async fn release_token(
     State(node): State<Arc<Node>>,
     uri: Uri,
