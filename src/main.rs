@@ -12,6 +12,7 @@
 mod consensus;
 mod discovery;
 mod election;
+mod indexed_queue;
 mod kv;
 mod locks;
 mod persist;

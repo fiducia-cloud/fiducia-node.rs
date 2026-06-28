@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::indexed_queue::IndexedQueue;
+
 /// Every mutation in the system, as it travels through the replicated log.
 ///
 /// Read operations never become commands. They are served directly off applied
@@ -279,8 +281,10 @@ struct LockManager {
     held: HashMap<String, u64>,
     /// fencing token → grant.
     grants: HashMap<u64, LockGrant>,
-    /// FIFO queue of requests waiting for their full union to be free.
-    queue: VecDeque<QueuedLock>,
+    /// FIFO queue of requests waiting for their full union to be free. Indexed by
+    /// `(holder, key-set)` so an "already queued?" check and a cancel/lease-expiry
+    /// removal from the middle of the queue are O(1) (see [`crate::indexed_queue`]).
+    queue: IndexedQueue<(String, Vec<String>), QueuedLock>,
 }
 
 /// Read view of a counting semaphore.
@@ -320,7 +324,8 @@ struct QueuedPermit {
 struct Semaphore {
     limit: u32,
     holders: Vec<SemaphoreSlot>,
-    queue: VecDeque<QueuedPermit>,
+    /// FIFO queue of waiters, indexed by holder for O(1) dedup and removal.
+    queue: IndexedQueue<String, QueuedPermit>,
 }
 
 /// Distributed rate-limit snapshot.
@@ -750,7 +755,7 @@ impl Store {
             .locks
             .queue
             .iter()
-            .flat_map(|q| q.keys.iter().map(|k| k.as_str()))
+            .flat_map(|(_, q)| q.keys.iter().map(|k| k.as_str()))
             .collect();
         let blocked_by_queue = keys.iter().any(|k| reserved.contains(k.as_str()));
 
@@ -775,25 +780,21 @@ impl Store {
         }
 
         // Not grantable. Queue it (idempotently) when the caller wants to wait.
-        let already = self
-            .locks
-            .queue
-            .iter()
-            .any(|q| q.holder == holder && q.keys == keys);
+        // Identity is (holder, key-set), so the dedup and place-in-line are O(1).
+        let id = (holder.clone(), keys.clone());
+        let already = self.locks.queue.contains(&id);
         if wait && !already {
-            self.locks.queue.push_back(QueuedLock {
-                holder: holder.clone(),
-                keys: keys.clone(),
-                ttl_ms,
-                requested_ms: now,
-            });
+            self.locks.queue.push_back(
+                id.clone(),
+                QueuedLock {
+                    holder: holder.clone(),
+                    keys: keys.clone(),
+                    ttl_ms,
+                    requested_ms: now,
+                },
+            );
         }
-        let position = self
-            .locks
-            .queue
-            .iter()
-            .position(|q| q.holder == holder && q.keys == keys)
-            .map(|idx| idx + 1);
+        let position = self.locks.queue.position(&id).map(|idx| idx + 1);
         let conflicts: Vec<String> = keys
             .iter()
             .filter(|k| self.locks.held.contains_key(*k))
@@ -858,15 +859,15 @@ impl Store {
     /// Index of the first queue entry whose whole key set is free, treating the
     /// key sets of earlier still-queued entries as reserved (so a later request
     /// can't barge ahead of an earlier overlapping one — FIFO, no starvation).
-    fn lock_first_grantable(&self) -> Option<usize> {
+    fn lock_first_grantable(&self) -> Option<(String, Vec<String>)> {
         let mut reserved: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for (idx, q) in self.locks.queue.iter().enumerate() {
+        for (id, q) in self.locks.queue.iter() {
             let blocked = q
                 .keys
                 .iter()
                 .any(|k| self.locks.held.contains_key(k) || reserved.contains(k.as_str()));
             if !blocked {
-                return Some(idx);
+                return Some(id.clone());
             }
             for k in &q.keys {
                 reserved.insert(k.as_str());
@@ -879,8 +880,8 @@ impl Store {
     /// promoted and the token they were granted.
     fn lock_promote(&mut self, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
-        while let Some(idx) = self.lock_first_grantable() {
-            let waiter = self.locks.queue.remove(idx).expect("index from scan");
+        while let Some(id) = self.lock_first_grantable() {
+            let waiter = self.locks.queue.remove(&id).expect("key from scan");
             let token = self.next_token();
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             promoted.push(json!({
@@ -917,7 +918,7 @@ impl Store {
             .or_insert_with(|| Semaphore {
                 limit: limit.max(1),
                 holders: Vec::new(),
-                queue: VecDeque::new(),
+                queue: IndexedQueue::new(),
             });
         // Let callers re-tune the cap; shrinking just stops new grants until it
         // drains back under the new limit.
@@ -948,19 +949,18 @@ impl Store {
             });
         }
 
-        let already = sem.queue.iter().any(|q| q.holder == holder);
+        let already = sem.queue.contains(&holder);
         if wait && !already {
-            sem.queue.push_back(QueuedPermit {
-                holder: holder.clone(),
-                ttl_ms,
-                requested_ms: now,
-            });
+            sem.queue.push_back(
+                holder.clone(),
+                QueuedPermit {
+                    holder: holder.clone(),
+                    ttl_ms,
+                    requested_ms: now,
+                },
+            );
         }
-        let position = sem
-            .queue
-            .iter()
-            .position(|q| q.holder == holder)
-            .map(|idx| idx + 1);
+        let position = sem.queue.position(&holder).map(|idx| idx + 1);
         json!({
             "acquired": false,
             "queued": wait && position.is_some(),
@@ -1011,7 +1011,7 @@ impl Store {
             }
             let token = self.next_token();
             let sem = self.semaphores.get_mut(key).expect("checked above");
-            let waiter = sem.queue.pop_front().expect("non-empty checked");
+            let (_, waiter) = sem.queue.pop_front().expect("non-empty checked");
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             sem.holders.push(SemaphoreSlot {
                 holder: waiter.holder.clone(),
@@ -1295,8 +1295,8 @@ impl Store {
             .locks
             .queue
             .iter()
-            .filter(|q| q.keys.iter().any(|k| k == key))
-            .map(|q| LockWaiter {
+            .filter(|(_, q)| q.keys.iter().any(|k| k == key))
+            .map(|(_, q)| LockWaiter {
                 holder: q.holder.clone(),
                 keys: q.keys.clone(),
                 requested_ms: q.requested_ms,
@@ -1338,7 +1338,7 @@ impl Store {
             wait_queue: sem
                 .queue
                 .iter()
-                .map(|q| LockWaiter {
+                .map(|(_, q)| LockWaiter {
                     holder: q.holder.clone(),
                     keys: vec![key.to_string()],
                     requested_ms: q.requested_ms,
@@ -1479,6 +1479,60 @@ mod tests {
         assert_eq!(rel.output["promoted"][0]["holder"], "holder-2");
         assert_eq!(sm.lock_get("y").holder.as_deref(), Some("holder-2"));
         assert_eq!(sm.lock_get("y").wait_queue[0].holder, "holder-3");
+    }
+
+    #[test]
+    fn wait_queue_is_recreated_by_replaying_the_log_after_a_restart() {
+        // The wait queue is derived state inside the replicated state machine, so a
+        // node that goes down recovers it by **replaying its committed log** — there
+        // is nothing extra to persist. Apply a command log to one machine, then
+        // replay the identical log into a fresh one (the restart) and confirm the
+        // rebuilt machine holds the same grant and the same FIFO wait queue order.
+        let log = vec![
+            Command::LockAcquire {
+                keys: vec!["x".to_string()],
+                holder: "holder-1".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            Command::LockAcquire {
+                keys: vec!["x".to_string()],
+                holder: "holder-2".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            Command::LockAcquire {
+                keys: vec!["x".to_string()],
+                holder: "holder-3".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+        ];
+
+        let crashed = StateMachine::new();
+        for command in &log {
+            crashed.apply(command.clone());
+        }
+        // holder-1 holds {x}; holder-2 then holder-3 wait behind it.
+        let before = crashed.lock_get("x");
+        assert_eq!(before.holder.as_deref(), Some("holder-1"));
+        assert_eq!(before.wait_queue.len(), 2);
+
+        // Restart: a fresh state machine replays the same committed log.
+        let recovered = StateMachine::new();
+        for command in &log {
+            recovered.apply(command.clone());
+        }
+
+        let after = recovered.lock_get("x");
+        assert_eq!(after.holder.as_deref(), Some("holder-1"), "grant recovered");
+        let recovered_waiters: Vec<String> =
+            after.wait_queue.iter().map(|w| w.holder.clone()).collect();
+        assert_eq!(
+            recovered_waiters,
+            vec!["holder-2".to_string(), "holder-3".to_string()],
+            "the FIFO wait queue is rebuilt in order by log replay"
+        );
     }
 
     #[test]
