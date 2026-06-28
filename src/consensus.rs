@@ -147,6 +147,10 @@ impl RaftTiming {
                 .ok()
                 .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
                 .unwrap_or(d.pre_vote),
+            check_quorum: std::env::var("FIDUCIA_RAFT_CHECK_QUORUM")
+                .ok()
+                .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+                .unwrap_or(d.check_quorum),
         }
         .sanitized()
     }
