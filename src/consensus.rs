@@ -1665,6 +1665,50 @@ impl Node {
             .collect()
     }
 
+    /// The whole-coordinator lock inventory (every grant + the wait queue). All
+    /// lock state lives on one shard, so this is a single leader-gated read; a
+    /// non-leader of the lock shard returns `NotLeader` for the caller to redirect.
+    pub async fn lock_inventory(&self) -> Result<LockInventory, ProposeError> {
+        match self.query(ReadRequest::LockInventory).await? {
+            ReadResponse::LockInventory(inv) => Ok(inv),
+            _ => Err(ProposeError::Unavailable {
+                shard: self.shard_for(crate::state::LOCK_DOMAIN),
+            }),
+        }
+    }
+
+    /// A snapshot of every counting semaphore on the lock-coordinator shard.
+    pub async fn semaphore_inventory(&self) -> Result<Vec<SemaphoreState>, ProposeError> {
+        match self.query(ReadRequest::SemaphoreInventory).await? {
+            ReadResponse::SemaphoreInventory(list) => Ok(list),
+            _ => Err(ProposeError::Unavailable {
+                shard: self.shard_for(crate::state::LOCK_DOMAIN),
+            }),
+        }
+    }
+
+    /// Every named election's current leader, merged across all shards this node
+    /// hosts (elections route by name) and sorted by name.
+    pub async fn list_elections(&self) -> Vec<ElectionEntry> {
+        let mut out: Vec<ElectionEntry> = self
+            .query_all_shards(|| ReadRequest::ElectionList)
+            .await
+            .into_iter()
+            .filter_map(|r| match r {
+                ReadResponse::ElectionList(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Aggregated per-operation call metrics (counts, error rate, latency).
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
+    }
+
     /// Per-shard consensus status across all shards this node hosts.
     pub async fn status(&self) -> NodeStatus {
         let mut shards: Vec<ShardStatus> = Vec::with_capacity(self.shards.len());
