@@ -407,6 +407,7 @@ impl ShardActor {
             timing,
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
+            last_leader_contact: Instant::now(),
             rng: Rng::seeded(&node_id, shard_id),
             pending: HashMap::new(),
             changes,
