@@ -896,6 +896,7 @@ impl ShardActor {
         if n > self.commit_index && self.term_at(n) == self.current_term {
             self.commit_index = n;
             self.apply_committed();
+            self.persist_hard_state(); // record the advanced commit pointer
         }
     }
 
