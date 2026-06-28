@@ -61,6 +61,7 @@ pub fn router() -> Router<Arc<Node>> {
 }
 
 /// `GET /v1/locks?key=K` — inspect lock state for one member key.
+#[tracing::instrument(name = "http.lock.get", skip(node, uri), fields(key = %q.key))]
 async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<KeyParam>) -> Response {
     match node.query(ReadRequest::Lock { key: q.key.clone() }).await {
         Ok(ReadResponse::Lock(lock)) => Json(json!({ "key": q.key, "lock": lock })).into_response(),
@@ -70,6 +71,11 @@ async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<KeyPa
 }
 
 /// `POST /v1/locks/acquire` — acquire the union of `keys` (or a single `key`).
+#[tracing::instrument(
+    name = "http.lock.acquire",
+    skip(node, uri, body),
+    fields(holder = ?body.holder, keys = ?body.keys, key = ?body.key, ttl_ms = ?body.ttl_ms, wait = ?body.wait)
+)]
 async fn acquire_union(
     State(node): State<Arc<Node>>,
     uri: Uri,
@@ -103,6 +109,11 @@ async fn acquire(node: Arc<Node>, uri: Uri, keys: Vec<String>, body: AcquireBody
 }
 
 /// `POST /v1/locks/release` — release a (possibly multi-key) grant by token.
+#[tracing::instrument(
+    name = "http.lock.release",
+    skip(node, uri, body),
+    fields(holder = %body.holder, fencing_token = body.fencing_token)
+)]
 async fn release_token(
     State(node): State<Arc<Node>>,
     uri: Uri,

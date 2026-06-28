@@ -1,11 +1,11 @@
-//! Service discovery handlers.
+//! Service discovery (skeleton handlers).
 //!
 //! A registry of live service instances with TTL-based health: instances
 //! register an address, heartbeat to stay listed, and silently drop out when
 //! their lease expires (crash-safe — no stale endpoints). Mutations are proposed
-//! to the service-discovery coordinator shard; reads go through [`Node::query`].
-//! That keeps the service-name registry linearizable while still allowing each
-//! service lookup to return only that service's live instances.
+//! to the shard owning the service name; reads go through [`Node::query`]. A
+//! service's instances all route to one shard, so listing a service is a
+//! single-shard read.
 //!
 //! Routes (mounted under `/v1/services`):
 //!   * `GET    /v1/services`                                  — list services
@@ -35,7 +35,7 @@ use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
-use crate::state::{Command, SERVICE_DOMAIN};
+use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
@@ -61,15 +61,13 @@ pub fn router() -> Router<Arc<Node>> {
         )
 }
 
-/// `GET /v1/services` — list known service names.
-async fn list_services(State(node): State<Arc<Node>>, uri: Uri) -> Response {
-    match node.query(ReadRequest::Services).await {
-        Ok(ReadResponse::Services(services)) => {
-            Json(json!({ "services": services })).into_response()
-        }
-        Err(err) => read_error_response(err, &uri),
-        _ => Json(json!({ "error": "unavailable" })).into_response(),
-    }
+/// `GET /v1/services` — list known service names with their live-instance counts.
+///
+/// Services span shards, so this fans a serializable read out across every shard
+/// and merges the per-shard summaries.
+async fn list_services(State(node): State<Arc<Node>>) -> Response {
+    let services = node.list_services().await;
+    Json(json!({ "count": services.len(), "services": services })).into_response()
 }
 
 /// `GET /v1/services/{service}` — list live (unexpired) instances.
@@ -144,16 +142,19 @@ async fn deregister(
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
+///
+/// Subscribes to the owning shard's change broadcast and emits one SSE event per
+/// committed `register`/`heartbeat`/`deregister` for this service, so clients can
+/// keep a live view of the instance set instead of polling. (TTL-expiry removals
+/// surface on the next read/registration rather than as a push event.)
 async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
-    let Some(rx) = node.watch(SERVICE_DOMAIN).await else {
-        return Json(
-            json!({ "error": "unavailable", "op": "discovery.watch", "service": service }),
-        )
-        .into_response();
+    let Some(rx) = node.watch(&service).await else {
+        return Json(json!({ "error": "unavailable", "op": "discovery.watch", "service": service }))
+            .into_response();
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let event = item.ok()?;
-        if event.key != service {
+        let event = item.ok()?; // drop lag/closed notifications
+        if event.scope != "service" || event.key != service {
             return None;
         }
         Some(Ok::<Event, Infallible>(
