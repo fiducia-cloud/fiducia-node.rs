@@ -394,6 +394,9 @@ pub enum ReadResponse {
     KvList(Vec<KvListItem>),
     ServiceList(Vec<ServiceSummary>),
     ScheduleList(Vec<Schedule>),
+    LockInventory(LockInventory),
+    SemaphoreInventory(Vec<SemaphoreState>),
+    ElectionList(Vec<ElectionEntry>),
 }
 
 // ---------------------------------------------------------------------------
