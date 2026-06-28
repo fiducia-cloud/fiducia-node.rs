@@ -61,10 +61,13 @@ pub fn router() -> Router<Arc<Node>> {
         )
 }
 
-/// `GET /v1/services` — list known service names.
-async fn list_services(State(_node): State<Arc<Node>>) -> Json<Value> {
-    // TODO: services span shards, so this fans out across shards and merges.
-    Json(json!({ "error": "not_implemented", "op": "discovery.list_services" }))
+/// `GET /v1/services` — list known service names with their live-instance counts.
+///
+/// Services span shards, so this fans a serializable read out across every shard
+/// and merges the per-shard summaries.
+async fn list_services(State(node): State<Arc<Node>>) -> Response {
+    let services = node.list_services().await;
+    Json(json!({ "count": services.len(), "services": services })).into_response()
 }
 
 /// `GET /v1/services/{service}` — list live (unexpired) instances.
