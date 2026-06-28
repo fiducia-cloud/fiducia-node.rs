@@ -5,17 +5,14 @@
 //! HTTP: locks, rate limits, cron schedules, config KV, leader election, and
 //! service discovery.
 //!
-//! This is a **skeleton**: the routing, consensus, and state-machine shapes are
-//! in place; the per-command logic, replication, watches, and TTL expiry are
-//! marked with `TODO`s in the respective modules.
+//! The routing, consensus, state-machine primitives, replication, watches, and
+//! TTL expiry are implemented in the respective modules.
 
 mod consensus;
 mod discovery;
 mod election;
-mod indexed_queue;
 mod kv;
 mod locks;
-mod persist;
 mod raft_api;
 mod rate_limit;
 mod schedule;

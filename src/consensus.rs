@@ -34,7 +34,6 @@
 //! `fiducia-brain`'s job and is not done here.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -48,10 +47,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
-use crate::persist::{Recovered, ShardStore};
 use crate::state::{
-    Command, KvEntry, KvListItem, Leadership, LockState, RateLimitSnapshot, Schedule, ScheduleRun,
-    SemaphoreState, ServiceInstance, ServiceSummary, StateMachine,
+    Command, KvEntry, Leadership, LockState, RateLimitSnapshot, Schedule, ScheduleRun,
+    SemaphoreState, ServiceInstance, StateMachine,
 };
 use crate::transport::{
     AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
@@ -65,122 +63,15 @@ pub use fiducia_routing::ShardId;
 
 /// Depth of each shard actor's inbox before senders must wait.
 const SHARD_INBOX_CAPACITY: usize = 1024;
-/// How long a client write waits for its entry to commit before giving up.
-const COMMIT_WAIT: Duration = Duration::from_secs(5);
+/// How often a shard actor wakes to check election/heartbeat deadlines.
+const TICK: Duration = Duration::from_millis(20);
+/// Default Raft timing. WAN deployments should tune these from measured RTT.
+const DEFAULT_HEARTBEAT_MS: u64 = 50;
+const DEFAULT_ELECTION_MIN_MS: u64 = 150;
+const DEFAULT_ELECTION_JITTER_MS: u64 = 150;
+const DEFAULT_COMMIT_WAIT_MS: u64 = 5_000;
 /// Capacity of each shard's change-event broadcast (feeds KV watches).
 const CHANGE_BUFFER: usize = 256;
-
-/// Raft timing knobs. The timer *durations* default to the original **LAN**
-/// values, so an unconfigured node keeps the same heartbeat/election cadence as
-/// before; the one behaviour change with no env set is that PreVote is **on** by
-/// default (strictly safer — see [`RaftTiming::pre_vote`]). For a cross-cloud
-/// (WAN) deployment the durations must be sized **above** the inter-cloud
-/// round-trip + jitter, or transatlantic latency triggers spurious elections and
-/// leadership flapping — set e.g. `FIDUCIA_RAFT_HEARTBEAT_MS=150`,
-/// `FIDUCIA_RAFT_ELECTION_MIN_MS=1000`, `FIDUCIA_RAFT_ELECTION_JITTER_MS=1000`.
-/// PreVote can be disabled with `FIDUCIA_RAFT_PREVOTE=off`.
-#[derive(Debug, Clone, Copy)]
-pub struct RaftTiming {
-    /// How often a shard actor wakes to check election/heartbeat deadlines.
-    pub tick: Duration,
-    /// How often a leader sends heartbeats (must be `<<` the election timeout).
-    pub heartbeat: Duration,
-    /// Election-timeout base; the actual timeout is `min + rand(0..jitter)` so
-    /// peers don't all campaign at once (split-vote avoidance).
-    pub election_min_ms: u64,
-    pub election_jitter_ms: u64,
-    /// PreVote (Raft thesis §9.6): run a non-binding straw poll before
-    /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
-    /// leader on rejoin. Strictly safer on a WAN; on by default.
-    pub pre_vote: bool,
-}
-
-impl Default for RaftTiming {
-    fn default() -> Self {
-        RaftTiming {
-            tick: Duration::from_millis(20),
-            heartbeat: Duration::from_millis(50),
-            election_min_ms: 150,
-            election_jitter_ms: 150,
-            pre_vote: true,
-        }
-    }
-}
-
-impl RaftTiming {
-    /// Read timing from the environment, falling back to the LAN defaults, then
-    /// run it through [`sanitized`](Self::sanitized) so an operator typo can never
-    /// produce a panicking or self-flapping configuration.
-    pub fn from_env() -> Self {
-        fn ms(var: &str, default: u64) -> u64 {
-            std::env::var(var)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
-        }
-        let d = RaftTiming::default();
-        RaftTiming {
-            tick: Duration::from_millis(ms("FIDUCIA_RAFT_TICK_MS", d.tick.as_millis() as u64)),
-            heartbeat: Duration::from_millis(ms(
-                "FIDUCIA_RAFT_HEARTBEAT_MS",
-                d.heartbeat.as_millis() as u64,
-            )),
-            election_min_ms: ms("FIDUCIA_RAFT_ELECTION_MIN_MS", d.election_min_ms),
-            election_jitter_ms: ms("FIDUCIA_RAFT_ELECTION_JITTER_MS", d.election_jitter_ms),
-            pre_vote: std::env::var("FIDUCIA_RAFT_PREVOTE")
-                .ok()
-                .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-                .unwrap_or(d.pre_vote),
-        }
-        .sanitized()
-    }
-
-    /// Clamp degenerate / unsafe values into a working range. Guards against
-    /// operator typos that would otherwise be fatal or self-defeating:
-    ///   * a **zero** `tick` or `heartbeat` panics `tokio::time::interval`;
-    ///   * a `tick` coarser than the `heartbeat` makes the actor notice deadlines
-    ///     late, so heartbeats and elections fire behind schedule;
-    ///   * an election timeout **below** the heartbeat guarantees a leader can
-    ///     never out-heartbeat its own election timer → perpetual flapping.
-    ///
-    /// Pure (only side effect is a warning log), so it is unit-tested directly.
-    pub fn sanitized(mut self) -> RaftTiming {
-        if self.tick.is_zero() {
-            self.tick = Duration::from_millis(1);
-        }
-        if self.heartbeat.is_zero() {
-            self.heartbeat = Duration::from_millis(1);
-        }
-        // Deadlines are only re-checked once per tick, so the tick must be at least
-        // as fine as the heartbeat.
-        if self.tick > self.heartbeat {
-            self.tick = self.heartbeat;
-        }
-        let heartbeat_ms = self.heartbeat.as_millis() as u64;
-        // Hard floor: election timeout must be at least 2x the heartbeat or the
-        // cluster cannot hold a stable leader. Clamp up if misconfigured.
-        let floor = heartbeat_ms.saturating_mul(2).max(1);
-        if self.election_min_ms < floor {
-            tracing::warn!(
-                heartbeat_ms,
-                requested_election_min_ms = self.election_min_ms,
-                clamped_to_ms = floor,
-                "raft timing: election timeout below 2x the heartbeat — clamped up to \
-                 avoid guaranteed leadership flapping"
-            );
-            self.election_min_ms = floor;
-        } else if self.election_min_ms < heartbeat_ms.saturating_mul(3) {
-            // Soft guidance: 3x is the comfortable margin on a lossy / WAN link.
-            tracing::warn!(
-                heartbeat_ms,
-                election_min_ms = self.election_min_ms,
-                "raft timing: election timeout is under 3x the heartbeat — spurious \
-                 elections are likely on a WAN; consider raising FIDUCIA_RAFT_ELECTION_MIN_MS"
-            );
-        }
-        self
-    }
-}
 
 /// A node's role *within a single shard's* Raft group. A node holds a `Role` per
 /// shard it replicates — `Leader` for some, `Follower` for others.
@@ -205,23 +96,16 @@ pub struct LogEntry {
     pub command: Option<Command>,
 }
 
-/// A change applied to a shard's state machine, broadcast to watchers (KV,
-/// elections, discovery). `scope` lets a watcher ignore changes from a different
-/// primitive that happens to share a name with what it's watching.
+/// A change applied to a shard's state machine, broadcast to watch clients.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeEvent {
-    /// Which primitive changed: `"kv"`, `"election"`, or `"service"`.
-    pub scope: &'static str,
-    /// Domain verb: kv `put`/`delete`; election `elected`/`renewed`/`resigned`;
-    /// service `register`/`heartbeat`/`deregister`.
+    /// Domain-specific event name, such as `"put"`, `"election_campaign"`, or
+    /// `"service_register"`.
     pub kind: &'static str,
-    /// The watched name: kv key, election name, or service name.
     pub key: String,
     pub revision: u64,
-    /// Optional payload (the new `Leadership` or `ServiceInstance`) so watchers
-    /// can act on a single event without a follow-up read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub data: Value,
 }
 
 /// Static identity + cluster membership for this physical node.
@@ -234,11 +118,35 @@ pub struct NodeConfig {
     pub peers: Vec<String>,
     /// Number of shards the keyspace is partitioned into.
     pub shard_count: u32,
-    /// Directory for durable per-shard Raft state (term/vote/log). `None` runs
-    /// fully in-memory — the mode used by the in-process loopback tests; a real
-    /// deployment points this at a persistent volume so a pod restart can't drop
-    /// a member's log.
-    pub data_dir: Option<PathBuf>,
+    /// Raft heartbeat/election/client wait timing. Cross-cloud clusters should
+    /// set this from observed inter-provider RTT.
+    pub timing: RaftTiming,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RaftTiming {
+    /// Leader heartbeat interval.
+    pub heartbeat_ms: u64,
+    /// Base election timeout; actual timeout adds random jitter below.
+    pub election_min_ms: u64,
+    /// Randomized election timeout jitter.
+    pub election_jitter_ms: u64,
+    /// Client write wait for quorum commit before returning unavailable.
+    pub commit_wait_ms: u64,
+}
+
+impl RaftTiming {
+    fn heartbeat_duration(self) -> Duration {
+        Duration::from_millis(self.heartbeat_ms)
+    }
+
+    fn election_duration(self, jitter: u64) -> Duration {
+        Duration::from_millis(self.election_min_ms.saturating_add(jitter))
+    }
+
+    fn commit_wait_duration(self) -> Duration {
+        Duration::from_millis(self.commit_wait_ms)
+    }
 }
 
 impl Default for NodeConfig {
@@ -257,17 +165,45 @@ impl Default for NodeConfig {
             shard_count: std::env::var("FIDUCIA_SHARD_COUNT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-            // Default to the conventional PVC mount; a deployment can override
-            // with FIDUCIA_DATA_DIR. The directory must be writable (the pod
-            // mounts a PersistentVolume there).
-            data_dir: Some(
-                std::env::var("FIDUCIA_DATA_DIR")
-                    .unwrap_or_else(|_| "/var/lib/fiducia".to_string())
-                    .into(),
-            ),
+                .unwrap_or(16)
+                .max(1),
+            timing: RaftTiming::default(),
         }
     }
+}
+
+impl Default for RaftTiming {
+    fn default() -> Self {
+        let mut heartbeat_ms = env_u64("FIDUCIA_RAFT_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS).max(1);
+        let mut election_min_ms =
+            env_u64("FIDUCIA_RAFT_ELECTION_MIN_MS", DEFAULT_ELECTION_MIN_MS).max(1);
+        let election_jitter_ms = env_u64(
+            "FIDUCIA_RAFT_ELECTION_JITTER_MS",
+            DEFAULT_ELECTION_JITTER_MS,
+        );
+        let commit_wait_ms = env_u64("FIDUCIA_RAFT_COMMIT_WAIT_MS", DEFAULT_COMMIT_WAIT_MS).max(1);
+
+        if let Some(rtt_ms) = env_optional_u64("FIDUCIA_RAFT_RTT_MS") {
+            heartbeat_ms = heartbeat_ms.max(rtt_ms.max(1));
+            election_min_ms = election_min_ms.max(heartbeat_ms.saturating_mul(10));
+        }
+        election_min_ms = election_min_ms.max(heartbeat_ms.saturating_mul(3));
+
+        Self {
+            heartbeat_ms,
+            election_min_ms,
+            election_jitter_ms,
+            commit_wait_ms,
+        }
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env_optional_u64(name).unwrap_or(default)
+}
+
+fn env_optional_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -288,13 +224,6 @@ pub enum ShardMsg {
         request: ReadRequest,
         resp: oneshot::Sender<Result<ReadResponse, ProposeError>>,
     },
-    /// A serializable (non-leader) read off this shard's local applied state, for
-    /// list/range fan-outs where slightly-stale results are acceptable and no
-    /// single shard is authoritative.
-    QueryLocal {
-        request: ReadRequest,
-        resp: oneshot::Sender<ReadResponse>,
-    },
     /// Inbound `AppendEntries` from a peer leader.
     AppendEntries {
         req: AppendEntriesReq,
@@ -306,18 +235,14 @@ pub enum ShardMsg {
         resp: oneshot::Sender<RequestVoteResp>,
     },
     /// A peer's reply to a `RequestVote` this shard sent (routed back to self).
-    /// `pre_vote` echoes whether the request that produced it was a pre-vote, so
-    /// the candidate counts it toward the right round.
-    VoteReply {
-        from: String,
-        pre_vote: bool,
-        resp: RequestVoteResp,
-    },
+    VoteReply { from: String, resp: RequestVoteResp },
     /// A peer's reply to an `AppendEntries` this shard sent (routed back to self).
     AppendReply {
         from: String,
         /// Last index the leader tried to replicate in that RPC.
         up_to: u64,
+        /// RPC round-trip latency measured by the spawned transport task.
+        rtt_ms: Option<u64>,
         /// `None` if the peer was unreachable.
         resp: Option<AppendEntriesResp>,
     },
@@ -329,22 +254,19 @@ pub enum ShardMsg {
     Status { resp: oneshot::Sender<ShardStatus> },
 }
 
-/// A single-key read, routed to its owning shard.
+/// A read routed to its owning shard, except prefix reads which are fanned out
+/// across every hosted shard by [`Node::query_kv_prefix`].
 pub enum ReadRequest {
     Kv { key: String },
+    KvPrefix { prefix: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
     Schedule { name: String },
     ScheduleHistory { name: String },
     Election { name: String },
+    Services,
     Service { service: String },
-    /// Range read: every KV key under `prefix` on one shard. Fanned out across
-    /// shards by [`Node::list_kv`] and served serializably (no leader gate).
-    KvList { prefix: String },
-    /// Every service with live instances on one shard. Fanned out by
-    /// [`Node::list_services`] and served serializably.
-    ServiceList,
 }
 
 impl ReadRequest {
@@ -352,15 +274,12 @@ impl ReadRequest {
     /// to the same lock-coordinator shard as their writes (see [`Command::routing_key`]).
     pub fn routing_key(&self) -> &str {
         match self {
-            ReadRequest::Kv { key } => key,
+            ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
-            ReadRequest::Service { service } => service,
-            // List reads fan out across all shards rather than routing to one.
-            ReadRequest::KvList { prefix } => prefix,
-            ReadRequest::ServiceList => "",
+            ReadRequest::Services | ReadRequest::Service { .. } => crate::state::SERVICE_DOMAIN,
         }
     }
 }
@@ -369,15 +288,15 @@ impl ReadRequest {
 #[derive(Debug)]
 pub enum ReadResponse {
     Kv(Option<KvEntry>),
+    KvPrefix(Vec<(String, KvEntry)>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
     Schedule(Option<Schedule>),
     ScheduleHistory(Vec<ScheduleRun>),
     Election(Option<Leadership>),
+    Services(Vec<String>),
     Service(Vec<ServiceInstance>),
-    KvList(Vec<KvListItem>),
-    ServiceList(Vec<ServiceSummary>),
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +315,24 @@ struct LeaderState {
     in_flight: HashMap<String, bool>,
 }
 
+struct PendingProposal {
+    started_at: Instant,
+    resp: oneshot::Sender<Result<ProposeOutcome, ProposeError>>,
+}
+
+/// Per-shard metric snapshot surfaced through `/v1/status`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ShardMetrics {
+    /// Last successful AppendEntries round-trip observed by the leader.
+    pub append_rtt_ms_last: Option<u64>,
+    /// Last client proposal latency from leader append to quorum commit/apply.
+    pub quorum_rtt_ms_last: Option<u64>,
+    /// Current max `leader_last_log_index - follower_match_index` across peers.
+    pub follower_lag_max: u64,
+    /// Observed leadership changes into or out of leader role on this shard.
+    pub leader_transfer_count: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Shard actor: owns one shard's Raft group + state-machine partition.
 // ---------------------------------------------------------------------------
@@ -412,12 +349,9 @@ struct ShardActor {
     /// A clone of this actor's own inbox, so spawned RPC tasks can route replies
     /// back in as `VoteReply` / `AppendReply`.
     self_tx: mpsc::Sender<ShardMsg>,
+    timing: RaftTiming,
 
-    // --- Raft state. `current_term`, `voted_for`, and `log` are the bits Raft
-    //     must persist before acting on them; `store`, when present, is their
-    //     durable home (see `crate::persist`). `commit_index`/`last_applied` are
-    //     volatile but recoverable by replaying the log up to the persisted
-    //     commit point. `None` store = in-memory only (loopback tests). ---
+    // --- persistent-ish Raft state (in-memory in this build) ---
     role: Role,
     current_term: u64,
     voted_for: Option<String>,
@@ -425,35 +359,26 @@ struct ShardActor {
     log: Vec<LogEntry>,
     commit_index: u64,
     last_applied: u64,
-    /// Durable backing for term/vote/log, or `None` for an in-memory shard.
-    store: Option<ShardStore>,
 
     // --- candidate state ---
     votes: HashSet<String>,
-    // --- pre-vote (straw-poll) state, for the would-be term `pre_vote_term` ---
-    pre_votes: HashSet<String>,
-    pre_vote_term: u64,
     // --- leader state ---
     leader: Option<LeaderState>,
 
     // --- timers ---
-    timing: RaftTiming,
     election_deadline: Instant,
     heartbeat_deadline: Instant,
-    /// When we last heard from a valid leader (an `AppendEntries`). Tracked
-    /// **separately** from `election_deadline` (which we reset for our own
-    /// campaigning) so pre-vote's leader-stickiness reflects the *leader's*
-    /// liveness, not our candidacy.
-    last_leader_contact: Instant,
     rng: Rng,
 
     // --- client write waiters: log index → who is blocked on its commit ---
-    pending: HashMap<u64, oneshot::Sender<Result<ProposeOutcome, ProposeError>>>,
+    pending: HashMap<u64, PendingProposal>,
     // --- change stream feeding KV watches ---
     changes: broadcast::Sender<ChangeEvent>,
 
     // --- the state-machine partition holding this shard's keys ---
     state: StateMachine,
+    // --- low-cardinality metrics for Raft operations ---
+    metrics: ShardMetrics,
 }
 
 impl ShardActor {
@@ -464,16 +389,10 @@ impl ShardActor {
         transport: Arc<Transport>,
         self_tx: mpsc::Sender<ShardMsg>,
         timing: RaftTiming,
-        store: Option<ShardStore>,
-        recovered: Recovered,
     ) -> Self {
         let members = peers.len() + 1;
         let single = members == 1;
         let (changes, _) = broadcast::channel(CHANGE_BUFFER);
-        // Seed from disk when we have it. A fresh shard recovers `term == 0`; this
-        // engine numbers terms from 1, so keep the floor at 1 for a clean start.
-        let current_term = recovered.current_term.max(1);
-        let recovered_commit = recovered.commit_index.min(recovered.log.len() as u64);
         let mut actor = ShardActor {
             shard_id,
             node_id: node_id.clone(),
@@ -481,47 +400,38 @@ impl ShardActor {
             members,
             transport,
             self_tx,
-            // We always restart as a follower (even if we last led) so a stale term
-            // can't serve writes before re-validation; a single-node shard is the
-            // exception — it has no one to elect against, so it leads from t=0.
+            timing,
+            // A single-node shard leads itself from t=0 (no one to elect against);
+            // a real group starts as a follower and runs an election.
             role: if single { Role::Leader } else { Role::Follower },
-            current_term,
-            voted_for: recovered.voted_for,
+            current_term: 1,
+            voted_for: None,
             leader_id: if single { Some(node_id.clone()) } else { None },
-            log: recovered.log,
-            commit_index: recovered_commit,
+            log: Vec::new(),
+            commit_index: 0,
             last_applied: 0,
-            store,
             votes: HashSet::new(),
-            pre_votes: HashSet::new(),
-            pre_vote_term: 0,
             leader: if single {
                 Some(LeaderState::default())
             } else {
                 None
             },
-            timing,
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
-            last_leader_contact: Instant::now(),
             rng: Rng::seeded(&node_id, shard_id),
             pending: HashMap::new(),
             changes,
             state: StateMachine::new(),
+            metrics: ShardMetrics::default(),
         };
         actor.reset_election_deadline();
-        // Rebuild the in-memory state machine from the recovered log up to the
-        // committed point (the state machine itself is not persisted).
-        if actor.commit_index > 0 {
-            actor.apply_committed();
-        }
         actor
     }
 
     /// The shard's event loop: drain the inbox and fire the election/heartbeat
     /// tick until every sender is dropped (node shutdown).
     async fn run(mut self, mut inbox: mpsc::Receiver<ShardMsg>) {
-        let mut tick = tokio::time::interval(self.timing.tick);
+        let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -540,9 +450,6 @@ impl ShardActor {
             ShardMsg::Query { request, resp } => {
                 let _ = resp.send(self.handle_query(request));
             }
-            ShardMsg::QueryLocal { request, resp } => {
-                let _ = resp.send(self.handle_query_local(request));
-            }
             ShardMsg::AppendEntries { req, resp } => {
                 let out = self.handle_append_entries(req);
                 let _ = resp.send(out);
@@ -551,14 +458,13 @@ impl ShardActor {
                 let out = self.handle_request_vote(req);
                 let _ = resp.send(out);
             }
-            ShardMsg::VoteReply {
+            ShardMsg::VoteReply { from, resp } => self.handle_vote_reply(from, resp),
+            ShardMsg::AppendReply {
                 from,
-                pre_vote,
+                up_to,
+                rtt_ms,
                 resp,
-            } => self.handle_vote_reply(from, pre_vote, resp),
-            ShardMsg::AppendReply { from, up_to, resp } => {
-                self.handle_append_reply(from, up_to, resp)
-            }
+            } => self.handle_append_reply(from, up_to, rtt_ms, resp),
             ShardMsg::Subscribe { resp } => {
                 let _ = resp.send(self.changes.subscribe());
             }
@@ -572,8 +478,7 @@ impl ShardActor {
 
     fn reset_election_deadline(&mut self) {
         let jitter = self.rng.below(self.timing.election_jitter_ms);
-        self.election_deadline =
-            Instant::now() + Duration::from_millis(self.timing.election_min_ms + jitter);
+        self.election_deadline = Instant::now() + self.timing.election_duration(jitter);
     }
 
     /// Periodic tick: leaders heartbeat; everyone else campaigns once their
@@ -583,21 +488,13 @@ impl ShardActor {
         match self.role {
             Role::Leader => {
                 if now >= self.heartbeat_deadline {
-                    self.heartbeat_deadline = now + self.timing.heartbeat;
+                    self.heartbeat_deadline = now + self.timing.heartbeat_duration();
                     self.broadcast_append_entries();
                 }
             }
             Role::Follower | Role::Candidate => {
                 if now >= self.election_deadline {
-                    // With PreVote, time-out starts a non-binding straw poll first;
-                    // only a pre-vote majority escalates to a real (term-bumping)
-                    // election. Single-member groups never reach here (they lead
-                    // from t=0), so there is always a peer to poll.
-                    if self.timing.pre_vote && self.members > 1 {
-                        self.start_pre_election();
-                    } else {
-                        self.start_election();
-                    }
+                    self.start_election();
                 }
             }
         }
@@ -628,73 +525,26 @@ impl ShardActor {
         self.members / 2 + 1
     }
 
-    /// PreVote straw poll: ask peers whether they *would* vote for us at
-    /// `current_term + 1`, **without adopting that term or changing any state**.
-    /// Only a majority of grants escalates to a real [`start_election`]. This is
-    /// what stops a partitioned node — whose term has run ahead while it was
-    /// isolated — from forcing a healthy leader to step down when it reconnects.
-    fn start_pre_election(&mut self) {
-        // Run the straw poll strictly as a follower: abandon any failed candidacy
-        // so a late vote-reply from the prior term can't complete a stale election
-        // while this pre-poll is in flight. The term is *not* bumped here.
-        self.role = Role::Follower;
-        self.votes.clear();
-        self.reset_election_deadline();
-        let would_be_term = self.current_term + 1;
-        self.pre_vote_term = would_be_term;
-        self.pre_votes.clear();
-        self.pre_votes.insert(self.node_id.clone());
-        tracing::debug!(
-            shard = ?self.shard_id,
-            node = %self.node_id,
-            would_be_term,
-            members = self.members,
-            "raft: election timeout — starting pre-vote straw poll"
-        );
-        // (Unreachable for members > 1, but keep the single-member invariant.)
-        if self.pre_votes.len() >= self.majority() {
-            self.start_election();
-            return;
-        }
-        self.solicit_votes(would_be_term, true);
-    }
-
     fn start_election(&mut self) {
         self.current_term += 1;
         self.role = Role::Candidate;
-        tracing::info!(
-            shard = ?self.shard_id,
-            node = %self.node_id,
-            term = self.current_term,
-            members = self.members,
-            "raft: election timeout — starting campaign as candidate"
-        );
         self.voted_for = Some(self.node_id.clone());
         self.leader_id = None;
         self.votes.clear();
         self.votes.insert(self.node_id.clone());
         self.reset_election_deadline();
-        // Durable before we ask anyone for a vote in this term.
-        self.persist_hard_state();
 
         if self.votes.len() >= self.majority() {
             // Single-member group: we already have a majority.
             self.become_leader();
             return;
         }
-        self.solicit_votes(self.current_term, false);
-    }
 
-    /// Send `RequestVote` (real or pre-vote) to every peer for `term`, routing
-    /// each reply back into our own inbox as a `VoteReply` tagged with `pre_vote`
-    /// so it is counted toward the right round.
-    fn solicit_votes(&self, term: u64, pre_vote: bool) {
         let req = RequestVoteReq {
-            term,
+            term: self.current_term,
             candidate_id: self.node_id.clone(),
             last_log_index: self.last_log_index(),
             last_log_term: self.last_log_term(),
-            pre_vote,
         };
         for peer in self.peers.clone() {
             let transport = self.transport.clone();
@@ -703,37 +553,15 @@ impl ShardActor {
             let req = req.clone();
             tokio::spawn(async move {
                 if let Some(resp) = transport.request_vote(&peer, shard, req).await {
-                    let _ = self_tx
-                        .send(ShardMsg::VoteReply {
-                            from: peer,
-                            pre_vote,
-                            resp,
-                        })
-                        .await;
+                    let _ = self_tx.send(ShardMsg::VoteReply { from: peer, resp }).await;
                 }
             });
         }
     }
 
-    fn handle_vote_reply(&mut self, from: String, pre_vote: bool, resp: RequestVoteResp) {
-        // A higher term anywhere means we're behind: adopt it and stand down.
+    fn handle_vote_reply(&mut self, from: String, resp: RequestVoteResp) {
         if resp.term > self.current_term {
             self.step_down(resp.term, None);
-            return;
-        }
-        if pre_vote {
-            // Pre-vote round: we are still a Follower at `current_term`; a majority
-            // of grants for the would-be term promotes us to a real election.
-            // Ignore replies once our term has advanced past this round.
-            if self.pre_vote_term != self.current_term + 1 {
-                return;
-            }
-            if resp.granted {
-                self.pre_votes.insert(from);
-                if self.pre_votes.len() >= self.majority() {
-                    self.start_election();
-                }
-            }
             return;
         }
         if self.role != Role::Candidate || resp.term != self.current_term {
@@ -748,16 +576,9 @@ impl ShardActor {
     }
 
     fn become_leader(&mut self) {
+        self.record_leader_transfer(self.role, Role::Leader, "became_leader");
         self.role = Role::Leader;
         self.leader_id = Some(self.node_id.clone());
-        tracing::info!(
-            shard = ?self.shard_id,
-            node = %self.node_id,
-            term = self.current_term,
-            votes = self.votes.len(),
-            members = self.members,
-            "raft: won election — now leader for shard"
-        );
         self.votes.clear();
         let mut ls = LeaderState::default();
         let next = self.last_log_index() + 1;
@@ -776,25 +597,21 @@ impl ShardActor {
             index,
             command: None,
         });
-        // Durable before this entry can count toward a commit.
-        self.persist_log_append();
 
-        self.heartbeat_deadline = Instant::now() + self.timing.heartbeat;
+        self.heartbeat_deadline = Instant::now() + self.timing.heartbeat_duration();
         self.maybe_advance_commit(); // single-node commits the no-op immediately
         self.broadcast_append_entries();
+        tracing::info!(
+            shard = self.shard_id,
+            term = self.current_term,
+            "became leader"
+        );
     }
 
     /// Convert to follower at `term`, optionally learning the new leader. Fails
     /// any outstanding client writes so they retry against the real leader.
     fn step_down(&mut self, term: u64, leader: Option<String>) {
-        if self.role != Role::Follower {
-            tracing::info!(
-                shard = ?self.shard_id,
-                node = %self.node_id,
-                term,
-                "raft: stepped down to follower (observed a higher term)"
-            );
-        }
+        self.record_leader_transfer(self.role, Role::Follower, "step_down");
         self.current_term = term;
         self.voted_for = None;
         self.role = Role::Follower;
@@ -803,49 +620,14 @@ impl ShardActor {
         if leader.is_some() {
             self.leader_id = leader;
         }
-        self.persist_hard_state();
         self.reset_election_deadline();
         self.fail_pending();
     }
 
-    // --- durability: persist before acting (no-ops for an in-memory shard) ----
-
-    /// Persist `current_term`, `voted_for`, and `commit_index`. Call after any
-    /// change to them and **before** the action that relies on them (granting a
-    /// vote, campaigning, committing). A persist failure is logged, not hidden —
-    /// it means we may be running without the durability the caller assumes.
-    fn persist_hard_state(&mut self) {
-        if let Some(store) = self.store.as_ref() {
-            if let Err(e) =
-                store.save_meta(self.current_term, self.voted_for.as_deref(), self.commit_index)
-            {
-                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist hard state");
-            }
-        }
-    }
-
-    /// Persist newly-appended tail entries (pure-append path).
-    fn persist_log_append(&mut self) {
-        if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store.append_tail(&self.log) {
-                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log append");
-            }
-        }
-    }
-
-    /// Persist the full log after a conflicting suffix was truncated/replaced.
-    fn persist_log_rewrite(&mut self) {
-        if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store.rewrite(&self.log) {
-                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log rewrite");
-            }
-        }
-    }
-
     fn fail_pending(&mut self) {
         let leader = self.leader_id.clone();
-        for (_, resp) in self.pending.drain() {
-            let _ = resp.send(Err(ProposeError::NotLeader {
+        for (_, pending) in self.pending.drain() {
+            let _ = pending.resp.send(Err(ProposeError::NotLeader {
                 shard: self.shard_id,
                 leader: leader.clone(),
             }));
@@ -896,20 +678,39 @@ impl ShardActor {
         let shard = self.shard_id;
         let peer_owned = peer.to_string();
         tokio::spawn(async move {
+            let started_at = Instant::now();
             let resp = transport.append_entries(&peer_owned, shard, req).await;
+            let rtt_ms = Some(duration_millis(started_at.elapsed()));
             let _ = self_tx
                 .send(ShardMsg::AppendReply {
                     from: peer_owned,
                     up_to,
+                    rtt_ms,
                     resp,
                 })
                 .await;
         });
     }
 
-    fn handle_append_reply(&mut self, from: String, up_to: u64, resp: Option<AppendEntriesResp>) {
+    fn handle_append_reply(
+        &mut self,
+        from: String,
+        up_to: u64,
+        rtt_ms: Option<u64>,
+        resp: Option<AppendEntriesResp>,
+    ) {
         if let Some(ls) = self.leader.as_mut() {
             ls.in_flight.insert(from.clone(), false);
+        }
+        if let Some(rtt_ms) = rtt_ms {
+            self.metrics.append_rtt_ms_last = Some(rtt_ms);
+            tracing::debug!(
+                metric.name = "fiducia.raft.append_entries_rtt_ms",
+                shard = self.shard_id,
+                peer = %from,
+                rtt_ms,
+                "append entries round-trip"
+            );
         }
         let Some(resp) = resp else {
             return; // peer unreachable; retry next tick
@@ -940,6 +741,7 @@ impl ShardActor {
         if resp.success {
             self.maybe_advance_commit();
         }
+        self.refresh_follower_lag_metric();
         if more {
             self.send_append_to(&from);
         }
@@ -963,8 +765,29 @@ impl ShardActor {
         if n > self.commit_index && self.term_at(n) == self.current_term {
             self.commit_index = n;
             self.apply_committed();
-            self.persist_hard_state(); // record the advanced commit pointer
         }
+    }
+
+    fn refresh_follower_lag_metric(&mut self) {
+        let Some(ls) = &self.leader else {
+            self.metrics.follower_lag_max = 0;
+            return;
+        };
+        let leader_last_log_index = self.last_log_index();
+        self.metrics.follower_lag_max = self
+            .peers
+            .iter()
+            .map(|peer| {
+                leader_last_log_index.saturating_sub(ls.match_index.get(peer).copied().unwrap_or(0))
+            })
+            .max()
+            .unwrap_or(0);
+        tracing::debug!(
+            metric.name = "fiducia.raft.follower_lag_entries",
+            shard = self.shard_id,
+            follower_lag_max = self.metrics.follower_lag_max,
+            "updated follower lag"
+        );
     }
 
     // --- replication (follower side) --------------------------------------
@@ -982,8 +805,6 @@ impl ShardActor {
         if req.term > self.current_term {
             self.current_term = req.term;
             self.voted_for = None;
-            // Durable before we answer this RPC (even the reject path below).
-            self.persist_hard_state();
         }
         self.become_follower_of(req.leader_id.clone());
 
@@ -1001,8 +822,6 @@ impl ShardActor {
 
         // Append, truncating on the first conflicting term.
         let mut idx = req.prev_log_index;
-        let mut truncated = false;
-        let mut grew = false;
         for entry in req.entries {
             idx += 1;
             match self.log.get((idx - 1) as usize) {
@@ -1010,26 +829,14 @@ impl ShardActor {
                 Some(_) => {
                     self.log.truncate((idx - 1) as usize);
                     self.log.push(entry);
-                    truncated = true;
                 }
-                None => {
-                    self.log.push(entry);
-                    grew = true;
-                }
+                None => self.log.push(entry),
             }
-        }
-        // Persist the log change before acking success: a full rewrite if we
-        // truncated a conflicting suffix, otherwise just the appended tail.
-        if truncated {
-            self.persist_log_rewrite();
-        } else if grew {
-            self.persist_log_append();
         }
 
         if req.leader_commit > self.commit_index {
             self.commit_index = req.leader_commit.min(self.last_log_index());
             self.apply_committed();
-            self.persist_hard_state(); // record the advanced commit pointer
         }
 
         AppendEntriesResp {
@@ -1040,22 +847,33 @@ impl ShardActor {
     }
 
     fn become_follower_of(&mut self, leader: String) {
+        self.record_leader_transfer(self.role, Role::Follower, "append_entries");
         self.role = Role::Follower;
         self.leader_id = Some(leader);
         self.leader = None;
         self.votes.clear();
-        self.last_leader_contact = Instant::now(); // heard from the leader
         self.reset_election_deadline();
         // Anything we were leading is no longer ours to commit.
         self.fail_pending();
     }
 
-    fn handle_request_vote(&mut self, req: RequestVoteReq) -> RequestVoteResp {
-        // PreVote is answered without mutating any Raft state (no term bump, no
-        // `voted_for`, no deadline reset) — that read-only-ness is the whole point.
-        if req.pre_vote {
-            return self.handle_pre_vote(&req);
+    fn record_leader_transfer(&mut self, from: Role, to: Role, reason: &'static str) {
+        if from == to || (from != Role::Leader && to != Role::Leader) {
+            return;
         }
+        self.metrics.leader_transfer_count += 1;
+        tracing::info!(
+            metric.name = "fiducia.raft.leader_transfer",
+            shard = self.shard_id,
+            from = ?from,
+            to = ?to,
+            reason,
+            count = self.metrics.leader_transfer_count,
+            "observed raft leadership transition"
+        );
+    }
+
+    fn handle_request_vote(&mut self, req: RequestVoteReq) -> RequestVoteResp {
         if req.term < self.current_term {
             return RequestVoteResp {
                 term: self.current_term,
@@ -1078,8 +896,6 @@ impl ShardActor {
         if can_vote && log_ok {
             self.voted_for = Some(req.candidate_id.clone());
             self.reset_election_deadline();
-            // Durable before we tell the candidate it has our vote.
-            self.persist_hard_state();
             RequestVoteResp {
                 term: self.current_term,
                 granted: true,
@@ -1089,33 +905,6 @@ impl ShardActor {
                 term: self.current_term,
                 granted: false,
             }
-        }
-    }
-
-    /// Answer a PreVote straw poll. Pure read: changes nothing. Grant only if
-    ///   * the candidate's would-be term isn't stale (`req.term >= current_term`),
-    ///   * its log is at least as up-to-date as ours, **and**
-    ///   * we are not currently being served by a live leader — i.e. we know of no
-    ///     leader, or our own election timeout has already lapsed.
-    ///
-    /// That last clause is the leader-stickiness that makes pre-vote *refuse* to
-    /// disrupt a healthy leader: while heartbeats keep arriving, `election_deadline`
-    /// stays in the future, so a rejoining/partitioned node's pre-vote is denied
-    /// and it can never bump the cluster's term. At cold start `leader_id` is
-    /// `None`, so the first election is still granted immediately.
-    fn handle_pre_vote(&self, req: &RequestVoteReq) -> RequestVoteResp {
-        let log_ok = (req.last_log_term > self.last_log_term())
-            || (req.last_log_term == self.last_log_term()
-                && req.last_log_index >= self.last_log_index());
-        // A leader is presumed alive if we know one AND we've heard from it within
-        // an election timeout. At cold start `leader_id` is `None`, so the first
-        // election is granted; once a known leader stops heartbeating, contact goes
-        // stale and pre-votes flow again so failover can proceed.
-        let leader_alive = self.leader_id.is_some()
-            && self.last_leader_contact.elapsed() < Duration::from_millis(self.timing.election_min_ms);
-        RequestVoteResp {
-            term: self.current_term,
-            granted: req.term >= self.current_term && log_ok && !leader_alive,
         }
     }
 
@@ -1139,16 +928,19 @@ impl ShardActor {
             index,
             command: Some(command),
         });
-        // Durable before this entry can count toward a commit / be acked.
-        self.persist_log_append();
         // Block the client on this index committing.
-        self.pending.insert(index, resp);
+        self.pending.insert(
+            index,
+            PendingProposal {
+                started_at: Instant::now(),
+                resp,
+            },
+        );
 
         if self.members == 1 {
             // One-member quorum: commit (and apply, which resolves the waiter) now.
             self.commit_index = index;
             self.apply_committed();
-            self.persist_hard_state(); // record the advanced commit pointer
         } else {
             self.broadcast_append_entries();
         }
@@ -1167,9 +959,18 @@ impl ShardActor {
                 continue; // no-op
             };
             let applied = self.state.apply(command.clone());
-            self.publish_change(&command, &applied.output, applied.revision);
-            if let Some(resp) = self.pending.remove(&i) {
-                let _ = resp.send(Ok(ProposeOutcome {
+            self.publish_change(&command, applied.revision, &applied.output);
+            if let Some(pending) = self.pending.remove(&i) {
+                let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
+                self.metrics.quorum_rtt_ms_last = Some(quorum_rtt_ms);
+                tracing::info!(
+                    metric.name = "fiducia.raft.quorum_rtt_ms",
+                    shard = self.shard_id,
+                    log_index = i,
+                    quorum_rtt_ms,
+                    "proposal committed on quorum"
+                );
+                let _ = pending.resp.send(Ok(ProposeOutcome {
                     shard: self.shard_id,
                     log_index: i,
                     revision: applied.revision,
@@ -1179,70 +980,56 @@ impl ShardActor {
         }
     }
 
-    fn publish_change(&self, command: &Command, output: &serde_json::Value, revision: u64) {
-        // Only publish changes that actually mutated state: a campaign that lost
-        // or a renew by a stale token must not look like a leadership change.
-        let flagged = |field: &str| output.get(field).and_then(|v| v.as_bool()).unwrap_or(false);
-        let detail = |field: &str| output.get(field).cloned();
+    fn publish_change(&self, command: &Command, revision: u64, output: &Value) {
         let event = match command {
             Command::KvPut { key, .. } => Some(ChangeEvent {
-                scope: "kv",
                 kind: "put",
                 key: key.clone(),
                 revision,
-                detail: None,
+                data: output.clone(),
             }),
             Command::KvDelete { key } => Some(ChangeEvent {
-                scope: "kv",
                 kind: "delete",
                 key: key.clone(),
                 revision,
-                detail: None,
+                data: output.clone(),
             }),
-            Command::ElectionCampaign { name, .. } if flagged("won") => Some(ChangeEvent {
-                scope: "election",
-                kind: "elected",
+            Command::ElectionCampaign { name, .. } => Some(ChangeEvent {
+                kind: "election_campaign",
                 key: name.clone(),
                 revision,
-                detail: detail("leadership"),
+                data: output.clone(),
             }),
-            Command::ElectionRenew { name, .. } if flagged("renewed") => Some(ChangeEvent {
-                scope: "election",
-                kind: "renewed",
+            Command::ElectionRenew { name, .. } => Some(ChangeEvent {
+                kind: "election_renew",
                 key: name.clone(),
                 revision,
-                detail: detail("leadership"),
+                data: output.clone(),
             }),
-            Command::ElectionResign { name, .. } if flagged("resigned") => Some(ChangeEvent {
-                scope: "election",
-                kind: "resigned",
+            Command::ElectionResign { name, .. } => Some(ChangeEvent {
+                kind: "election_resign",
                 key: name.clone(),
                 revision,
-                detail: None,
+                data: output.clone(),
             }),
-            Command::ServiceRegister { service, .. } if flagged("registered") => Some(ChangeEvent {
-                scope: "service",
-                kind: "register",
+            Command::ServiceRegister { service, .. } => Some(ChangeEvent {
+                kind: "service_register",
                 key: service.clone(),
                 revision,
-                detail: detail("instance"),
+                data: output.clone(),
             }),
-            Command::ServiceHeartbeat { service, .. } if flagged("heartbeat") => Some(ChangeEvent {
-                scope: "service",
-                kind: "heartbeat",
+            Command::ServiceHeartbeat { service, .. } => Some(ChangeEvent {
+                kind: "service_heartbeat",
                 key: service.clone(),
                 revision,
-                detail: detail("instance"),
+                data: output.clone(),
             }),
-            Command::ServiceDeregister { service, .. } if flagged("deregistered") => {
-                Some(ChangeEvent {
-                    scope: "service",
-                    kind: "deregister",
-                    key: service.clone(),
-                    revision,
-                    detail: None,
-                })
-            }
+            Command::ServiceDeregister { service, .. } => Some(ChangeEvent {
+                kind: "service_deregister",
+                key: service.clone(),
+                revision,
+                data: output.clone(),
+            }),
             _ => None,
         };
         if let Some(event) = event {
@@ -1250,9 +1037,13 @@ impl ShardActor {
         }
     }
 
-    /// Serve a read off applied state — leader only, for linearizability.
+    /// Serve a read off applied state.
+    ///
+    /// Single-shard reads stay leader-only for linearizability. A prefix read
+    /// spans shards, so it is served from this node's locally committed shard
+    /// snapshots and merged by [`Node::query_kv_prefix`].
     fn handle_query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
-        if self.role != Role::Leader {
+        if !matches!(&request, ReadRequest::KvPrefix { .. }) && self.role != Role::Leader {
             return Err(ProposeError::NotLeader {
                 shard: self.shard_id,
                 leader: self.leader_id.clone(),
@@ -1260,6 +1051,9 @@ impl ShardActor {
         }
         match request {
             ReadRequest::Kv { key } => Ok(ReadResponse::Kv(self.state.kv_get(&key))),
+            ReadRequest::KvPrefix { prefix } => {
+                Ok(ReadResponse::KvPrefix(self.state.kv_prefix(&prefix)))
+            }
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
@@ -1276,43 +1070,9 @@ impl ShardActor {
             ReadRequest::Election { name } => {
                 Ok(ReadResponse::Election(self.state.election_get(&name)))
             }
+            ReadRequest::Services => Ok(ReadResponse::Services(self.state.service_names())),
             ReadRequest::Service { service } => {
                 Ok(ReadResponse::Service(self.state.service_list(&service)))
-            }
-            // List reads are served serializably; route them through the local
-            // path even if they reach here.
-            list @ (ReadRequest::KvList { .. } | ReadRequest::ServiceList) => {
-                Ok(self.handle_query_local(list))
-            }
-        }
-    }
-
-    /// Serializable read off local applied state — used for list/range fan-outs.
-    /// No leader gate: every shard replica can answer for its own slice, and the
-    /// fan-out merges them. Only list variants are expected here.
-    fn handle_query_local(&self, request: ReadRequest) -> ReadResponse {
-        match request {
-            ReadRequest::KvList { prefix } => ReadResponse::KvList(self.state.kv_list(&prefix)),
-            ReadRequest::ServiceList => ReadResponse::ServiceList(self.state.service_names()),
-            // A single-key read arriving on the local path: serve it off applied
-            // state too rather than erroring.
-            ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
-            ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
-            ReadRequest::Semaphore { key } => {
-                ReadResponse::Semaphore(self.state.semaphore_get(&key))
-            }
-            ReadRequest::RateLimit { tenant, key } => {
-                ReadResponse::RateLimit(self.state.rate_limit_get(&tenant, &key))
-            }
-            ReadRequest::Schedule { name } => ReadResponse::Schedule(self.state.schedule_get(&name)),
-            ReadRequest::ScheduleHistory { name } => {
-                ReadResponse::ScheduleHistory(self.state.schedule_history(&name))
-            }
-            ReadRequest::Election { name } => {
-                ReadResponse::Election(self.state.election_get(&name))
-            }
-            ReadRequest::Service { service } => {
-                ReadResponse::Service(self.state.service_list(&service))
             }
         }
     }
@@ -1325,6 +1085,7 @@ impl ShardActor {
             leader_id: self.leader_id.clone(),
             commit_index: self.commit_index,
             last_log_index: self.last_log_index(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -1353,8 +1114,8 @@ impl Node {
     ///
     /// Must be called from within a Tokio runtime (it spawns the actor tasks).
     pub fn bootstrap(config: NodeConfig, transport: Transport) -> Self {
+        assert!(config.shard_count > 0, "shard_count must be > 0");
         let transport = Arc::new(transport);
-        let timing = RaftTiming::from_env();
         let mut shards = HashMap::new();
         let mut tasks = Vec::new();
         for shard_id in 0..config.shard_count {
@@ -1362,27 +1123,13 @@ impl Node {
             if let Some(reg) = transport.loopback_registry() {
                 reg.register(&config.node_id, shard_id, tx.clone());
             }
-            // Open durable storage when a data dir is configured. Failing closed
-            // here (panic) is deliberate: a coordination engine that silently
-            // ran without durability would be worse than a visible crashloop.
-            let (store, recovered) = match &config.data_dir {
-                Some(dir) => {
-                    let (s, r) = ShardStore::open(dir, shard_id).unwrap_or_else(|e| {
-                        panic!("fiducia-node: cannot open durable store for shard {shard_id} under {dir:?}: {e}")
-                    });
-                    (Some(s), r)
-                }
-                None => (None, Recovered::default()),
-            };
             let actor = ShardActor::new(
                 shard_id,
                 config.node_id.clone(),
                 config.peers.clone(),
                 transport.clone(),
                 tx.clone(),
-                timing,
-                store,
-                recovered,
+                config.timing,
             );
             tasks.push(tokio::spawn(actor.run(rx)));
             shards.insert(shard_id, tx);
@@ -1412,77 +1159,63 @@ impl Node {
     /// Propose a command to the Raft group of the shard that owns its key. Returns
     /// once the entry **commits** on a quorum (or fast on not-leader/timeout).
     pub async fn propose(&self, command: Command) -> Result<ProposeOutcome, ProposeError> {
-        // Telemetry: capture the op label + routing key BEFORE the command is moved
-        // into the shard actor, so every lock/semaphore/kv write emits one outcome
-        // event with op/key/shard/latency. This single chokepoint covers all writes.
-        let op = command.kind();
-        let routing_key = command.routing_key().to_string();
-        let shard = self.shard_for(&routing_key);
-        let started = std::time::Instant::now();
-        let result = async {
-            let Some(tx) = self.sender(shard) else {
-                return Err(ProposeError::Unavailable { shard });
-            };
-            let (resp, rx) = oneshot::channel();
-            if tx.send(ShardMsg::Propose { command, resp }).await.is_err() {
-                return Err(ProposeError::Unavailable { shard });
-            }
-            match tokio::time::timeout(COMMIT_WAIT, rx).await {
-                Ok(Ok(result)) => result,
-                // Sender dropped (actor gone) or commit timed out.
-                _ => Err(ProposeError::Unavailable { shard }),
-            }
+        let shard = self.shard_for(command.routing_key());
+        let Some(tx) = self.sender(shard) else {
+            return Err(ProposeError::Unavailable { shard });
+        };
+        let (resp, rx) = oneshot::channel();
+        if tx.send(ShardMsg::Propose { command, resp }).await.is_err() {
+            return Err(ProposeError::Unavailable { shard });
         }
-        .await;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
-        match &result {
-            Ok(_) => tracing::info!(
-                op,
-                shard = ?shard,
-                key = %routing_key,
-                elapsed_ms,
-                committed = true,
-                "propose committed"
-            ),
-            Err(ProposeError::NotLeader { leader, .. }) => tracing::debug!(
-                op,
-                shard = ?shard,
-                key = %routing_key,
-                elapsed_ms,
-                leader = leader.as_deref().unwrap_or("unknown"),
-                "propose redirected: this node is not the shard leader"
-            ),
-            Err(ProposeError::Unavailable { .. }) => tracing::warn!(
-                op,
-                shard = ?shard,
-                key = %routing_key,
-                elapsed_ms,
-                "propose unavailable: shard not hosted here or commit lost quorum"
-            ),
+        match tokio::time::timeout(self.config.timing.commit_wait_duration(), rx).await {
+            Ok(Ok(result)) => result,
+            // Sender dropped (actor gone) or commit timed out.
+            _ => Err(ProposeError::Unavailable { shard }),
         }
-        result
     }
 
     /// Serve a single-key read from the owning shard.
     pub async fn query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
-        let routing_key = request.routing_key().to_string();
-        let shard = self.shard_for(&routing_key);
+        let shard = self.shard_for(request.routing_key());
         let Some(tx) = self.sender(shard) else {
-            tracing::debug!(shard = ?shard, key = %routing_key, "query unavailable: shard not hosted here");
             return Err(ProposeError::Unavailable { shard });
         };
         let (resp, rx) = oneshot::channel();
         if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
             return Err(ProposeError::Unavailable { shard });
         }
-        let result = rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }));
-        tracing::debug!(
-            shard = ?shard,
-            key = %routing_key,
-            ok = result.is_ok(),
-            "query served"
-        );
-        result
+        rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }))
+    }
+
+    /// Query every hosted shard for entries under a prefix and merge the partial
+    /// results in deterministic key order.
+    pub async fn query_kv_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<Vec<(String, KvEntry)>, ProposeError> {
+        let mut entries = Vec::new();
+        let mut shards: Vec<_> = self.shards.iter().map(|(shard, tx)| (*shard, tx)).collect();
+        shards.sort_by_key(|(shard, _)| *shard);
+
+        for (shard, tx) in shards {
+            let (resp, rx) = oneshot::channel();
+            let request = ReadRequest::KvPrefix {
+                prefix: prefix.clone(),
+            };
+            if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
+                return Err(ProposeError::Unavailable { shard });
+            }
+            match rx
+                .await
+                .unwrap_or(Err(ProposeError::Unavailable { shard }))?
+            {
+                ReadResponse::KvPrefix(mut shard_entries) => entries.append(&mut shard_entries),
+                _ => return Err(ProposeError::Unavailable { shard }),
+            }
+        }
+
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(entries)
     }
 
     /// Deliver an inbound `AppendEntries` to the owning shard actor.
@@ -1509,9 +1242,7 @@ impl Node {
         rx.await.ok()
     }
 
-    /// Subscribe to the change stream of the shard owning `key` (for a watch).
-    /// Works for any primitive routed by name: a KV key, an election name, or a
-    /// service name all hash to one shard, and the caller filters by scope+key.
+    /// Subscribe to the change stream of the shard owning `key` (for a KV watch).
     pub async fn watch(&self, key: &str) -> Option<broadcast::Receiver<ChangeEvent>> {
         let shard = self.shard_for(key);
         let tx = self.sender(shard)?;
@@ -1520,66 +1251,21 @@ impl Node {
         rx.await.ok()
     }
 
-    /// Fan a serializable read out across **every shard this node hosts**, then
-    /// merge. `make` builds a fresh request per shard ([`ReadRequest`] isn't
-    /// `Clone`). Used for list/range operations that no single shard owns.
-    async fn query_all_shards(
-        &self,
-        make: impl Fn() -> ReadRequest,
-    ) -> Vec<ReadResponse> {
-        let mut out = Vec::with_capacity(self.shards.len());
-        for tx in self.shards.values() {
+    /// Subscribe to every shard hosted by this node. Used by prefix watches
+    /// because keys under one prefix can hash to many shards.
+    pub async fn watch_all(&self) -> Vec<broadcast::Receiver<ChangeEvent>> {
+        let mut receivers = Vec::with_capacity(self.shards.len());
+        let mut shards: Vec<_> = self.shards.iter().map(|(shard, tx)| (*shard, tx)).collect();
+        shards.sort_by_key(|(shard, _)| *shard);
+        for (_, tx) in shards {
             let (resp, rx) = oneshot::channel();
-            if tx
-                .send(ShardMsg::QueryLocal {
-                    request: make(),
-                    resp,
-                })
-                .await
-                .is_ok()
-            {
-                if let Ok(response) = rx.await {
-                    out.push(response);
+            if tx.send(ShardMsg::Subscribe { resp }).await.is_ok() {
+                if let Ok(receiver) = rx.await {
+                    receivers.push(receiver);
                 }
             }
         }
-        out
-    }
-
-    /// Every live KV entry under `prefix`, merged across shards and sorted by key.
-    pub async fn list_kv(&self, prefix: &str) -> Vec<KvListItem> {
-        let mut items: Vec<KvListItem> = self
-            .query_all_shards(|| ReadRequest::KvList {
-                prefix: prefix.to_string(),
-            })
-            .await
-            .into_iter()
-            .filter_map(|r| match r {
-                ReadResponse::KvList(v) => Some(v),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        items.sort_by(|a, b| a.key.cmp(&b.key));
-        items
-    }
-
-    /// Every service with live instances, merged across shards. A service name
-    /// routes to a single shard, so counts don't need de-duping across shards,
-    /// but we still merge defensively in case a name appears more than once.
-    pub async fn list_services(&self) -> Vec<ServiceSummary> {
-        let mut merged: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        for response in self.query_all_shards(|| ReadRequest::ServiceList).await {
-            if let ReadResponse::ServiceList(summaries) = response {
-                for summary in summaries {
-                    *merged.entry(summary.service).or_default() += summary.instances;
-                }
-            }
-        }
-        merged
-            .into_iter()
-            .map(|(service, instances)| ServiceSummary { service, instances })
-            .collect()
+        receivers
     }
 
     /// Per-shard consensus status across all shards this node hosts.
@@ -1594,6 +1280,7 @@ impl Node {
             }
         }
         shards.sort_by_key(|s| s.shard_id);
+        let hosted_shards: Vec<ShardId> = shards.iter().map(|s| s.shard_id).collect();
         let leading_shards: Vec<ShardId> = shards
             .iter()
             .filter(|s| s.role == Role::Leader)
@@ -1608,6 +1295,8 @@ impl Node {
             node_id: self.config.node_id.clone(),
             peers: self.config.peers.clone(),
             shard_count: self.config.shard_count,
+            timing: self.config.timing,
+            hosted_shards,
             leader_count: leading_shards.len(),
             follower_count: following_shards.len(),
             leading_shards,
@@ -1674,6 +1363,10 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 // ---------------------------------------------------------------------------
 // Status + result types.
 // ---------------------------------------------------------------------------
@@ -1687,6 +1380,7 @@ pub struct ShardStatus {
     pub leader_id: Option<String>,
     pub commit_index: u64,
     pub last_log_index: u64,
+    pub metrics: ShardMetrics,
 }
 
 /// Whole-node status: identity, membership, and a row per hosted shard.
@@ -1695,6 +1389,9 @@ pub struct NodeStatus {
     pub node_id: String,
     pub peers: Vec<String>,
     pub shard_count: u32,
+    pub timing: RaftTiming,
+    /// Shards for which this node hosts a local actor.
+    pub hosted_shards: Vec<ShardId>,
     /// Count of hosted shards for which this node is currently leader.
     pub leader_count: usize,
     /// Count of hosted shards for which this node is currently follower.
@@ -1889,8 +1586,7 @@ mod tests {
                 node_id: id.to_string(),
                 peers: peers.iter().map(|s| s.to_string()).collect(),
                 shard_count,
-                // In-memory: the loopback cluster tests don't touch disk.
-                data_dir: None,
+                timing: RaftTiming::default(),
             },
             Transport::loopback(reg.clone()),
         )
@@ -1950,49 +1646,244 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_state_survives_a_restart_via_the_durable_store() {
-        // A single-node group with a real on-disk store. Commit a write, drop the
-        // node (simulating a pod restart), boot a fresh node on the SAME data dir,
-        // and prove the committed value is recovered by log replay — the whole
-        // point of persisting term/vote/log instead of running in memory.
-        let dir = std::env::temp_dir().join(format!(
-            "fiducia-node-restart-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let cfg = || NodeConfig {
-            node_id: "solo".to_string(),
-            peers: vec![],
-            shard_count: 1,
-            data_dir: Some(dir.clone()),
-        };
-
-        {
-            let reg = LoopbackRegistry::new();
-            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
-            let out = n.propose(put("orders/42", "paid")).await.expect("commit");
-            assert!(out.output["ok"].as_bool().unwrap());
-            n.shutdown(None); // simulate the process going away
-        }
-
-        {
-            let reg = LoopbackRegistry::new();
-            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
-            match n
-                .query(ReadRequest::Kv {
-                    key: "orders/42".to_string(),
-                })
-                .await
+    async fn kv_prefix_query_fans_out_across_shards() {
+        let reg = LoopbackRegistry::new();
+        let n = node("solo-prefix", &[], 8, &reg);
+        let mut selected = Vec::new();
+        for i in 0..1_000 {
+            let key = format!("flags/key-{i}");
+            let shard = n.shard_for(&key);
+            if selected
+                .first()
+                .map(|(first_shard, _): &(ShardId, String)| *first_shard != shard)
+                .unwrap_or(true)
             {
-                Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "paid"),
-                other => panic!("committed write was not recovered after restart: {other:?}"),
+                selected.push((shard, key));
+            }
+            if selected.len() == 2 {
+                break;
             }
         }
+        assert_eq!(
+            selected.len(),
+            2,
+            "expected two prefix keys on different shards"
+        );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        for (_, key) in &selected {
+            n.propose(put(key, "kept")).await.expect("commit");
+        }
+        n.propose(put("other/key", "ignored"))
+            .await
+            .expect("commit");
+
+        let entries = n
+            .query_kv_prefix("flags/".to_string())
+            .await
+            .expect("prefix read");
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+        let shards: std::collections::HashSet<_> =
+            entries.iter().map(|(key, _)| n.shard_for(key)).collect();
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|key| key.starts_with("flags/")));
+        assert_eq!(shards.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_prefix_query_reads_committed_snapshots_on_followers() {
+        let reg = LoopbackRegistry::new();
+        let a = node("a", &["b", "c"], 4, &reg);
+        let b = node("b", &["a", "c"], 4, &reg);
+        let c = node("c", &["a", "b"], 4, &reg);
+        let nodes = [&a, &b, &c];
+        let mut selected = Vec::new();
+        for i in 0..1_000 {
+            let key = format!("flags/multi-{i}");
+            let shard = a.shard_for(&key);
+            if selected
+                .first()
+                .map(|(first_shard, _): &(ShardId, String)| *first_shard != shard)
+                .unwrap_or(true)
+            {
+                selected.push((shard, key));
+            }
+            if selected.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(selected.len(), 2);
+
+        for (shard, key) in &selected {
+            let leader_idx = await_leader(&nodes, *shard, 150).await;
+            nodes[leader_idx]
+                .propose(put(key, "kept"))
+                .await
+                .expect("commit prefix key");
+        }
+
+        for n in nodes {
+            let entries = await_prefix_entries(n, "flags/", 2).await;
+            let shards: std::collections::HashSet<_> =
+                entries.iter().map(|(key, _)| n.shard_for(key)).collect();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(shards.len(), 2);
+        }
+    }
+
+    async fn await_prefix_entries(
+        node: &Node,
+        prefix: &str,
+        expected_len: usize,
+    ) -> Vec<(String, KvEntry)> {
+        for _ in 0..100 {
+            let entries = node
+                .query_kv_prefix(prefix.to_string())
+                .await
+                .expect("prefix query should not require every shard to lead locally");
+            if entries.len() == expected_len {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("prefix query did not observe {expected_len} entries");
+    }
+
+    async fn await_all_shards_stable(
+        nodes: &[&Node],
+        shard_count: u32,
+        tries: u32,
+    ) -> Vec<NodeStatus> {
+        let expected_hosted: Vec<_> = (0..shard_count).collect();
+        for _ in 0..tries {
+            let mut statuses = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                statuses.push(node.status().await);
+            }
+
+            let every_node_hosts_every_shard = statuses.iter().all(|status| {
+                status.hosted_shards == expected_hosted
+                    && status.leader_count + status.follower_count == expected_hosted.len()
+            });
+            let every_shard_has_one_leader = (0..shard_count).all(|shard| {
+                statuses
+                    .iter()
+                    .filter(|status| status.leading_shards.contains(&shard))
+                    .count()
+                    == 1
+            });
+
+            if every_node_hosts_every_shard && every_shard_has_one_leader {
+                return statuses;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("shards did not converge to one leader per shard");
+    }
+
+    fn key_for_shard(node: &Node, shard: ShardId, label: &str) -> String {
+        for i in 0..10_000 {
+            let key = format!("{label}/shard-{shard}-{i}");
+            if node.shard_for(&key) == shard {
+                return key;
+            }
+        }
+        panic!("could not find key for shard {shard}");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "shard_count must be > 0")]
+    async fn bootstrap_rejects_zero_shard_count() {
+        let reg = LoopbackRegistry::new();
+        let _ = Node::bootstrap(
+            NodeConfig {
+                node_id: "zero-shards".to_string(),
+                peers: vec![],
+                shard_count: 0,
+                timing: RaftTiming::default(),
+            },
+            Transport::loopback(reg),
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_timing_is_configurable_and_reported_in_status() {
+        let reg = LoopbackRegistry::new();
+        let n = Node::bootstrap(
+            NodeConfig {
+                node_id: "wan-node".to_string(),
+                peers: vec![],
+                shard_count: 1,
+                timing: RaftTiming {
+                    heartbeat_ms: 100,
+                    election_min_ms: 1_000,
+                    election_jitter_ms: 500,
+                    commit_wait_ms: 10_000,
+                },
+            },
+            Transport::loopback(reg),
+        );
+
+        let status = n.status().await;
+        assert_eq!(status.timing.heartbeat_ms, 100);
+        assert_eq!(status.timing.election_min_ms, 1_000);
+        assert_eq!(status.timing.commit_wait_ms, 10_000);
+        assert_eq!(status.hosted_shards, vec![0]);
+        assert_eq!(status.leader_count, 1);
+        assert_eq!(status.follower_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_process_hosts_multiple_leaders_and_followers_across_shards() {
+        let reg = LoopbackRegistry::new();
+        let shard_count = 16;
+        let a = node("a", &["b", "c"], shard_count, &reg);
+        let b = node("b", &["a", "c"], shard_count, &reg);
+        let c = node("c", &["a", "b"], shard_count, &reg);
+        let nodes = [&a, &b, &c];
+
+        let statuses = await_all_shards_stable(&nodes, shard_count, 250).await;
+        let (mixed_idx, mixed_status) = statuses
+            .iter()
+            .enumerate()
+            .find(|(_, status)| status.leader_count >= 2 && status.follower_count >= 2)
+            .expect("expected one process to lead 2+ shards and follow 2+ shards");
+
+        let leading: std::collections::HashSet<_> =
+            mixed_status.leading_shards.iter().copied().collect();
+        let following: std::collections::HashSet<_> =
+            mixed_status.following_shards.iter().copied().collect();
+        assert!(leading.is_disjoint(&following));
+        assert_eq!(leading.len(), mixed_status.leader_count);
+        assert_eq!(following.len(), mixed_status.follower_count);
+        assert_eq!(mixed_status.hosted_shards.len(), shard_count as usize);
+
+        for shard in mixed_status.leading_shards.iter().take(2) {
+            let key = key_for_shard(nodes[mixed_idx], *shard, "multi-leader");
+            let out = nodes[mixed_idx]
+                .propose(put(&key, "leader-write"))
+                .await
+                .expect("local leader shard should commit");
+            assert_eq!(out.shard, *shard);
+        }
+
+        for shard in mixed_status.following_shards.iter().take(2) {
+            let key = key_for_shard(nodes[mixed_idx], *shard, "multi-follower");
+            let err = nodes[mixed_idx]
+                .propose(put(&key, "follower-write"))
+                .await
+                .expect_err("local follower shard should redirect");
+            match err {
+                ProposeError::NotLeader {
+                    shard: actual_shard,
+                    leader,
+                } => {
+                    assert_eq!(actual_shard, *shard);
+                    assert!(leader.is_some());
+                }
+                other => panic!("expected not-leader for follower shard, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2028,6 +1919,15 @@ mod tests {
             .await
             .expect("quorum commit");
         assert!(out.output["ok"].as_bool().unwrap());
+        let leader_status = nodes[leader_idx].status().await;
+        let shard_status = leader_status
+            .shards
+            .iter()
+            .find(|s| s.shard_id == shard)
+            .expect("leader shard status");
+        assert!(shard_status.metrics.append_rtt_ms_last.is_some());
+        assert!(shard_status.metrics.quorum_rtt_ms_last.is_some());
+        assert!(shard_status.metrics.leader_transfer_count >= 1);
 
         // A non-leader rejects the write with a redirect to the leader.
         let follower_idx = (0..3).find(|i| *i != leader_idx).unwrap();
@@ -2036,6 +1936,47 @@ mod tests {
             .await
             .expect_err("follower must redirect");
         assert!(matches!(err, ProposeError::NotLeader { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn member_with_committed_log_rejects_stale_candidate_vote() {
+        let reg = LoopbackRegistry::new();
+        let a = node("a", &["b", "c"], 1, &reg);
+        let b = node("b", &["a", "c"], 1, &reg);
+        let c = node("c", &["a", "b"], 1, &reg);
+        let nodes = [&a, &b, &c];
+
+        let leader_idx = await_leader(&nodes, 0, 150).await;
+        nodes[leader_idx]
+            .propose(put("k", "committed"))
+            .await
+            .expect("quorum commit");
+
+        let status = nodes[leader_idx].status().await;
+        let shard_status = status
+            .shards
+            .iter()
+            .find(|s| s.shard_id == 0)
+            .expect("shard status");
+        assert!(shard_status.last_log_index > 0);
+
+        let vote = nodes[leader_idx]
+            .request_vote(
+                0,
+                RequestVoteReq {
+                    term: shard_status.term + 1,
+                    candidate_id: "stale-candidate".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+            )
+            .await
+            .expect("vote response");
+
+        assert!(
+            !vote.granted,
+            "a member with committed entries must reject a stale candidate"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2072,274 +2013,45 @@ mod tests {
         assert!(out.output["ok"].as_bool().unwrap());
     }
 
-    /// Cluster-wide: poll until **every** shard in `0..shard_count` has settled on
-    /// exactly one leader across `nodes`, or panic. Returns each shard's leader idx.
-    async fn await_all_shards_converged(
-        nodes: &[&Node],
-        shard_count: u32,
-        tries: u32,
-    ) -> Vec<usize> {
-        for _ in 0..tries {
-            // Snapshot every node once per round (status is a per-shard scan).
-            let statuses: Vec<NodeStatus> = {
-                let mut v = Vec::with_capacity(nodes.len());
-                for n in nodes {
-                    v.push(n.status().await);
-                }
-                v
-            };
-            let mut leaders = Vec::with_capacity(shard_count as usize);
-            let mut all_single = true;
-            for shard in 0..shard_count {
-                let holders: Vec<usize> = statuses
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, st)| {
-                        st.shards
-                            .iter()
-                            .any(|s| s.shard_id == shard && s.role == Role::Leader)
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                if holders.len() == 1 {
-                    leaders.push(holders[0]);
-                } else {
-                    all_single = false;
-                    break;
-                }
-            }
-            if all_single {
-                return leaders;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("cluster did not converge to one leader per shard");
-    }
-
-    /// The headline multi-Raft property the node exists to provide: a **single
-    /// process** (one [`Node`]) is simultaneously the **leader of 2+ shards** and a
-    /// **follower of 2+ other shards**, each shard an independent Raft group with
-    /// its own term/log/leader. This is what "1+ leaders and 1+ followers in one
-    /// process" means; the test pins it so a refactor can't quietly collapse the
-    /// per-shard isolation back into a single global Raft group.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn one_process_simultaneously_leads_and_follows_multiple_shards() {
+    async fn leadership_fails_over_when_the_leader_becomes_unresponsive() {
         let reg = LoopbackRegistry::new();
-        // 12 shards over 3 nodes: concentration of all leadership on one node
-        // (the only split with zero mixed-role nodes) has probability
-        // 3·(1/3)^12 ≈ 6e-6, so a mixed-role node is observed deterministically
-        // in practice while the elections stay genuinely independent per shard.
-        let shard_count = 12;
-        let a = node("a", &["b", "c"], shard_count, &reg);
-        let b = node("b", &["a", "c"], shard_count, &reg);
-        let c = node("c", &["a", "b"], shard_count, &reg);
+        let a = node("a", &["b", "c"], 1, &reg);
+        let b = node("b", &["a", "c"], 1, &reg);
+        let c = node("c", &["a", "b"], 1, &reg);
         let nodes = [&a, &b, &c];
 
-        let leader_of_shard = await_all_shards_converged(&nodes, shard_count, 400).await;
-
-        // (1) Exactly one leader per shard, cluster-wide (guaranteed by Raft; the
-        //     convergence helper already enforced it — assert the count again).
-        assert_eq!(leader_of_shard.len(), shard_count as usize);
-
-        // (2) Each node hosts every shard, in exactly one of {leader, follower}
-        //     once converged (no shard left perpetually mid-election).
-        let mut mixed_role_nodes = 0;
-        for n in &nodes {
-            let st = n.status().await;
-            assert_eq!(
-                st.leader_count + st.follower_count,
-                shard_count as usize,
-                "node {} must host all {shard_count} shards as leader or follower",
-                st.node_id,
-            );
-            assert_eq!(
-                st.leading_shards.len(),
-                st.leader_count,
-                "leading_shards must match leader_count"
-            );
-            assert_eq!(
-                st.following_shards.len(),
-                st.follower_count,
-                "following_shards must match follower_count"
-            );
-            if st.leader_count >= 2 && st.follower_count >= 2 {
-                mixed_role_nodes += 1;
-            }
-        }
-        // (3) The headline assertion: at least one single process holds multiple
-        //     leader roles AND multiple follower roles at the same time.
-        assert!(
-            mixed_role_nodes >= 1,
-            "expected a node leading >=2 shards while following >=2 others"
-        );
-
-        // (4) Writes routed to keys owned by different shards each commit through
-        //     that shard's own leader — proving the mixed roles are functional,
-        //     not just a status artifact. Drive enough distinct keys to touch at
-        //     least two different shards led by (potentially) different nodes.
-        let mut shards_written: HashSet<ShardId> = HashSet::new();
-        for i in 0..(shard_count * 2) {
-            let key = format!("orders/{i}");
-            let shard = a.shard_for(&key);
-            let leader_idx = leader_of_shard[shard as usize];
-            let out = nodes[leader_idx]
-                .propose(put(&key, "v"))
-                .await
-                .expect("write commits via the owning shard's leader");
-            assert_eq!(out.shard, shard);
-            assert!(out.output["ok"].as_bool().unwrap());
-            shards_written.insert(shard);
-        }
-        assert!(
-            shards_written.len() >= 2,
-            "writes must commit across multiple independent shards"
-        );
-
-        // (5) A write sent to a NON-leader of its shard is redirected, not served
-        //     by the wrong replica — per-shard leadership is enforced per shard.
-        let shard0_leader = leader_of_shard[0];
-        let key0 = (0..)
-            .map(|i| format!("k/{i}"))
-            .find(|k| a.shard_for(k) == 0)
-            .unwrap();
-        let non_leader = (0..3).find(|i| *i != shard0_leader).unwrap();
-        let err = nodes[non_leader]
-            .propose(put(&key0, "v"))
+        let leader_idx = await_leader(&nodes, 0, 150).await;
+        nodes[leader_idx]
+            .propose(put("k", "before"))
             .await
-            .expect_err("a non-leader of shard 0 must redirect");
-        assert!(matches!(err, ProposeError::NotLeader { shard: 0, .. }));
-    }
+            .expect("write before failover");
 
-    // --- WAN timing + PreVote ---------------------------------------------
+        // Leave the leader registered, but stop its shard actors. Peers still
+        // have a stale address for it, but Raft RPCs get no response.
+        nodes[leader_idx].shutdown(None);
 
-    /// Unset env must reproduce the original LAN constants exactly, so a node that
-    /// configures nothing behaves byte-for-byte as before this change.
-    #[test]
-    fn raft_timing_defaults_match_the_original_lan_constants() {
-        let t = RaftTiming::default();
-        assert_eq!(t.tick, Duration::from_millis(20));
-        assert_eq!(t.heartbeat, Duration::from_millis(50));
-        assert_eq!(t.election_min_ms, 150);
-        assert_eq!(t.election_jitter_ms, 150);
-        assert!(t.pre_vote, "pre-vote on by default");
-        // Defaults are already sane: sanitize is a no-op on them.
-        let s = t.sanitized();
-        assert_eq!(s.tick, t.tick);
-        assert_eq!(s.heartbeat, t.heartbeat);
-        assert_eq!(s.election_min_ms, t.election_min_ms);
-    }
+        let survivors: Vec<&Node> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| *n)
+            .collect();
+        let new_leader = await_leader(&survivors, 0, 200).await;
+        let out = survivors[new_leader]
+            .propose(put("k", "after-unresponsive"))
+            .await
+            .expect("new leader commits while stale node is unresponsive");
+        assert!(out.output["ok"].as_bool().unwrap());
 
-    /// Operator-typo guards: `sanitized` must never return a config that panics
-    /// `tokio::time::interval` or that can't hold a stable leader.
-    #[test]
-    fn raft_timing_sanitized_clamps_degenerate_values() {
-        let timing = |tick, hb, emin| RaftTiming {
-            tick: Duration::from_millis(tick),
-            heartbeat: Duration::from_millis(hb),
-            election_min_ms: emin,
-            election_jitter_ms: 0,
-            pre_vote: true,
-        };
-
-        // Zero tick/heartbeat would panic tokio's interval — floored to 1ms.
-        let t = timing(0, 0, 0).sanitized();
-        assert_eq!(t.tick, Duration::from_millis(1));
-        assert_eq!(t.heartbeat, Duration::from_millis(1));
-        assert!(t.election_min_ms >= 2, "election clamped to >= 2x heartbeat");
-
-        // Tick coarser than the heartbeat is clamped down to the heartbeat.
-        let t = timing(500, 150, 1000).sanitized();
-        assert_eq!(t.tick, Duration::from_millis(150));
-        assert_eq!(t.election_min_ms, 1000, "a sane election timeout is preserved");
-
-        // Election timeout below 2x the heartbeat is clamped up.
-        let t = timing(20, 150, 100).sanitized();
-        assert_eq!(t.election_min_ms, 300, "clamped to 2x heartbeat");
-
-        // A realistic WAN config passes through untouched.
-        let t = timing(20, 150, 1000).sanitized();
-        assert_eq!(t.tick, Duration::from_millis(20));
-        assert_eq!(t.election_min_ms, 1000);
-    }
-
-    /// Build a bare follower shard actor (3-member group) for white-box tests of
-    /// the pre-vote decision. Not wired into any cluster.
-    fn follower_actor() -> ShardActor {
-        let reg = LoopbackRegistry::new();
-        let (tx, _rx) = mpsc::channel(16);
-        ShardActor::new(
-            0,
-            "a".to_string(),
-            vec!["b".to_string(), "c".to_string()],
-            Arc::new(Transport::loopback(reg)),
-            tx,
-            RaftTiming::default(),
-            None,
-            Recovered::default(),
-        )
-    }
-
-    fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {
-        RequestVoteReq {
-            term,
-            candidate_id: "z".to_string(),
-            last_log_index,
-            last_log_term,
-            pre_vote: true,
+        match survivors[new_leader]
+            .query(ReadRequest::Kv {
+                key: "k".to_string(),
+            })
+            .await
+        {
+            Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "after-unresponsive"),
+            other => panic!("unexpected read after unresponsive failover: {other:?}"),
         }
-    }
-
-    /// The anti-disruption property: while a leader is alive (election deadline in
-    /// the future), a pre-vote is **denied** — so a rejoining node can never bump
-    /// the cluster's term. With no leader (or a lapsed deadline) it is granted, so
-    /// genuine elections still proceed.
-    #[test]
-    fn pre_vote_is_denied_under_a_live_leader_and_granted_otherwise() {
-        let mut a = follower_actor();
-
-        // Cold start: no leader known → granted (first election must be able to run).
-        assert!(a.leader_id.is_none());
-        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
-
-        // Healthy leader, contact still fresh → denied (no disruption).
-        a.leader_id = Some("b".to_string());
-        a.last_leader_contact = Instant::now();
-        assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
-        // ...and the round must not have mutated our state (structurally enforced
-        // by `&self`, but assert the observable bits too).
-        assert_eq!(a.current_term, 1);
-        assert_eq!(a.voted_for, None);
-        assert_eq!(a.role, Role::Follower);
-
-        // Leader known but contact has gone stale (missed heartbeats) → granted.
-        a.last_leader_contact = Instant::now() - Duration::from_secs(1);
-        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
-    }
-
-    /// Pre-vote still enforces the two safety checks: a stale would-be term and a
-    /// behind log are both refused even when no leader is alive.
-    #[test]
-    fn pre_vote_refuses_stale_term_and_behind_log() {
-        let mut a = follower_actor();
-        a.leader_id = None; // remove the leader-stickiness clause from the picture
-
-        // Stale would-be term (< our current term) → denied.
-        assert!(!a.handle_pre_vote(&pre_vote_req(0, 0, 0)).granted);
-
-        // We now hold one entry at term 1: a candidate behind on the log is denied,
-        // a caught-up one is granted.
-        a.log.push(LogEntry {
-            term: 1,
-            index: 1,
-            command: None,
-        });
-        assert!(
-            !a.handle_pre_vote(&pre_vote_req(5, 0, 0)).granted,
-            "behind log must be denied"
-        );
-        assert!(
-            a.handle_pre_vote(&pre_vote_req(5, 1, 1)).granted,
-            "caught-up log granted"
-        );
     }
 }

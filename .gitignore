@@ -6,6 +6,3 @@
 !.env.example
 *.log
 .DS_Store
-
-# local isolated build target dirs
-.cargo-target-*/

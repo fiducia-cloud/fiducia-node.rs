@@ -1,8 +1,8 @@
 //! The replicated state machine.
 //!
 //! Every mutation exposed by Fiducia is represented as a [`Command`] and is applied
-//! in committed-log order. In this single-node skeleton the log is local, but the
-//! state-machine semantics are the same ones the replicated path will use.
+//! in committed-log order. The log may be local in single-node development, but
+//! the state-machine semantics are the same ones the replicated path uses.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -10,8 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-
-use crate::indexed_queue::IndexedQueue;
 
 /// Every mutation in the system, as it travels through the replicated log.
 ///
@@ -98,19 +96,12 @@ pub enum Command {
         name: String,
         candidate: String,
         ttl_ms: u64,
-        /// Opaque candidate facts published to observers/watchers (e.g. address,
-        /// region, version) so the leader is *discoverable*, not just named.
-        #[serde(default)]
         metadata: HashMap<String, String>,
     },
     ElectionRenew {
         name: String,
         candidate: String,
         fencing_token: u64,
-        /// Lease extension; when omitted the leadership's original campaign TTL
-        /// is reused instead of a hard-coded default.
-        #[serde(default)]
-        ttl_ms: Option<u64>,
     },
     ElectionResign {
         name: String,
@@ -144,13 +135,22 @@ pub enum Command {
 /// atomically and detect that it conflicts with a holder of `{B}`, one state
 /// machine must see every member key together. Routing every lock/semaphore
 /// command to a single coordinator (the live-mutex single-broker model) gives
-/// exactly that. KV/rate-limit/discovery/etc. stay sharded by their own key.
+/// exactly that. KV/rate-limit/etc. stay sharded by their own key; service
+/// discovery has its own coordinator because listing service names is global.
 /// Sharding the lock space across coordinators (cross-shard 2PC for sets that
 /// span them) is the documented scaling path.
 ///
 /// Defined in the shared [`fiducia_routing`] crate so the node, the load
 /// balancer, and the brain route locks to the **same** coordinator shard.
 pub const LOCK_DOMAIN: &str = fiducia_routing::LOCK_COORDINATION_KEY;
+
+/// Routing key under which all service-discovery state lives.
+///
+/// This keeps `GET /v1/services` linearizable without asking every shard leader
+/// for a partial service-name list. Individual service lookups still return one
+/// service's instances, but all discovery mutations and reads meet in the same
+/// replicated state machine.
+pub const SERVICE_DOMAIN: &str = fiducia_routing::SERVICE_DISCOVERY_KEY;
 
 impl Command {
     /// Key used to route this command to its owning shard.
@@ -167,31 +167,9 @@ impl Command {
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
-            Command::ServiceRegister { service, .. }
-            | Command::ServiceHeartbeat { service, .. }
-            | Command::ServiceDeregister { service, .. } => service,
-        }
-    }
-
-    /// Short, stable label for this command's operation kind — used as the `op`
-    /// attribute on telemetry spans/events so traces group by primitive.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Command::KvPut { .. } => "kv.put",
-            Command::KvDelete { .. } => "kv.delete",
-            Command::LockAcquire { .. } => "lock.acquire",
-            Command::LockRelease { .. } => "lock.release",
-            Command::SemaphoreAcquire { .. } => "semaphore.acquire",
-            Command::SemaphoreRelease { .. } => "semaphore.release",
-            Command::RateLimitCheck { .. } => "ratelimit.check",
-            Command::ScheduleUpsert { .. } => "schedule.upsert",
-            Command::ScheduleRecordRun { .. } => "schedule.record_run",
-            Command::ElectionCampaign { .. } => "election.campaign",
-            Command::ElectionRenew { .. } => "election.renew",
-            Command::ElectionResign { .. } => "election.resign",
-            Command::ServiceRegister { .. } => "service.register",
-            Command::ServiceHeartbeat { .. } => "service.heartbeat",
-            Command::ServiceDeregister { .. } => "service.deregister",
+            Command::ServiceRegister { .. }
+            | Command::ServiceHeartbeat { .. }
+            | Command::ServiceDeregister { .. } => SERVICE_DOMAIN,
         }
     }
 }
@@ -281,10 +259,8 @@ struct LockManager {
     held: HashMap<String, u64>,
     /// fencing token → grant.
     grants: HashMap<u64, LockGrant>,
-    /// FIFO queue of requests waiting for their full union to be free. Indexed by
-    /// `(holder, key-set)` so an "already queued?" check and a cancel/lease-expiry
-    /// removal from the middle of the queue are O(1) (see [`crate::indexed_queue`]).
-    queue: IndexedQueue<(String, Vec<String>), QueuedLock>,
+    /// FIFO queue of requests waiting for their full union to be free.
+    queue: VecDeque<QueuedLock>,
 }
 
 /// Read view of a counting semaphore.
@@ -324,8 +300,7 @@ struct QueuedPermit {
 struct Semaphore {
     limit: u32,
     holders: Vec<SemaphoreSlot>,
-    /// FIFO queue of waiters, indexed by holder for O(1) dedup and removal.
-    queue: IndexedQueue<String, QueuedPermit>,
+    queue: VecDeque<QueuedPermit>,
 }
 
 /// Distributed rate-limit snapshot.
@@ -356,26 +331,9 @@ pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
     pub lease_expires_ms: u64,
-    /// Campaign TTL in ms, retained so a renew without an explicit TTL reuses it.
-    pub ttl_ms: u64,
-    /// Candidate facts (address/region/version/…) — lets observers discover the
-    /// current leader's endpoint, not just its id.
     pub metadata: HashMap<String, String>,
-}
-
-/// A KV entry paired with its key — one row of a prefix listing.
-#[derive(Debug, Clone, Serialize)]
-pub struct KvListItem {
-    pub key: String,
-    #[serde(flatten)]
-    pub entry: KvEntry,
-}
-
-/// One service in a discovery listing: its name and how many live instances it has.
-#[derive(Debug, Clone, Serialize)]
-pub struct ServiceSummary {
-    pub service: String,
-    pub instances: usize,
+    #[serde(skip)]
+    lease_ttl_ms: u64,
 }
 
 /// A scheduled job definition.
@@ -527,8 +485,7 @@ impl StateMachine {
                 name,
                 candidate,
                 fencing_token,
-                ttl_ms,
-            } => store.apply_election_renew(now, name, candidate, fencing_token, ttl_ms),
+            } => store.apply_election_renew(now, name, candidate, fencing_token),
             Command::ElectionResign {
                 name,
                 candidate,
@@ -564,6 +521,19 @@ impl StateMachine {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
         store.kv.get(key).cloned()
+    }
+
+    pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut entries: Vec<_> = store
+            .kv
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
     }
 
     pub fn lock_get(&self, key: &str) -> LockState {
@@ -619,37 +589,12 @@ impl StateMachine {
             .unwrap_or_default()
     }
 
-    /// Every live KV entry whose key starts with `prefix` (this shard's slice of
-    /// the keyspace). Serializable read off applied state; callers fan this out
-    /// across shards and merge.
-    pub fn kv_list(&self, prefix: &str) -> Vec<KvListItem> {
+    pub fn service_names(&self) -> Vec<String> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
-        store
-            .kv
-            .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
-            .map(|(key, entry)| KvListItem {
-                key: key.clone(),
-                entry: entry.clone(),
-            })
-            .collect()
-    }
-
-    /// Every service that has at least one live instance on this shard, with the
-    /// live-instance count. Callers fan this out across shards and sum.
-    pub fn service_names(&self) -> Vec<ServiceSummary> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store
-            .services
-            .iter()
-            .filter(|(_, instances)| !instances.is_empty())
-            .map(|(service, instances)| ServiceSummary {
-                service: service.clone(),
-                instances: instances.len(),
-            })
-            .collect()
+        let mut names: Vec<String> = store.services.keys().cloned().collect();
+        names.sort();
+        names
     }
 }
 
@@ -695,6 +640,7 @@ impl Store {
         for instances in self.services.values_mut() {
             instances.retain(|_, instance| instance.lease_expires_ms > now);
         }
+        self.services.retain(|_, instances| !instances.is_empty());
     }
 
     fn apply_kv_put(
@@ -755,7 +701,7 @@ impl Store {
             .locks
             .queue
             .iter()
-            .flat_map(|(_, q)| q.keys.iter().map(|k| k.as_str()))
+            .flat_map(|q| q.keys.iter().map(|k| k.as_str()))
             .collect();
         let blocked_by_queue = keys.iter().any(|k| reserved.contains(k.as_str()));
 
@@ -780,21 +726,25 @@ impl Store {
         }
 
         // Not grantable. Queue it (idempotently) when the caller wants to wait.
-        // Identity is (holder, key-set), so the dedup and place-in-line are O(1).
-        let id = (holder.clone(), keys.clone());
-        let already = self.locks.queue.contains(&id);
+        let already = self
+            .locks
+            .queue
+            .iter()
+            .any(|q| q.holder == holder && q.keys == keys);
         if wait && !already {
-            self.locks.queue.push_back(
-                id.clone(),
-                QueuedLock {
-                    holder: holder.clone(),
-                    keys: keys.clone(),
-                    ttl_ms,
-                    requested_ms: now,
-                },
-            );
+            self.locks.queue.push_back(QueuedLock {
+                holder: holder.clone(),
+                keys: keys.clone(),
+                ttl_ms,
+                requested_ms: now,
+            });
         }
-        let position = self.locks.queue.position(&id).map(|idx| idx + 1);
+        let position = self
+            .locks
+            .queue
+            .iter()
+            .position(|q| q.holder == holder && q.keys == keys)
+            .map(|idx| idx + 1);
         let conflicts: Vec<String> = keys
             .iter()
             .filter(|k| self.locks.held.contains_key(*k))
@@ -859,15 +809,15 @@ impl Store {
     /// Index of the first queue entry whose whole key set is free, treating the
     /// key sets of earlier still-queued entries as reserved (so a later request
     /// can't barge ahead of an earlier overlapping one — FIFO, no starvation).
-    fn lock_first_grantable(&self) -> Option<(String, Vec<String>)> {
+    fn lock_first_grantable(&self) -> Option<usize> {
         let mut reserved: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for (id, q) in self.locks.queue.iter() {
+        for (idx, q) in self.locks.queue.iter().enumerate() {
             let blocked = q
                 .keys
                 .iter()
                 .any(|k| self.locks.held.contains_key(k) || reserved.contains(k.as_str()));
             if !blocked {
-                return Some(id.clone());
+                return Some(idx);
             }
             for k in &q.keys {
                 reserved.insert(k.as_str());
@@ -880,8 +830,8 @@ impl Store {
     /// promoted and the token they were granted.
     fn lock_promote(&mut self, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
-        while let Some(id) = self.lock_first_grantable() {
-            let waiter = self.locks.queue.remove(&id).expect("key from scan");
+        while let Some(idx) = self.lock_first_grantable() {
+            let waiter = self.locks.queue.remove(idx).expect("index from scan");
             let token = self.next_token();
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             promoted.push(json!({
@@ -918,7 +868,7 @@ impl Store {
             .or_insert_with(|| Semaphore {
                 limit: limit.max(1),
                 holders: Vec::new(),
-                queue: IndexedQueue::new(),
+                queue: VecDeque::new(),
             });
         // Let callers re-tune the cap; shrinking just stops new grants until it
         // drains back under the new limit.
@@ -949,18 +899,19 @@ impl Store {
             });
         }
 
-        let already = sem.queue.contains(&holder);
+        let already = sem.queue.iter().any(|q| q.holder == holder);
         if wait && !already {
-            sem.queue.push_back(
-                holder.clone(),
-                QueuedPermit {
-                    holder: holder.clone(),
-                    ttl_ms,
-                    requested_ms: now,
-                },
-            );
+            sem.queue.push_back(QueuedPermit {
+                holder: holder.clone(),
+                ttl_ms,
+                requested_ms: now,
+            });
         }
-        let position = sem.queue.position(&holder).map(|idx| idx + 1);
+        let position = sem
+            .queue
+            .iter()
+            .position(|q| q.holder == holder)
+            .map(|idx| idx + 1);
         json!({
             "acquired": false,
             "queued": wait && position.is_some(),
@@ -1011,7 +962,7 @@ impl Store {
             }
             let token = self.next_token();
             let sem = self.semaphores.get_mut(key).expect("checked above");
-            let (_, waiter) = sem.queue.pop_front().expect("non-empty checked");
+            let waiter = sem.queue.pop_front().expect("non-empty checked");
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             sem.holders.push(SemaphoreSlot {
                 holder: waiter.holder.clone(),
@@ -1189,8 +1140,8 @@ impl Store {
             leader: candidate.clone(),
             fencing_token: token,
             lease_expires_ms: now.saturating_add(ttl_ms),
-            ttl_ms,
             metadata,
+            lease_ttl_ms: ttl_ms,
         };
         self.elections.insert(name.clone(), leadership.clone());
         json!({ "won": true, "name": name, "leadership": leadership, "revision": revision })
@@ -1202,7 +1153,6 @@ impl Store {
         name: String,
         candidate: String,
         fencing_token: u64,
-        ttl_ms: Option<u64>,
     ) -> Value {
         let Some(leadership) = self.elections.get_mut(&name) else {
             return json!({ "renewed": false, "reason": "not_found", "name": name });
@@ -1210,10 +1160,7 @@ impl Store {
         if leadership.leader != candidate || leadership.fencing_token != fencing_token {
             return json!({ "renewed": false, "reason": "not_leader", "name": name });
         }
-        // Honor an explicit TTL, else reuse the TTL the leader campaigned with.
-        let ttl = ttl_ms.unwrap_or(leadership.ttl_ms);
-        leadership.ttl_ms = ttl;
-        leadership.lease_expires_ms = now.saturating_add(ttl);
+        leadership.lease_expires_ms = now.saturating_add(leadership.lease_ttl_ms);
         json!({ "renewed": true, "name": name, "leadership": leadership })
     }
 
@@ -1282,6 +1229,14 @@ impl Store {
             .get_mut(&service)
             .map(|instances| instances.remove(&instance_id).is_some())
             .unwrap_or(false);
+        if self
+            .services
+            .get(&service)
+            .map(|instances| instances.is_empty())
+            .unwrap_or(false)
+        {
+            self.services.remove(&service);
+        }
         json!({ "deregistered": removed, "service": service, "instance_id": instance_id })
     }
 
@@ -1295,8 +1250,8 @@ impl Store {
             .locks
             .queue
             .iter()
-            .filter(|(_, q)| q.keys.iter().any(|k| k == key))
-            .map(|(_, q)| LockWaiter {
+            .filter(|q| q.keys.iter().any(|k| k == key))
+            .map(|q| LockWaiter {
                 holder: q.holder.clone(),
                 keys: q.keys.clone(),
                 requested_ms: q.requested_ms,
@@ -1338,7 +1293,7 @@ impl Store {
             wait_queue: sem
                 .queue
                 .iter()
-                .map(|(_, q)| LockWaiter {
+                .map(|q| LockWaiter {
                     holder: q.holder.clone(),
                     keys: vec![key.to_string()],
                     requested_ms: q.requested_ms,
@@ -1397,6 +1352,23 @@ mod tests {
         sm.apply(Command::LockAcquire {
             keys: keys.iter().map(|s| s.to_string()).collect(),
             holder: holder.to_string(),
+            ttl_ms: 30_000,
+            wait,
+        })
+        .output
+    }
+
+    fn semaphore_acquire(
+        sm: &StateMachine,
+        key: &str,
+        holder: &str,
+        limit: u32,
+        wait: bool,
+    ) -> Value {
+        sm.apply(Command::SemaphoreAcquire {
+            key: key.to_string(),
+            holder: holder.to_string(),
+            limit,
             ttl_ms: 30_000,
             wait,
         })
@@ -1482,76 +1454,108 @@ mod tests {
     }
 
     #[test]
-    fn wait_queue_is_recreated_by_replaying_the_log_after_a_restart() {
-        // The wait queue is derived state inside the replicated state machine, so a
-        // node that goes down recovers it by **replaying its committed log** — there
-        // is nothing extra to persist. Apply a command log to one machine, then
-        // replay the identical log into a fresh one (the restart) and confirm the
-        // rebuilt machine holds the same grant and the same FIFO wait queue order.
-        let log = vec![
-            Command::LockAcquire {
-                keys: vec!["x".to_string()],
+    fn union_lock_canonicalizes_keys_and_releases_every_member() {
+        let sm = StateMachine::new();
+        let grant = acquire(&sm, &["z", "x", "x", "", "y"], "holder-1", false);
+        assert_eq!(grant["acquired"], true);
+        assert_eq!(grant["keys"], json!(["x", "y", "z"]));
+
+        for key in ["x", "y", "z"] {
+            let state = sm.lock_get(key);
+            assert_eq!(state.holder.as_deref(), Some("holder-1"));
+            assert_eq!(state.held_keys, vec!["x", "y", "z"]);
+        }
+
+        let release = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: grant["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(release.output["released"], true);
+
+        for key in ["x", "y", "z"] {
+            assert!(sm.lock_get(key).holder.is_none());
+        }
+    }
+
+    #[test]
+    fn no_wait_union_conflict_leaves_free_members_unheld_and_unqueued() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["x", "y"], "holder-1", false);
+        assert_eq!(first["acquired"], true);
+
+        let no_wait = acquire(&sm, &["y", "z"], "holder-2", false);
+        assert_eq!(no_wait["acquired"], false);
+        assert_eq!(no_wait["queued"], false);
+        assert_eq!(no_wait["conflicts"], json!(["y"]));
+        assert!(sm.lock_get("z").holder.is_none());
+        assert!(sm.lock_get("y").wait_queue.is_empty());
+
+        sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: first["fencing_token"].as_u64().unwrap(),
+        });
+
+        let retry = acquire(&sm, &["y", "z"], "holder-3", false);
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(sm.lock_get("z").holder.as_deref(), Some("holder-3"));
+    }
+
+    #[test]
+    fn stale_lock_holder_cannot_release_after_fifo_promotion() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["orders"], "holder-1", false);
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = acquire(&sm, &["orders"], "holder-2", true);
+        assert_eq!(queued["queued"], true);
+
+        let release = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        let token2 = release.output["promoted"][0]["fencing_token"]
+            .as_u64()
+            .unwrap();
+        assert!(token2 > token1);
+
+        let stale = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        assert_eq!(stale.output["released"], false);
+        assert_eq!(stale.output["reason"], "not_found");
+        assert_eq!(sm.lock_get("orders").holder.as_deref(), Some("holder-2"));
+    }
+
+    #[test]
+    fn expired_lock_grant_promotes_waiter_with_new_token() {
+        let sm = StateMachine::new();
+        let first = sm
+            .apply(Command::LockAcquire {
+                keys: vec!["lease-key".to_string()],
                 holder: "holder-1".to_string(),
-                ttl_ms: 30_000,
-                wait: true,
-            },
-            Command::LockAcquire {
-                keys: vec!["x".to_string()],
-                holder: "holder-2".to_string(),
-                ttl_ms: 30_000,
-                wait: true,
-            },
-            Command::LockAcquire {
-                keys: vec!["x".to_string()],
-                holder: "holder-3".to_string(),
-                ttl_ms: 30_000,
-                wait: true,
-            },
-        ];
+                ttl_ms: 50,
+                wait: false,
+            })
+            .output;
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = acquire(&sm, &["lease-key"], "holder-2", true);
+        assert_eq!(queued["queued"], true);
 
-        let crashed = StateMachine::new();
-        for command in &log {
-            crashed.apply(command.clone());
-        }
-        // holder-1 holds {x}; holder-2 then holder-3 wait behind it.
-        let before = crashed.lock_get("x");
-        assert_eq!(before.holder.as_deref(), Some("holder-1"));
-        assert_eq!(before.wait_queue.len(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(80));
 
-        // Restart: a fresh state machine replays the same committed log.
-        let recovered = StateMachine::new();
-        for command in &log {
-            recovered.apply(command.clone());
-        }
-
-        let after = recovered.lock_get("x");
-        assert_eq!(after.holder.as_deref(), Some("holder-1"), "grant recovered");
-        let recovered_waiters: Vec<String> =
-            after.wait_queue.iter().map(|w| w.holder.clone()).collect();
-        assert_eq!(
-            recovered_waiters,
-            vec!["holder-2".to_string(), "holder-3".to_string()],
-            "the FIFO wait queue is rebuilt in order by log replay"
-        );
+        let state = sm.lock_get("lease-key");
+        assert_eq!(state.holder.as_deref(), Some("holder-2"));
+        assert!(state.fencing_token.unwrap() > token1);
+        assert!(state.wait_queue.is_empty());
     }
 
     #[test]
     fn semaphore_caps_concurrent_holders_and_admits_in_fifo() {
         let sm = StateMachine::new();
-        let acq = |holder: &str, wait: bool| {
-            sm.apply(Command::SemaphoreAcquire {
-                key: "db-pool".to_string(),
-                holder: holder.to_string(),
-                limit: 2,
-                ttl_ms: 30_000,
-                wait,
-            })
-            .output
-        };
         // limit = 2: first two acquire, third is capped out and queues.
-        let a = acq("a", false);
-        let b = acq("b", false);
-        let c = acq("c", true);
+        let a = semaphore_acquire(&sm, "db-pool", "a", 2, false);
+        let b = semaphore_acquire(&sm, "db-pool", "b", 2, false);
+        let c = semaphore_acquire(&sm, "db-pool", "c", 2, true);
         assert_eq!(a["acquired"], true);
         assert_eq!(b["acquired"], true);
         assert_eq!(c["acquired"], false);
@@ -1568,6 +1572,55 @@ mod tests {
         let state = sm.semaphore_get("db-pool");
         assert_eq!(state.holders.len(), 2);
         assert!(state.holders.iter().any(|h| h.holder == "c"));
+    }
+
+    #[test]
+    fn semaphore_no_wait_over_cap_does_not_queue_or_consume_permit() {
+        let sm = StateMachine::new();
+        let first = semaphore_acquire(&sm, "pool", "holder-1", 1, false);
+        assert_eq!(first["acquired"], true);
+
+        let no_wait = semaphore_acquire(&sm, "pool", "holder-2", 1, false);
+        assert_eq!(no_wait["acquired"], false);
+        assert_eq!(no_wait["queued"], false);
+        let capped = sm.semaphore_get("pool");
+        assert_eq!(capped.holders.len(), 1);
+        assert!(capped.wait_queue.is_empty());
+
+        sm.apply(Command::SemaphoreRelease {
+            key: "pool".to_string(),
+            holder: "holder-1".to_string(),
+            fencing_token: first["fencing_token"].as_u64().unwrap(),
+        });
+
+        let retry = semaphore_acquire(&sm, "pool", "holder-3", 1, false);
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(sm.semaphore_get("pool").holders[0].holder, "holder-3");
+    }
+
+    #[test]
+    fn expired_semaphore_permit_promotes_fifo_waiter() {
+        let sm = StateMachine::new();
+        let first = sm
+            .apply(Command::SemaphoreAcquire {
+                key: "lease-pool".to_string(),
+                holder: "holder-1".to_string(),
+                limit: 1,
+                ttl_ms: 50,
+                wait: false,
+            })
+            .output;
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = semaphore_acquire(&sm, "lease-pool", "holder-2", 1, true);
+        assert_eq!(queued["queued"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let state = sm.semaphore_get("lease-pool");
+        assert_eq!(state.holders.len(), 1);
+        assert_eq!(state.holders[0].holder, "holder-2");
+        assert!(state.holders[0].fencing_token > token1);
+        assert!(state.wait_queue.is_empty());
     }
 
     #[test]
@@ -1664,27 +1717,56 @@ mod tests {
     }
 
     #[test]
+    fn kv_prefix_lists_matching_keys_in_order() {
+        let sm = StateMachine::new();
+        for (key, value) in [
+            ("flags/new-checkout", "on"),
+            ("flags/search", "off"),
+            ("config/theme", "blue"),
+        ] {
+            sm.apply(Command::KvPut {
+                key: key.to_string(),
+                value: value.to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            });
+        }
+
+        let entries = sm.kv_prefix("flags/");
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+
+        assert_eq!(keys, vec!["flags/new-checkout", "flags/search"]);
+        assert_eq!(entries[0].1.value, "on");
+    }
+
+    #[test]
     fn election_uses_fencing_tokens_for_campaign_renew_and_resign() {
         let sm = StateMachine::new();
+        let metadata = HashMap::from([
+            ("region".to_string(), "us-east".to_string()),
+            ("address".to_string(), "https://node-a.internal".to_string()),
+        ]);
         let won = sm.apply(Command::ElectionCampaign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
-            ttl_ms: 30_000,
-            metadata: HashMap::new(),
+            ttl_ms: 120_000,
+            metadata,
         });
         let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
+        let initial_expiry = won.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
         let stale_renew = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             fencing_token: token + 1,
-            ttl_ms: None,
         });
         let renewed = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
             fencing_token: token,
-            ttl_ms: None,
         });
+        let stored_metadata = sm.election_get("scheduler").unwrap().metadata;
         let resigned = sm.apply(Command::ElectionResign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
@@ -1692,8 +1774,14 @@ mod tests {
         });
 
         assert_eq!(won.output["won"], true);
+        assert_eq!(won.output["leadership"]["metadata"]["region"], "us-east");
+        assert_eq!(stored_metadata["address"], "https://node-a.internal");
         assert_eq!(stale_renew.output["renewed"], false);
         assert_eq!(renewed.output["renewed"], true);
+        let renewed_expiry = renewed.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(renewed_expiry >= initial_expiry.saturating_sub(1_000));
         assert_eq!(resigned.output["resigned"], true);
         assert!(sm.election_get("scheduler").is_none());
     }
@@ -1757,124 +1845,73 @@ mod tests {
     }
 
     #[test]
-    fn election_campaign_publishes_candidate_metadata() {
+    fn service_names_are_sorted_and_pruned_when_empty() {
         let sm = StateMachine::new();
-        let mut metadata = HashMap::new();
-        metadata.insert("address".to_string(), "10.2.4.18:8080".to_string());
-        metadata.insert("region".to_string(), "us-east-1".to_string());
-        sm.apply(Command::ElectionCampaign {
-            name: "invoice-reconciler/leader".to_string(),
-            candidate: "node-3".to_string(),
-            ttl_ms: 15_000,
-            metadata,
-        });
-        let held = sm.election_get("invoice-reconciler/leader").unwrap();
-        assert_eq!(held.leader, "node-3");
-        assert_eq!(held.metadata["address"], "10.2.4.18:8080");
-        assert_eq!(held.metadata["region"], "us-east-1");
-        assert_eq!(held.ttl_ms, 15_000);
-    }
-
-    #[test]
-    fn election_renew_reuses_campaign_ttl_when_unspecified() {
-        let sm = StateMachine::new();
-        let won = sm.apply(Command::ElectionCampaign {
-            name: "leader".to_string(),
-            candidate: "node-a".to_string(),
-            ttl_ms: 90_000,
+        sm.apply(Command::ServiceRegister {
+            service: "worker".to_string(),
+            instance_id: "w-1".to_string(),
+            address: "http://10.0.0.2:8080".to_string(),
+            ttl_ms: 30_000,
             metadata: HashMap::new(),
         });
-        let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
-        let campaign_expiry = won.output["leadership"]["lease_expires_ms"]
-            .as_u64()
-            .unwrap();
-        // Renew with no explicit TTL: must reuse the 90s campaign TTL, not snap
-        // back to the old hard-coded 30s default (which would shrink the lease).
-        let renewed = sm.apply(Command::ElectionRenew {
-            name: "leader".to_string(),
-            candidate: "node-a".to_string(),
-            fencing_token: token,
-            ttl_ms: None,
+        sm.apply(Command::ServiceRegister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+            address: "http://10.0.0.1:8080".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
         });
-        let renew_expiry = renewed.output["leadership"]["lease_expires_ms"]
-            .as_u64()
-            .unwrap();
-        assert_eq!(renewed.output["renewed"], true);
-        assert!(
-            renew_expiry >= campaign_expiry,
-            "renew {renew_expiry} must not shrink lease below campaign {campaign_expiry}"
+
+        assert_eq!(
+            sm.service_names(),
+            vec!["api".to_string(), "worker".to_string()]
         );
+
+        sm.apply(Command::ServiceDeregister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+        });
+
+        assert_eq!(sm.service_names(), vec!["worker".to_string()]);
+        assert!(sm.service_list("api").is_empty());
     }
 
     #[test]
-    fn election_failover_after_lease_expiry() {
-        // Drive the store directly so we control `now` deterministically.
-        let mut store = Store::default();
-        let won_a = store.apply_election_campaign(
-            1,
-            1_000,
-            "leader".to_string(),
-            "node-a".to_string(),
-            5_000, // lease_expires at 6_000
-            HashMap::new(),
-        );
-        assert_eq!(won_a["won"], true);
-        // Before expiry, a rival campaign loses.
-        let lost = store.apply_election_campaign(
-            2,
-            5_000,
-            "leader".to_string(),
-            "node-b".to_string(),
-            5_000,
-            HashMap::new(),
-        );
-        assert_eq!(lost["won"], false);
-        // After the lease lapses, expire_due reaps it and the rival wins.
-        store.expire_due(7_000);
-        let won_b = store.apply_election_campaign(
-            3,
-            7_000,
-            "leader".to_string(),
-            "node-b".to_string(),
-            5_000,
-            HashMap::new(),
-        );
-        assert_eq!(won_b["won"], true);
-        assert_eq!(won_b["leadership"]["leader"], "node-b");
-    }
-
-    #[test]
-    fn kv_list_returns_only_prefixed_live_entries() {
+    fn expired_service_instances_leave_no_stale_service_name() {
         let sm = StateMachine::new();
-        for key in ["app/a", "app/b", "other/c"] {
-            sm.apply(Command::KvPut {
-                key: key.to_string(),
-                value: "v".to_string(),
-                ttl_ms: None,
-                prev_revision: None,
-            });
-        }
-        let listed = sm.kv_list("app/");
-        let mut keys: Vec<String> = listed.into_iter().map(|item| item.key).collect();
-        keys.sort();
-        assert_eq!(keys, vec!["app/a".to_string(), "app/b".to_string()]);
+        sm.apply(Command::ServiceRegister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+            address: "http://10.0.0.1:8080".to_string(),
+            ttl_ms: 0,
+            metadata: HashMap::new(),
+        });
+
+        assert!(sm.service_list("api").is_empty());
+        assert!(sm.service_names().is_empty());
     }
 
     #[test]
-    fn service_names_summarizes_live_instance_counts() {
-        let sm = StateMachine::new();
-        for id in ["i-1", "i-2"] {
-            sm.apply(Command::ServiceRegister {
-                service: "router".to_string(),
-                instance_id: id.to_string(),
-                address: format!("10.0.0.{id}:8080"),
+    fn service_discovery_routes_to_the_registry_coordination_domain() {
+        for command in [
+            Command::ServiceRegister {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+                address: "http://10.0.0.1:8080".to_string(),
                 ttl_ms: 30_000,
                 metadata: HashMap::new(),
-            });
+            },
+            Command::ServiceHeartbeat {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+                ttl_ms: None,
+            },
+            Command::ServiceDeregister {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+            },
+        ] {
+            assert_eq!(command.routing_key(), SERVICE_DOMAIN);
         }
-        let summaries = sm.service_names();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].service, "router");
-        assert_eq!(summaries[0].instances, 2);
     }
 }

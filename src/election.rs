@@ -1,4 +1,4 @@
-//! Leader-election API (skeleton handlers).
+//! Leader-election API.
 //!
 //! Lets *clients* run their own leader elections on top of Fiducia: campaign for
 //! a named leadership, hold it via a TTL lease, and observe who currently holds
@@ -11,7 +11,7 @@
 //! `name`.
 //!
 //! Routes (mounted under `/v1/elections`):
-//!   * `POST /v1/elections/{name}/campaign` — `{ "candidate", "ttl_ms" }`
+//!   * `POST /v1/elections/{name}/campaign` — `{ "candidate", "ttl_ms", "metadata"? }`
 //!   * `POST /v1/elections/{name}/renew`    — `{ "candidate", "fencing_token" }`
 //!   * `POST /v1/elections/{name}/resign`   — `{ "candidate", "fencing_token" }`
 //!   * `GET  /v1/elections/{name}`          — observe the current leader
@@ -43,25 +43,13 @@ use crate::state::Command;
 pub struct CampaignBody {
     pub candidate: String,
     pub ttl_ms: u64,
-    /// Optional candidate facts (address, region, version, …) published with the
-    /// leadership so observers/watchers can discover the leader's endpoint.
-    #[serde(default)]
-    pub metadata: HashMap<String, String>,
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct HoldBody {
     pub candidate: String,
     pub fencing_token: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RenewBody {
-    pub candidate: String,
-    pub fencing_token: u64,
-    /// Optional new lease TTL; when omitted the original campaign TTL is reused.
-    #[serde(default)]
-    pub ttl_ms: Option<u64>,
 }
 
 pub fn router() -> Router<Arc<Node>> {
@@ -85,7 +73,7 @@ async fn campaign(
             name,
             candidate: body.candidate,
             ttl_ms: body.ttl_ms,
-            metadata: body.metadata,
+            metadata: body.metadata.unwrap_or_default(),
         })
         .await;
     propose_response(result, &uri)
@@ -96,14 +84,13 @@ async fn renew(
     State(node): State<Arc<Node>>,
     uri: Uri,
     Path(name): Path<String>,
-    Json(body): Json<RenewBody>,
+    Json(body): Json<HoldBody>,
 ) -> Response {
     let result = node
         .propose(Command::ElectionRenew {
             name,
             candidate: body.candidate,
             fencing_token: body.fencing_token,
-            ttl_ms: body.ttl_ms,
         })
         .await;
     propose_response(result, &uri)
@@ -144,19 +131,14 @@ async fn observe(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<Strin
 }
 
 /// `GET /v1/elections/{name}/watch` — SSE stream of leadership changes.
-///
-/// Subscribes to the owning shard's change broadcast and emits one SSE event per
-/// committed `elected`/`renewed`/`resigned` for this election. A client watches
-/// this to learn, e.g., that the old leader's lease lapsed and a new candidate
-/// won — then re-routes to the new leader without polling.
 async fn watch(State(node): State<Arc<Node>>, Path(name): Path<String>) -> Response {
     let Some(rx) = node.watch(&name).await else {
         return Json(json!({ "error": "unavailable", "op": "election.watch", "name": name }))
             .into_response();
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let event = item.ok()?; // drop lag/closed notifications
-        if event.scope != "election" || event.key != name {
+        let event = item.ok()?;
+        if event.key != name {
             return None;
         }
         Some(Ok::<Event, Infallible>(
