@@ -182,7 +182,10 @@ impl Command {
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
             | Command::RateLimitCheck { key, .. } => key,
-            Command::ScheduleUpsert { name, .. } | Command::ScheduleRecordRun { name, .. } => name,
+            Command::ScheduleUpsert { name, .. }
+            | Command::ScheduleRecordRun { name, .. }
+            | Command::ScheduleClaimFire { name, .. }
+            | Command::ScheduleRecordResult { name, .. } => name,
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
