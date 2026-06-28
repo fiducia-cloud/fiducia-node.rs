@@ -17,17 +17,24 @@
 //!   * `GET  /v1/elections/{name}`          — observe the current leader
 //!   * `GET  /v1/elections/{name}/watch`    — SSE stream of leadership changes
 
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::Uri,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
@@ -36,12 +43,25 @@ use crate::state::Command;
 pub struct CampaignBody {
     pub candidate: String,
     pub ttl_ms: u64,
+    /// Optional candidate facts (address, region, version, …) published with the
+    /// leadership so observers/watchers can discover the leader's endpoint.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct HoldBody {
     pub candidate: String,
     pub fencing_token: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenewBody {
+    pub candidate: String,
+    pub fencing_token: u64,
+    /// Optional new lease TTL; when omitted the original campaign TTL is reused.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
 }
 
 pub fn router() -> Router<Arc<Node>> {
