@@ -732,8 +732,43 @@ impl ShardActor {
         if leader.is_some() {
             self.leader_id = leader;
         }
+        self.persist_hard_state();
         self.reset_election_deadline();
         self.fail_pending();
+    }
+
+    // --- durability: persist before acting (no-ops for an in-memory shard) ----
+
+    /// Persist `current_term`, `voted_for`, and `commit_index`. Call after any
+    /// change to them and **before** the action that relies on them (granting a
+    /// vote, campaigning, committing). A persist failure is logged, not hidden —
+    /// it means we may be running without the durability the caller assumes.
+    fn persist_hard_state(&mut self) {
+        if let Some(store) = self.store.as_ref() {
+            if let Err(e) =
+                store.save_meta(self.current_term, self.voted_for.as_deref(), self.commit_index)
+            {
+                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist hard state");
+            }
+        }
+    }
+
+    /// Persist newly-appended tail entries (pure-append path).
+    fn persist_log_append(&mut self) {
+        if let Some(store) = self.store.as_mut() {
+            if let Err(e) = store.append_tail(&self.log) {
+                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log append");
+            }
+        }
+    }
+
+    /// Persist the full log after a conflicting suffix was truncated/replaced.
+    fn persist_log_rewrite(&mut self) {
+        if let Some(store) = self.store.as_mut() {
+            if let Err(e) = store.rewrite(&self.log) {
+                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log rewrite");
+            }
+        }
     }
 
     fn fail_pending(&mut self) {
