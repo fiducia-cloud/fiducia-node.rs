@@ -363,7 +363,7 @@ impl ReadRequest {
             ReadRequest::Service { service } => service,
             // List reads fan out across all shards rather than routing to one.
             ReadRequest::KvList { prefix } => prefix,
-            ReadRequest::ServiceList => "",
+            ReadRequest::ServiceList | ReadRequest::ScheduleList => "",
         }
     }
 }
