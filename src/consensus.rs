@@ -133,6 +133,11 @@ pub struct RaftTiming {
     pub election_jitter_ms: u64,
     /// Client write wait for quorum commit before returning unavailable.
     pub commit_wait_ms: u64,
+    /// PreVote (Raft thesis §9.6): run a non-binding straw poll before
+    /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
+    /// leader on rejoin. Strictly safer on a WAN; on by default. Disable with
+    /// `FIDUCIA_RAFT_PREVOTE=off`.
+    pub pre_vote: bool,
 }
 
 impl RaftTiming {
