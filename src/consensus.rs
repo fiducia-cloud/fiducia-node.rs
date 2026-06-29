@@ -2333,12 +2333,8 @@ mod tests {
                 node_id: id.to_string(),
                 peers: peers.iter().map(|s| s.to_string()).collect(),
                 shard_count,
-<<<<<<< HEAD
                 // In-memory: the loopback cluster tests don't touch disk.
                 data_dir: None,
-=======
-                timing: RaftTiming::default(),
->>>>>>> origin/main
             },
             Transport::loopback(reg.clone()),
         )
