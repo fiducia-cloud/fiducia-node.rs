@@ -2079,7 +2079,9 @@ mod tests {
             vec!["holder-2".to_string(), "holder-3".to_string()],
             "the FIFO wait queue is rebuilt in order by log replay"
         );
-=======
+    }
+
+    #[test]
     fn union_lock_canonicalizes_keys_and_releases_every_member() {
         let sm = StateMachine::new();
         let grant = acquire(&sm, &["z", "x", "x", "", "y"], "holder-1", false);
