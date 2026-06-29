@@ -61,7 +61,6 @@ pub fn router() -> Router<Arc<Node>> {
         )
 }
 
-<<<<<<< HEAD
 /// `GET /v1/services` — list known service names with their live-instance counts.
 ///
 /// Services span shards, so this fans a serializable read out across every shard
@@ -69,17 +68,6 @@ pub fn router() -> Router<Arc<Node>> {
 async fn list_services(State(node): State<Arc<Node>>) -> Response {
     let services = node.list_services().await;
     Json(json!({ "count": services.len(), "services": services })).into_response()
-=======
-/// `GET /v1/services` — list known service names.
-async fn list_services(State(node): State<Arc<Node>>, uri: Uri) -> Response {
-    match node.query(ReadRequest::Services).await {
-        Ok(ReadResponse::Services(services)) => {
-            Json(json!({ "services": services })).into_response()
-        }
-        Err(err) => read_error_response(err, &uri),
-        _ => Json(json!({ "error": "unavailable" })).into_response(),
-    }
->>>>>>> origin/main
 }
 
 /// `GET /v1/services/{service}` — list live instances, optionally filtered by
