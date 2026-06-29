@@ -770,15 +770,9 @@ impl ShardActor {
         self.solicit_votes(self.current_term, false);
     }
 
-<<<<<<< HEAD
     /// Send `RequestVote` (real or pre-vote) to every peer for `term`, routing
     /// each reply back into our own inbox as a `VoteReply` tagged with `pre_vote`
     /// so it is counted toward the right round.
-=======
-    /// Send `RequestVote` (real or pre-vote) to every peer for `term`, routing each
-    /// reply back into our own inbox as a `VoteReply` tagged with `pre_vote` so it
-    /// is counted toward the right round.
->>>>>>> origin/main
     fn solicit_votes(&self, term: u64, pre_vote: bool) {
         let req = RequestVoteReq {
             term,
