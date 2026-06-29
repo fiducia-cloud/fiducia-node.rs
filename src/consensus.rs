@@ -3176,16 +3176,10 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     /// The anti-disruption property: while a leader is alive (election deadline in
     /// the future), a pre-vote is **denied** — so a rejoining node can never bump
     /// the cluster's term. With no leader (or a lapsed deadline) it is granted, so
     /// genuine elections still proceed.
-=======
-    /// The anti-disruption property: while a leader is alive (recent contact), a
-    /// pre-vote is denied — so a rejoining node can't bump the cluster's term —
-    /// but with no leader (or stale contact) it is granted so failover proceeds.
->>>>>>> origin/main
     #[test]
     fn pre_vote_is_denied_under_a_live_leader_and_granted_otherwise() {
         let mut a = follower_actor();
