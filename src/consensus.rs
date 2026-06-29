@@ -3203,11 +3203,7 @@ mod tests {
         assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
     }
 
-<<<<<<< HEAD
     /// Pre-vote still enforces the two safety checks: a stale would-be term and a
-=======
-    /// Pre-vote still enforces the safety checks: a stale would-be term and a
->>>>>>> origin/main
     /// behind log are both refused even when no leader is alive.
     #[test]
     fn pre_vote_refuses_stale_term_and_behind_log() {
