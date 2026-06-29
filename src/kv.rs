@@ -150,7 +150,6 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
-<<<<<<< HEAD
         if event.scope != "kv" {
             return None; // ignore election/service changes on the shared shard stream
         }
@@ -160,9 +159,6 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
             event.key == key
         };
         if !matches {
-=======
-        if !is_kv_change(event.kind) || event.key != key {
->>>>>>> origin/main
             return None;
         }
         Some(Ok::<Event, Infallible>(
