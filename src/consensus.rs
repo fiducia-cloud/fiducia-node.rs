@@ -1678,13 +1678,9 @@ impl Node {
                 config.peers.clone(),
                 transport.clone(),
                 tx.clone(),
-<<<<<<< HEAD
                 timing,
                 store,
                 recovered,
-=======
-                config.timing,
->>>>>>> origin/main
             );
             tasks.push(tokio::spawn(actor.run(rx)));
             shards.insert(shard_id, tx);
