@@ -1398,15 +1398,11 @@ impl ShardActor {
         }
     }
 
-<<<<<<< HEAD
     fn publish_change(&self, command: &Command, output: &serde_json::Value, revision: u64) {
         // Only publish changes that actually mutated state: a campaign that lost
         // or a renew by a stale token must not look like a leadership change.
         let flagged = |field: &str| output.get(field).and_then(|v| v.as_bool()).unwrap_or(false);
         let detail = |field: &str| output.get(field).cloned();
-=======
-    fn publish_change(&self, command: &Command, revision: u64, output: &Value) {
->>>>>>> origin/main
         let event = match command {
             Command::KvPut { key, .. } => Some(ChangeEvent {
                 scope: "kv",
