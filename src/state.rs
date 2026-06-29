@@ -1637,14 +1637,10 @@ impl Store {
         if leadership.leader != candidate || leadership.fencing_token != fencing_token {
             return json!({ "renewed": false, "reason": "not_leader", "name": name });
         }
-<<<<<<< HEAD
         // Honor an explicit TTL, else reuse the TTL the leader campaigned with.
         let ttl = ttl_ms.unwrap_or(leadership.ttl_ms);
         leadership.ttl_ms = ttl;
         leadership.lease_expires_ms = now.saturating_add(ttl);
-=======
-        leadership.lease_expires_ms = now.saturating_add(leadership.lease_ttl_ms);
->>>>>>> origin/main
         json!({ "renewed": true, "name": name, "leadership": leadership })
     }
 
