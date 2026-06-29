@@ -1487,7 +1487,8 @@ impl ShardActor {
         // there by contract.
         if !matches!(
             request,
-            ReadRequest::KvList { .. }
+            ReadRequest::KvPrefix { .. }
+                | ReadRequest::KvList { .. }
                 | ReadRequest::ServiceList
                 | ReadRequest::ScheduleList
                 | ReadRequest::ElectionList
