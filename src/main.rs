@@ -29,6 +29,7 @@ mod state;
 mod transport;
 mod validate;
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -79,22 +80,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/services", discovery::router())
         .nest("/observe", observe::router());
 
-    let app = Router::new()
+    // Two listeners on two ports, so the client and peer planes are separable at
+    // L4 (a NetworkPolicy can lock the client port to in-namespace while leaving
+    // the peer port reachable cross-cluster — see fiducia-infra). Both still
+    // require the trusted-hop secret at L7 when FIDUCIA_INTERNAL_SECRET is set.
+    //
+    //   :PORT (8090)            — client/data plane: /healthz, /readyz, /v1/*
+    //   :FIDUCIA_PEER_PORT(9090)— peer plane: node↔node Raft RPC (/raft/*)
+    //
+    // Peers address each other at host:9090 (FIDUCIA_PEERS / topology.toml
+    // node_peer_endpoint), so /raft MUST live on the peer port — previously it
+    // was only on :8090, so cross-cluster AppendEntries to :9090 hit nothing.
+    let client_app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        // `/v1` (client data plane, reached via the LB) and `/raft` (peer RPC) are
-        // cluster-internal: when FIDUCIA_INTERNAL_SECRET is set, both require the
-        // trusted-hop header. Health probes stay open for k8s. The guard is a
-        // no-op when the secret is unset (dev / single-node), so this is additive.
+        // The guard is a no-op when the secret is unset (dev / single-node).
         .nest("/v1", v1.layer(middleware::from_fn(internal_auth::guard)))
-        // Internal node↔node Raft RPC (peer transport server side); not under /v1.
+        .with_state(node.clone())
+        // Hardening (outermost last): catch handler panics → 500 and cap body
+        // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.
+        .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
+
+    let peer_app = Router::new()
+        // A health route on the peer port too, so the peer listener can be probed.
+        .route("/healthz", get(health))
         .nest(
             "/raft",
             raft_api::router().layer(middleware::from_fn(internal_auth::guard)),
         )
         .with_state(node)
-        // Hardening (outermost last): catch handler panics → 500 and cap body
-        // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new());
@@ -103,11 +119,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8090);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let peer_port: u16 = std::env::var("FIDUCIA_PEER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9090);
+    let client_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let peer_addr = SocketAddr::from(([0, 0, 0, 0], peer_port));
 
-    tracing::info!("{SERVICE} listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    tracing::info!("{SERVICE} client plane on http://{client_addr} (/v1), peer plane on http://{peer_addr} (/raft)");
+    let client_listener = tokio::net::TcpListener::bind(client_addr).await?;
+    let peer_listener = tokio::net::TcpListener::bind(peer_addr).await?;
+    // Serve both concurrently; if either listener exits, the node exits.
+    tokio::try_join!(
+        axum::serve(client_listener, client_app).into_future(),
+        axum::serve(peer_listener, peer_app).into_future(),
+    )?;
     Ok(())
 }
 
