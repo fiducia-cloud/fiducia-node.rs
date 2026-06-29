@@ -2646,32 +2646,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
-=======
-    async fn raft_timing_is_configurable_and_reported_in_status() {
-        let reg = LoopbackRegistry::new();
-        let n = Node::bootstrap(
-            NodeConfig {
-                node_id: "wan-node".to_string(),
-                peers: vec![],
-                shard_count: 1,
-                timing: RaftTiming {
-                    heartbeat_ms: 100,
-                    election_min_ms: 1_000,
-                    election_jitter_ms: 500,
-                    commit_wait_ms: 10_000,
-                    pre_vote: true,
-                },
-            },
-            Transport::loopback(reg),
-        );
-
-        let status = n.status().await;
-        assert_eq!(status.timing.heartbeat_ms, 100);
-        assert_eq!(status.timing.election_min_ms, 1_000);
-        assert_eq!(status.timing.commit_wait_ms, 10_000);
-        assert_eq!(status.hosted_shards, vec![0]);
-        assert_eq!(status.leader_count, 1);
-        assert_eq!(status.follower_count, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
