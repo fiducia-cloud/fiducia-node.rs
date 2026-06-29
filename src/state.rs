@@ -824,7 +824,6 @@ impl StateMachine {
             .unwrap_or_default()
     }
 
-<<<<<<< HEAD
     /// Every live KV entry whose key starts with `prefix` (this shard's slice of
     /// the keyspace). Serializable read off applied state; callers fan this out
     /// across shards and merge.
