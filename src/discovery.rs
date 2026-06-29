@@ -205,8 +205,6 @@ async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Re
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
-<<<<<<< HEAD
-=======
 }
 
 #[cfg(test)]
