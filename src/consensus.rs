@@ -3184,7 +3184,6 @@ mod tests {
     fn pre_vote_is_denied_under_a_live_leader_and_granted_otherwise() {
         let mut a = follower_actor();
 
-<<<<<<< HEAD
         // Cold start: no leader known → granted (first election must be able to run).
         assert!(a.leader_id.is_none());
         assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
@@ -3195,16 +3194,6 @@ mod tests {
         assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
         // ...and the round must not have mutated our state (structurally enforced
         // by `&self`, but assert the observable bits too).
-=======
-        // Cold start: no leader known → granted (the first election must run).
-        assert!(a.leader_id.is_none());
-        assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
-
-        // Healthy leader, contact fresh → denied; and no state is mutated.
-        a.leader_id = Some("b".to_string());
-        a.last_leader_contact = Instant::now();
-        assert!(!a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
->>>>>>> origin/main
         assert_eq!(a.current_term, 1);
         assert_eq!(a.voted_for, None);
         assert_eq!(a.role, Role::Follower);
