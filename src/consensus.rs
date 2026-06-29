@@ -80,7 +80,7 @@ const CHANGE_BUFFER: usize = 256;
 /// leadership flapping — set e.g. `FIDUCIA_RAFT_HEARTBEAT_MS=150`,
 /// `FIDUCIA_RAFT_ELECTION_MIN_MS=1000`, `FIDUCIA_RAFT_ELECTION_JITTER_MS=1000`.
 /// PreVote can be disabled with `FIDUCIA_RAFT_PREVOTE=off`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct RaftTiming {
     /// How often a shard actor wakes to check election/heartbeat deadlines.
     pub tick: Duration,
