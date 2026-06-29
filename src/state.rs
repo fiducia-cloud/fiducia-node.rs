@@ -2908,6 +2908,5 @@ mod tests {
         ] {
             assert_eq!(command.routing_key(), SERVICE_DOMAIN);
         }
->>>>>>> origin/main
     }
 }
