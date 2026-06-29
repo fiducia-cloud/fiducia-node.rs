@@ -3213,13 +3213,8 @@ mod tests {
         // Stale would-be term (< our current term) → denied.
         assert!(!a.handle_pre_vote(&pre_vote_req(0, 0, 0)).granted);
 
-<<<<<<< HEAD
         // We now hold one entry at term 1: a candidate behind on the log is denied,
         // a caught-up one is granted.
-=======
-        // Holding one entry at term 1: a behind candidate is denied, a caught-up
-        // one is granted.
->>>>>>> origin/main
         a.log.push(LogEntry {
             term: 1,
             index: 1,
