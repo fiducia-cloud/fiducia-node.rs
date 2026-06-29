@@ -3166,11 +3166,6 @@ mod tests {
         assert_eq!(a.role, Role::Leader, "no step-down when check-quorum is off");
     }
 
-=======
-        )
-    }
-
->>>>>>> origin/main
     fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {
         RequestVoteReq {
             term,
