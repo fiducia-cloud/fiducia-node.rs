@@ -268,5 +268,4 @@ mod tests {
             metadata: HashMap::from(metadata),
         }
     }
->>>>>>> origin/main
 }
