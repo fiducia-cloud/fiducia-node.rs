@@ -50,14 +50,9 @@ use tokio::time::{Duration, Instant};
 
 use crate::persist::{Recovered, ShardStore};
 use crate::state::{
-<<<<<<< HEAD
-    Command, ElectionEntry, KvEntry, KvListItem, Leadership, LockInventory, LockState,
-    RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState, ServiceInstance, ServiceSummary,
-    StateMachine,
-=======
-    Command, IdempotencyRecord, KvEntry, Leadership, LockState, RateLimitSnapshot, Schedule,
-    ScheduleRun, SemaphoreState, ServiceInstance, StateMachine,
->>>>>>> origin/main
+    Command, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
+    LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState, ServiceInstance,
+    ServiceSummary, StateMachine,
 };
 use crate::transport::{
     AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
