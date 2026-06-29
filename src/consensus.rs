@@ -1521,7 +1521,6 @@ impl ShardActor {
             ReadRequest::Election { name } => {
                 Ok(ReadResponse::Election(self.state.election_get(&name)))
             }
-            ReadRequest::Services => Ok(ReadResponse::Services(self.state.service_names())),
             ReadRequest::Service { service } => {
                 Ok(ReadResponse::Service(self.state.service_list(&service)))
             }
