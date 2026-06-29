@@ -2596,10 +2596,9 @@ mod tests {
                 node_id: "zero-shards".to_string(),
                 peers: vec![],
                 shard_count: 0,
-                timing: RaftTiming::default(),
+                data_dir: None,
             },
             Transport::loopback(reg),
->>>>>>> origin/main
         );
     }
 
