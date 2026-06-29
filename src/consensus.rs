@@ -729,7 +729,6 @@ impl ShardActor {
         self.pre_vote_term = would_be_term;
         self.pre_votes.clear();
         self.pre_votes.insert(self.node_id.clone());
-<<<<<<< HEAD
         tracing::debug!(
             shard = ?self.shard_id,
             node = %self.node_id,
@@ -737,8 +736,6 @@ impl ShardActor {
             members = self.members,
             "raft: election timeout — starting pre-vote straw poll"
         );
-=======
->>>>>>> origin/main
         // (Unreachable for members > 1, but keep the single-member invariant.)
         if self.pre_votes.len() >= self.majority() {
             self.start_election();
