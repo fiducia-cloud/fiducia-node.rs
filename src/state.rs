@@ -2559,13 +2559,8 @@ mod tests {
         let won = sm.apply(Command::ElectionCampaign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
-<<<<<<< HEAD
-            ttl_ms: 30_000,
-            metadata: HashMap::new(),
-=======
             ttl_ms: 120_000,
             metadata,
->>>>>>> origin/main
         });
         let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
         let initial_expiry = won.output["leadership"]["lease_expires_ms"]
