@@ -1616,13 +1616,10 @@ impl ShardActor {
             commit_index: self.commit_index,
             last_applied: self.last_applied,
             last_log_index: self.last_log_index(),
-<<<<<<< HEAD
             healthy_replicas,
             has_quorum,
             replication,
-=======
             metrics: self.metrics.clone(),
->>>>>>> origin/main
         }
     }
 }
