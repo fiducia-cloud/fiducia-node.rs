@@ -1759,12 +1759,6 @@ impl Node {
                 elapsed_ms,
                 "propose unavailable: shard not hosted here or commit lost quorum"
             ),
-=======
-        match tokio::time::timeout(self.config.timing.commit_wait_duration(), rx).await {
-            Ok(Ok(result)) => result,
-            // Sender dropped (actor gone) or commit timed out.
-            _ => Err(ProposeError::Unavailable { shard }),
->>>>>>> origin/main
         }
         result
     }
