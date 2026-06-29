@@ -1856,7 +1856,6 @@ impl Node {
         rx.await.ok()
     }
 
-<<<<<<< HEAD
     /// Fan a serializable read out across **every shard this node hosts**, then
     /// merge. `make` builds a fresh request per shard ([`ReadRequest`] isn't
     /// `Clone`). Used for list/range operations that no single shard owns.
