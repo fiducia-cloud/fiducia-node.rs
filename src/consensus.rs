@@ -872,11 +872,7 @@ impl ShardActor {
         // Durable before this entry can count toward a commit.
         self.persist_log_append();
 
-<<<<<<< HEAD
         self.heartbeat_deadline = Instant::now() + self.timing.heartbeat;
-=======
-        self.heartbeat_deadline = Instant::now() + self.timing.heartbeat_duration();
->>>>>>> origin/main
         self.maybe_advance_commit(); // single-node commits the no-op immediately
         self.broadcast_append_entries();
     }
