@@ -1975,7 +1975,8 @@ impl Node {
     /// Aggregated per-operation call metrics (counts, error rate, latency).
     pub fn metrics(&self) -> &crate::metrics::Metrics {
         &self.metrics
-=======
+    }
+
     /// Subscribe to every shard hosted by this node. Used by prefix watches
     /// because keys under one prefix can hash to many shards.
     pub async fn watch_all(&self) -> Vec<broadcast::Receiver<ChangeEvent>> {
