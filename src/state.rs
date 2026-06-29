@@ -449,7 +449,6 @@ pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
     pub lease_expires_ms: u64,
-<<<<<<< HEAD
     /// Campaign TTL in ms, retained so a renew without an explicit TTL reuses it.
     pub ttl_ms: u64,
     /// Candidate facts (address/region/version/…) — lets observers discover the
@@ -479,11 +478,6 @@ pub struct KvListItem {
 pub struct ServiceSummary {
     pub service: String,
     pub instances: usize,
-=======
-    pub metadata: HashMap<String, String>,
-    #[serde(skip)]
-    lease_ttl_ms: u64,
->>>>>>> origin/main
 }
 
 /// A scheduled job definition.
