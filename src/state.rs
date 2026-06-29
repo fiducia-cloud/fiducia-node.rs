@@ -1616,13 +1616,8 @@ impl Store {
             leader: candidate.clone(),
             fencing_token: token,
             lease_expires_ms: now.saturating_add(ttl_ms),
-<<<<<<< HEAD
             ttl_ms,
             metadata,
-=======
-            metadata,
-            lease_ttl_ms: ttl_ms,
->>>>>>> origin/main
         };
         self.elections.insert(name.clone(), leadership.clone());
         json!({ "won": true, "name": name, "leadership": leadership, "revision": revision })
