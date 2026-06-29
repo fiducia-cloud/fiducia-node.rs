@@ -254,48 +254,11 @@ pub struct NodeConfig {
     pub peers: Vec<String>,
     /// Number of shards the keyspace is partitioned into.
     pub shard_count: u32,
-<<<<<<< HEAD
     /// Directory for durable per-shard Raft state (term/vote/log). `None` runs
     /// fully in-memory — the mode used by the in-process loopback tests; a real
     /// deployment points this at a persistent volume so a pod restart can't drop
     /// a member's log.
     pub data_dir: Option<PathBuf>,
-=======
-    /// Raft heartbeat/election/client wait timing. Cross-cloud clusters should
-    /// set this from observed inter-provider RTT.
-    pub timing: RaftTiming,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct RaftTiming {
-    /// Leader heartbeat interval.
-    pub heartbeat_ms: u64,
-    /// Base election timeout; actual timeout adds random jitter below.
-    pub election_min_ms: u64,
-    /// Randomized election timeout jitter.
-    pub election_jitter_ms: u64,
-    /// Client write wait for quorum commit before returning unavailable.
-    pub commit_wait_ms: u64,
-    /// PreVote (Raft thesis §9.6): run a non-binding straw poll before
-    /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
-    /// leader on rejoin. Strictly safer on a WAN; on by default. Disable with
-    /// `FIDUCIA_RAFT_PREVOTE=off`.
-    pub pre_vote: bool,
-}
-
-impl RaftTiming {
-    fn heartbeat_duration(self) -> Duration {
-        Duration::from_millis(self.heartbeat_ms)
-    }
-
-    fn election_duration(self, jitter: u64) -> Duration {
-        Duration::from_millis(self.election_min_ms.saturating_add(jitter))
-    }
-
-    fn commit_wait_duration(self) -> Duration {
-        Duration::from_millis(self.commit_wait_ms)
-    }
->>>>>>> origin/main
 }
 
 impl Default for NodeConfig {
