@@ -135,12 +135,9 @@ pub enum Command {
         name: String,
         candidate: String,
         ttl_ms: u64,
-<<<<<<< HEAD
         /// Opaque candidate facts published to observers/watchers (e.g. address,
         /// region, version) so the leader is *discoverable*, not just named.
         #[serde(default)]
-=======
->>>>>>> origin/main
         metadata: HashMap<String, String>,
     },
     ElectionRenew {
