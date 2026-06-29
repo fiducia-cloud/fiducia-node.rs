@@ -514,11 +514,7 @@ struct ShardActor {
     election_deadline: Instant,
     heartbeat_deadline: Instant,
     /// When we last heard from a valid leader (an `AppendEntries`). Tracked
-<<<<<<< HEAD
     /// **separately** from `election_deadline` (which we reset for our own
-=======
-    /// separately from `election_deadline` (which we reset for our own
->>>>>>> origin/main
     /// campaigning) so pre-vote's leader-stickiness reflects the *leader's*
     /// liveness, not our candidacy.
     last_leader_contact: Instant,
