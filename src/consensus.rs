@@ -1130,7 +1130,8 @@ impl ShardActor {
         );
         let term = self.current_term;
         self.step_down(term, None);
-=======
+    }
+
     fn refresh_follower_lag_metric(&mut self) {
         let Some(ls) = &self.leader else {
             self.metrics.follower_lag_max = 0;
