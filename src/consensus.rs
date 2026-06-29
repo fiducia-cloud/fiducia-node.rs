@@ -3198,11 +3198,7 @@ mod tests {
         assert_eq!(a.voted_for, None);
         assert_eq!(a.role, Role::Follower);
 
-<<<<<<< HEAD
         // Leader known but contact has gone stale (missed heartbeats) → granted.
-=======
-        // Leader known but contact stale (missed heartbeats) → granted.
->>>>>>> origin/main
         a.last_leader_contact = Instant::now() - Duration::from_secs(1);
         assert!(a.handle_pre_vote(&pre_vote_req(2, 0, 0)).granted);
     }
