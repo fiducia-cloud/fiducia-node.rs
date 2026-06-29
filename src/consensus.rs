@@ -225,7 +225,6 @@ pub struct LogEntry {
     pub command: Option<Command>,
 }
 
-<<<<<<< HEAD
 /// A change applied to a shard's state machine, broadcast to watchers (KV,
 /// elections, discovery). `scope` lets a watcher ignore changes from a different
 /// primitive that happens to share a name with what it's watching.
@@ -235,13 +234,6 @@ pub struct ChangeEvent {
     pub scope: &'static str,
     /// Domain verb: kv `put`/`delete`; election `elected`/`renewed`/`resigned`;
     /// service `register`/`heartbeat`/`deregister`.
-=======
-/// A change applied to a shard's state machine, broadcast to watch clients.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChangeEvent {
-    /// Domain-specific event name, such as `"put"`, `"election_campaign"`, or
-    /// `"service_register"`.
->>>>>>> origin/main
     pub kind: &'static str,
     /// The watched name: kv key, election name, or service name.
     pub key: String,
