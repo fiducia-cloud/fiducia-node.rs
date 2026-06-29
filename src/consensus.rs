@@ -3208,11 +3208,7 @@ mod tests {
     #[test]
     fn pre_vote_refuses_stale_term_and_behind_log() {
         let mut a = follower_actor();
-<<<<<<< HEAD
         a.leader_id = None; // remove the leader-stickiness clause from the picture
-=======
-        a.leader_id = None; // remove leader-stickiness from the picture
->>>>>>> origin/main
 
         // Stale would-be term (< our current term) → denied.
         assert!(!a.handle_pre_vote(&pre_vote_req(0, 0, 0)).granted);
