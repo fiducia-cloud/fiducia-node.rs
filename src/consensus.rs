@@ -1296,7 +1296,6 @@ impl ShardActor {
         }
     }
 
-<<<<<<< HEAD
     /// Answer a PreVote straw poll. Pure read: changes nothing. Grant only if
     ///   * the candidate's would-be term isn't stale (`req.term >= current_term`),
     ///   * its log is at least as up-to-date as ours, **and**
@@ -1308,14 +1307,6 @@ impl ShardActor {
     /// stays in the future, so a rejoining/partitioned node's pre-vote is denied
     /// and it can never bump the cluster's term. At cold start `leader_id` is
     /// `None`, so the first election is still granted immediately.
-=======
-    /// Answer a PreVote straw poll. Pure read: changes nothing. Grant only if the
-    /// candidate's would-be term isn't stale, its log is at least as up-to-date,
-    /// AND we are not currently served by a live leader — i.e. we know of no
-    /// leader, or our last `AppendEntries` is older than an election timeout. That
-    /// leader-stickiness is what makes pre-vote refuse to disrupt a healthy leader;
-    /// at cold start `leader_id` is `None`, so the first election still runs.
->>>>>>> origin/main
     fn handle_pre_vote(&self, req: &RequestVoteReq) -> RequestVoteResp {
         let log_ok = (req.last_log_term > self.last_log_term())
             || (req.last_log_term == self.last_log_term()
