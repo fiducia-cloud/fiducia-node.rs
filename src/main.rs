@@ -2,17 +2,17 @@
 //!
 //! A node hosts replicas of many shards (each an independent Raft group),
 //! leading some and following others, and exposes the coordination API over
-//! HTTP: locks, rate limits, cron schedules, config KV, leader election, and
-//! service discovery.
+//! HTTP: locks, idempotency keys, rate limits, cron schedules, config KV,
+//! leader election, and service discovery.
 //!
-//! This is a **skeleton**: the routing, consensus, and state-machine shapes are
-//! in place; the per-command logic, replication, watches, and TTL expiry are
-//! marked with `TODO`s in the respective modules.
+//! The routing, consensus, state-machine primitives, replication, watches, and
+//! TTL expiry are implemented in the respective modules.
 
 mod consensus;
 mod cron;
 mod discovery;
 mod election;
+mod idempotency;
 mod indexed_queue;
 mod internal_auth;
 mod kv;
@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
+        .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())
         .nest("/rate-limit", rate_limit::router())

@@ -1,8 +1,8 @@
 //! The replicated state machine.
 //!
 //! Every mutation exposed by Fiducia is represented as a [`Command`] and is applied
-//! in committed-log order. In this single-node skeleton the log is local, but the
-//! state-machine semantics are the same ones the replicated path will use.
+//! in committed-log order. The log may be local in single-node development, but
+//! the state-machine semantics are the same ones the replicated path uses.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -76,6 +76,24 @@ pub enum Command {
         window_ms: u64,
         refill_per_second: Option<f64>,
         cost: u32,
+    },
+
+    // --- Idempotency / dedupe ----------------------------------------------
+    /// Claim an idempotency key for the TTL window. First claim wins; later
+    /// claims return the existing active record as a duplicate.
+    IdempotencyClaim {
+        key: String,
+        owner: String,
+        ttl_ms: u64,
+        metadata: HashMap<String, String>,
+    },
+    /// Mark a claimed key complete and optionally store the domain result for
+    /// duplicate callers to replay.
+    IdempotencyComplete {
+        key: String,
+        owner: String,
+        fencing_token: u64,
+        result: Option<Value>,
     },
 
     // --- Cron / scheduling -------------------------------------------------
@@ -163,13 +181,22 @@ pub enum Command {
 /// atomically and detect that it conflicts with a holder of `{B}`, one state
 /// machine must see every member key together. Routing every lock/semaphore
 /// command to a single coordinator (the live-mutex single-broker model) gives
-/// exactly that. KV/rate-limit/discovery/etc. stay sharded by their own key.
+/// exactly that. KV/rate-limit/etc. stay sharded by their own key; service
+/// discovery has its own coordinator because listing service names is global.
 /// Sharding the lock space across coordinators (cross-shard 2PC for sets that
 /// span them) is the documented scaling path.
 ///
 /// Defined in the shared [`fiducia_routing`] crate so the node, the load
 /// balancer, and the brain route locks to the **same** coordinator shard.
 pub const LOCK_DOMAIN: &str = fiducia_routing::LOCK_COORDINATION_KEY;
+
+/// Routing key under which all service-discovery state lives.
+///
+/// This keeps `GET /v1/services` linearizable without asking every shard leader
+/// for a partial service-name list. Individual service lookups still return one
+/// service's instances, but all discovery mutations and reads meet in the same
+/// replicated state machine.
+pub const SERVICE_DOMAIN: &str = fiducia_routing::SERVICE_DISCOVERY_KEY;
 
 impl Command {
     /// Key used to route this command to its owning shard.
@@ -181,7 +208,9 @@ impl Command {
             | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
-            | Command::RateLimitCheck { key, .. } => key,
+            | Command::RateLimitCheck { key, .. }
+            | Command::IdempotencyClaim { key, .. }
+            | Command::IdempotencyComplete { key, .. } => key,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -189,9 +218,9 @@ impl Command {
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
-            Command::ServiceRegister { service, .. }
-            | Command::ServiceHeartbeat { service, .. }
-            | Command::ServiceDeregister { service, .. } => service,
+            Command::ServiceRegister { .. }
+            | Command::ServiceHeartbeat { .. }
+            | Command::ServiceDeregister { .. } => SERVICE_DOMAIN,
         }
     }
 
@@ -206,6 +235,8 @@ impl Command {
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
             Command::SemaphoreRelease { .. } => "semaphore.release",
             Command::RateLimitCheck { .. } => "ratelimit.check",
+            Command::IdempotencyClaim { .. } => "idempotency.claim",
+            Command::IdempotencyComplete { .. } => "idempotency.complete",
             Command::ScheduleUpsert { .. } => "schedule.upsert",
             Command::ScheduleRecordRun { .. } => "schedule.record_run",
             Command::ScheduleClaimFire { .. } => "schedule.claim_fire",
@@ -392,6 +423,28 @@ struct RateLimitRecord {
     last_allowed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IdempotencyStatus {
+    Claimed,
+    Completed,
+}
+
+/// One active idempotency record. It lives until `lease_expires_ms`, even after
+/// completion, so duplicate calls can be suppressed or replayed for the full TTL.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub owner: String,
+    pub fencing_token: u64,
+    pub status: IdempotencyStatus,
+    pub first_seen_ms: u64,
+    pub lease_expires_ms: u64,
+    pub metadata: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+}
+
 /// The current holder of a named election.
 #[derive(Debug, Clone, Serialize)]
 pub struct Leadership {
@@ -491,9 +544,28 @@ struct Store {
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
+    idempotency: HashMap<String, IdempotencyRecord>,
     elections: HashMap<String, Leadership>,
     schedules: HashMap<String, ScheduleRecord>,
     services: HashMap<String, HashMap<String, ServiceInstance>>,
+}
+
+struct SemaphoreAcquireInput {
+    key: String,
+    holder: String,
+    limit: u32,
+    ttl_ms: u64,
+    wait: bool,
+}
+
+struct RateLimitCheckInput {
+    key: String,
+    tenant: String,
+    algorithm: RateLimitAlgorithm,
+    limit: u32,
+    window_ms: u64,
+    refill_per_second: Option<f64>,
+    cost: u32,
 }
 
 /// Applies committed commands and answers read queries.
@@ -542,7 +614,17 @@ impl StateMachine {
                 limit,
                 ttl_ms,
                 wait,
-            } => store.apply_semaphore_acquire(revision, now, key, holder, limit, ttl_ms, wait),
+            } => store.apply_semaphore_acquire(
+                revision,
+                now,
+                SemaphoreAcquireInput {
+                    key,
+                    holder,
+                    limit,
+                    ttl_ms,
+                    wait,
+                },
+            ),
             Command::SemaphoreRelease {
                 key,
                 holder,
@@ -558,14 +640,28 @@ impl StateMachine {
                 cost,
             } => store.apply_rate_limit_check(
                 now,
-                key,
-                tenant,
-                algorithm,
-                limit,
-                window_ms,
-                refill_per_second,
-                cost.max(1),
+                RateLimitCheckInput {
+                    key,
+                    tenant,
+                    algorithm,
+                    limit,
+                    window_ms,
+                    refill_per_second,
+                    cost: cost.max(1),
+                },
             ),
+            Command::IdempotencyClaim {
+                key,
+                owner,
+                ttl_ms,
+                metadata,
+            } => store.apply_idempotency_claim(revision, now, key, owner, ttl_ms, metadata),
+            Command::IdempotencyComplete {
+                key,
+                owner,
+                fencing_token,
+                result,
+            } => store.apply_idempotency_complete(revision, key, owner, fencing_token, result),
             Command::ScheduleUpsert {
                 name,
                 cron,
@@ -647,6 +743,19 @@ impl StateMachine {
         store.kv.get(key).cloned()
     }
 
+    pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut entries: Vec<_> = store
+            .kv
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
+    }
+
     pub fn lock_get(&self, key: &str) -> LockState {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
@@ -663,6 +772,12 @@ impl StateMachine {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
         store.rate_limit_snapshot(tenant, key)
+    }
+
+    pub fn idempotency_get(&self, key: &str) -> Option<IdempotencyRecord> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        store.idempotency.get(key).cloned()
     }
 
     pub fn election_get(&self, name: &str) -> Option<Leadership> {
@@ -844,9 +959,12 @@ impl Store {
         self.semaphores_promote(now);
         self.elections
             .retain(|_, leadership| leadership.lease_expires_ms > now);
+        self.idempotency
+            .retain(|_, record| record.lease_expires_ms > now);
         for instances in self.services.values_mut() {
             instances.retain(|_, instance| instance.lease_expires_ms > now);
         }
+        self.services.retain(|_, instances| !instances.is_empty());
     }
 
     fn apply_kv_put(
@@ -1058,12 +1176,15 @@ impl Store {
         &mut self,
         revision: u64,
         now: u64,
-        key: String,
-        holder: String,
-        limit: u32,
-        ttl_ms: u64,
-        wait: bool,
+        input: SemaphoreAcquireInput,
     ) -> Value {
+        let SemaphoreAcquireInput {
+            key,
+            holder,
+            limit,
+            ttl_ms,
+            wait,
+        } = input;
         let sem = self
             .semaphores
             .entry(key.clone())
@@ -1154,10 +1275,7 @@ impl Store {
     /// Admit FIFO waiters of one semaphore up to its limit.
     fn semaphore_promote(&mut self, key: &str, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
-        loop {
-            let Some(sem) = self.semaphores.get(key) else {
-                break;
-            };
+        while let Some(sem) = self.semaphores.get(key) {
             if (sem.holders.len() as u32) >= sem.limit || sem.queue.is_empty() {
                 break;
             }
@@ -1187,17 +1305,16 @@ impl Store {
         }
     }
 
-    fn apply_rate_limit_check(
-        &mut self,
-        now: u64,
-        key: String,
-        tenant: String,
-        algorithm: RateLimitAlgorithm,
-        limit: u32,
-        window_ms: u64,
-        refill_per_second: Option<f64>,
-        cost: u32,
-    ) -> Value {
+    fn apply_rate_limit_check(&mut self, now: u64, input: RateLimitCheckInput) -> Value {
+        let RateLimitCheckInput {
+            key,
+            tenant,
+            algorithm,
+            limit,
+            window_ms,
+            refill_per_second,
+            cost,
+        } = input;
         let store_key = rate_limit_store_key(&tenant, &key);
         let record = self
             .rate_limits
@@ -1270,6 +1387,85 @@ impl Store {
             "key": key,
             "tenant": tenant,
             "algorithm": record.algorithm,
+        })
+    }
+
+    fn apply_idempotency_claim(
+        &mut self,
+        revision: u64,
+        now: u64,
+        key: String,
+        owner: String,
+        ttl_ms: u64,
+        metadata: HashMap<String, String>,
+    ) -> Value {
+        if key.trim().is_empty() {
+            return json!({ "claimed": false, "duplicate": false, "reason": "empty_key", "revision": revision });
+        }
+        if let Some(record) = self.idempotency.get(&key) {
+            return json!({
+                "claimed": false,
+                "duplicate": true,
+                "key": key,
+                "record": record,
+                "revision": revision,
+            });
+        }
+
+        let token = self.next_token();
+        let record = IdempotencyRecord {
+            key: key.clone(),
+            owner,
+            fencing_token: token,
+            status: IdempotencyStatus::Claimed,
+            first_seen_ms: now,
+            lease_expires_ms: now.saturating_add(ttl_ms.max(1)),
+            metadata,
+            result: None,
+        };
+        self.idempotency.insert(key.clone(), record.clone());
+        json!({
+            "claimed": true,
+            "duplicate": false,
+            "key": key,
+            "record": record,
+            "fencing_token": token,
+            "lease_expires_ms": record.lease_expires_ms,
+            "revision": revision,
+        })
+    }
+
+    fn apply_idempotency_complete(
+        &mut self,
+        revision: u64,
+        key: String,
+        owner: String,
+        fencing_token: u64,
+        result: Option<Value>,
+    ) -> Value {
+        let Some(record) = self.idempotency.get_mut(&key) else {
+            return json!({ "completed": false, "reason": "not_found", "key": key, "revision": revision });
+        };
+        if record.owner != owner || record.fencing_token != fencing_token {
+            return json!({ "completed": false, "reason": "not_holder", "key": key, "revision": revision });
+        }
+        if record.status == IdempotencyStatus::Completed {
+            return json!({
+                "completed": true,
+                "duplicate": true,
+                "key": key,
+                "record": record,
+                "revision": revision,
+            });
+        }
+        record.status = IdempotencyStatus::Completed;
+        record.result = result;
+        json!({
+            "completed": true,
+            "duplicate": false,
+            "key": key,
+            "record": record,
+            "revision": revision,
         })
     }
 
@@ -1515,6 +1711,14 @@ impl Store {
             .get_mut(&service)
             .map(|instances| instances.remove(&instance_id).is_some())
             .unwrap_or(false);
+        if self
+            .services
+            .get(&service)
+            .map(|instances| instances.is_empty())
+            .unwrap_or(false)
+        {
+            self.services.remove(&service);
+        }
         json!({ "deregistered": removed, "service": service, "instance_id": instance_id })
     }
 
@@ -1652,6 +1856,23 @@ mod tests {
         sm.apply(Command::LockAcquire {
             keys: keys.iter().map(|s| s.to_string()).collect(),
             holder: holder.to_string(),
+            ttl_ms: 30_000,
+            wait,
+        })
+        .output
+    }
+
+    fn semaphore_acquire(
+        sm: &StateMachine,
+        key: &str,
+        holder: &str,
+        limit: u32,
+        wait: bool,
+    ) -> Value {
+        sm.apply(Command::SemaphoreAcquire {
+            key: key.to_string(),
+            holder: holder.to_string(),
+            limit,
             ttl_ms: 30_000,
             wait,
         })
@@ -1863,22 +2084,108 @@ mod tests {
     }
 
     #[test]
+    fn union_lock_canonicalizes_keys_and_releases_every_member() {
+        let sm = StateMachine::new();
+        let grant = acquire(&sm, &["z", "x", "x", "", "y"], "holder-1", false);
+        assert_eq!(grant["acquired"], true);
+        assert_eq!(grant["keys"], json!(["x", "y", "z"]));
+
+        for key in ["x", "y", "z"] {
+            let state = sm.lock_get(key);
+            assert_eq!(state.holder.as_deref(), Some("holder-1"));
+            assert_eq!(state.held_keys, vec!["x", "y", "z"]);
+        }
+
+        let release = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: grant["fencing_token"].as_u64().unwrap(),
+        });
+        assert_eq!(release.output["released"], true);
+
+        for key in ["x", "y", "z"] {
+            assert!(sm.lock_get(key).holder.is_none());
+        }
+    }
+
+    #[test]
+    fn no_wait_union_conflict_leaves_free_members_unheld_and_unqueued() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["x", "y"], "holder-1", false);
+        assert_eq!(first["acquired"], true);
+
+        let no_wait = acquire(&sm, &["y", "z"], "holder-2", false);
+        assert_eq!(no_wait["acquired"], false);
+        assert_eq!(no_wait["queued"], false);
+        assert_eq!(no_wait["conflicts"], json!(["y"]));
+        assert!(sm.lock_get("z").holder.is_none());
+        assert!(sm.lock_get("y").wait_queue.is_empty());
+
+        sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: first["fencing_token"].as_u64().unwrap(),
+        });
+
+        let retry = acquire(&sm, &["y", "z"], "holder-3", false);
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(sm.lock_get("z").holder.as_deref(), Some("holder-3"));
+    }
+
+    #[test]
+    fn stale_lock_holder_cannot_release_after_fifo_promotion() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["orders"], "holder-1", false);
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = acquire(&sm, &["orders"], "holder-2", true);
+        assert_eq!(queued["queued"], true);
+
+        let release = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        let token2 = release.output["promoted"][0]["fencing_token"]
+            .as_u64()
+            .unwrap();
+        assert!(token2 > token1);
+
+        let stale = sm.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        assert_eq!(stale.output["released"], false);
+        assert_eq!(stale.output["reason"], "not_found");
+        assert_eq!(sm.lock_get("orders").holder.as_deref(), Some("holder-2"));
+    }
+
+    #[test]
+    fn expired_lock_grant_promotes_waiter_with_new_token() {
+        let sm = StateMachine::new();
+        let first = sm
+            .apply(Command::LockAcquire {
+                keys: vec!["lease-key".to_string()],
+                holder: "holder-1".to_string(),
+                ttl_ms: 50,
+                wait: false,
+            })
+            .output;
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = acquire(&sm, &["lease-key"], "holder-2", true);
+        assert_eq!(queued["queued"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let state = sm.lock_get("lease-key");
+        assert_eq!(state.holder.as_deref(), Some("holder-2"));
+        assert!(state.fencing_token.unwrap() > token1);
+        assert!(state.wait_queue.is_empty());
+    }
+
+    #[test]
     fn semaphore_caps_concurrent_holders_and_admits_in_fifo() {
         let sm = StateMachine::new();
-        let acq = |holder: &str, wait: bool| {
-            sm.apply(Command::SemaphoreAcquire {
-                key: "db-pool".to_string(),
-                holder: holder.to_string(),
-                limit: 2,
-                ttl_ms: 30_000,
-                wait,
-            })
-            .output
-        };
         // limit = 2: first two acquire, third is capped out and queues.
-        let a = acq("a", false);
-        let b = acq("b", false);
-        let c = acq("c", true);
+        let a = semaphore_acquire(&sm, "db-pool", "a", 2, false);
+        let b = semaphore_acquire(&sm, "db-pool", "b", 2, false);
+        let c = semaphore_acquire(&sm, "db-pool", "c", 2, true);
         assert_eq!(a["acquired"], true);
         assert_eq!(b["acquired"], true);
         assert_eq!(c["acquired"], false);
@@ -1895,6 +2202,55 @@ mod tests {
         let state = sm.semaphore_get("db-pool");
         assert_eq!(state.holders.len(), 2);
         assert!(state.holders.iter().any(|h| h.holder == "c"));
+    }
+
+    #[test]
+    fn semaphore_no_wait_over_cap_does_not_queue_or_consume_permit() {
+        let sm = StateMachine::new();
+        let first = semaphore_acquire(&sm, "pool", "holder-1", 1, false);
+        assert_eq!(first["acquired"], true);
+
+        let no_wait = semaphore_acquire(&sm, "pool", "holder-2", 1, false);
+        assert_eq!(no_wait["acquired"], false);
+        assert_eq!(no_wait["queued"], false);
+        let capped = sm.semaphore_get("pool");
+        assert_eq!(capped.holders.len(), 1);
+        assert!(capped.wait_queue.is_empty());
+
+        sm.apply(Command::SemaphoreRelease {
+            key: "pool".to_string(),
+            holder: "holder-1".to_string(),
+            fencing_token: first["fencing_token"].as_u64().unwrap(),
+        });
+
+        let retry = semaphore_acquire(&sm, "pool", "holder-3", 1, false);
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(sm.semaphore_get("pool").holders[0].holder, "holder-3");
+    }
+
+    #[test]
+    fn expired_semaphore_permit_promotes_fifo_waiter() {
+        let sm = StateMachine::new();
+        let first = sm
+            .apply(Command::SemaphoreAcquire {
+                key: "lease-pool".to_string(),
+                holder: "holder-1".to_string(),
+                limit: 1,
+                ttl_ms: 50,
+                wait: false,
+            })
+            .output;
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        let queued = semaphore_acquire(&sm, "lease-pool", "holder-2", 1, true);
+        assert_eq!(queued["queued"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let state = sm.semaphore_get("lease-pool");
+        assert_eq!(state.holders.len(), 1);
+        assert_eq!(state.holders[0].holder, "holder-2");
+        assert!(state.holders[0].fencing_token > token1);
+        assert!(state.wait_queue.is_empty());
     }
 
     #[test]
@@ -1961,6 +2317,188 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_claim_dedupes_until_ttl_expires() {
+        let sm = StateMachine::new();
+        let first = sm.apply(Command::IdempotencyClaim {
+            key: "stripe-webhook/event_123".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 50,
+            metadata: HashMap::new(),
+        });
+        let token = first.output["fencing_token"].as_u64().unwrap();
+        let duplicate = sm.apply(Command::IdempotencyClaim {
+            key: "stripe-webhook/event_123".to_string(),
+            owner: "worker-b".to_string(),
+            ttl_ms: 50,
+            metadata: HashMap::new(),
+        });
+
+        assert_eq!(first.output["claimed"], true);
+        assert_eq!(duplicate.output["claimed"], false);
+        assert_eq!(duplicate.output["duplicate"], true);
+        assert_eq!(duplicate.output["record"]["owner"], "worker-a");
+        assert_eq!(duplicate.output["record"]["fencing_token"], token);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let retry_after_ttl = sm.apply(Command::IdempotencyClaim {
+            key: "stripe-webhook/event_123".to_string(),
+            owner: "worker-b".to_string(),
+            ttl_ms: 50,
+            metadata: HashMap::new(),
+        });
+
+        assert_eq!(retry_after_ttl.output["claimed"], true);
+        assert_eq!(retry_after_ttl.output["duplicate"], false);
+        assert_ne!(retry_after_ttl.output["fencing_token"], token);
+    }
+
+    #[test]
+    fn idempotency_claim_preserves_exact_nonblank_key() {
+        let sm = StateMachine::new();
+        let claimed = sm.apply(Command::IdempotencyClaim {
+            key: " event with spaces ".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
+        });
+        let blank = sm.apply(Command::IdempotencyClaim {
+            key: "   ".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
+        });
+
+        assert_eq!(claimed.output["claimed"], true);
+        assert_eq!(claimed.output["key"], " event with spaces ");
+        assert!(sm
+            .idempotency_get(" event with spaces ")
+            .is_some_and(|record| record.key == " event with spaces "));
+        assert!(sm.idempotency_get("event with spaces").is_none());
+        assert_eq!(blank.output["claimed"], false);
+        assert_eq!(blank.output["reason"], "empty_key");
+    }
+
+    #[test]
+    fn idempotency_complete_requires_holder_and_replays_result() {
+        let sm = StateMachine::new();
+        let claimed = sm.apply(Command::IdempotencyClaim {
+            key: "orders/fulfill/123".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: [("source".to_string(), "stripe".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        let token = claimed.output["fencing_token"].as_u64().unwrap();
+        let stale = sm.apply(Command::IdempotencyComplete {
+            key: "orders/fulfill/123".to_string(),
+            owner: "worker-b".to_string(),
+            fencing_token: token,
+            result: None,
+        });
+        let completed = sm.apply(Command::IdempotencyComplete {
+            key: "orders/fulfill/123".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            result: Some(json!({ "order_id": "123", "status": "fulfilled" })),
+        });
+        let duplicate = sm.apply(Command::IdempotencyClaim {
+            key: "orders/fulfill/123".to_string(),
+            owner: "worker-c".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
+        });
+
+        assert_eq!(stale.output["completed"], false);
+        assert_eq!(stale.output["reason"], "not_holder");
+        assert_eq!(completed.output["completed"], true);
+        assert_eq!(completed.output["record"]["status"], "completed");
+        assert_eq!(duplicate.output["duplicate"], true);
+        assert_eq!(
+            duplicate.output["record"]["result"],
+            json!({ "order_id": "123", "status": "fulfilled" })
+        );
+    }
+
+    #[test]
+    fn idempotency_complete_rejects_missing_key_without_creating_record() {
+        let sm = StateMachine::new();
+        let missing = sm.apply(Command::IdempotencyComplete {
+            key: "missing-key".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: 1,
+            result: Some(json!({ "ok": true })),
+        });
+
+        assert_eq!(missing.output["completed"], false);
+        assert_eq!(missing.output["reason"], "not_found");
+        assert!(sm.idempotency_get("missing-key").is_none());
+    }
+
+    #[test]
+    fn idempotency_complete_is_idempotent_for_same_holder_and_token() {
+        let sm = StateMachine::new();
+        let claimed = sm.apply(Command::IdempotencyClaim {
+            key: "orders/fulfill/456".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: HashMap::new(),
+        });
+        let token = claimed.output["fencing_token"].as_u64().unwrap();
+        let first = sm.apply(Command::IdempotencyComplete {
+            key: "orders/fulfill/456".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            result: Some(json!({ "status": "fulfilled" })),
+        });
+        let second = sm.apply(Command::IdempotencyComplete {
+            key: "orders/fulfill/456".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            result: Some(json!({ "status": "ignored" })),
+        });
+
+        assert_eq!(first.output["completed"], true);
+        assert_eq!(first.output["duplicate"], false);
+        assert_eq!(second.output["completed"], true);
+        assert_eq!(second.output["duplicate"], true);
+        assert_eq!(
+            second.output["record"]["result"],
+            json!({ "status": "fulfilled" })
+        );
+    }
+
+    #[test]
+    fn idempotency_claim_metadata_round_trips_through_read_model() {
+        let sm = StateMachine::new();
+        sm.apply(Command::IdempotencyClaim {
+            key: "webhook/event_789".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: [
+                ("provider".to_string(), "stripe".to_string()),
+                (
+                    "event_type".to_string(),
+                    "checkout.session.completed".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        });
+
+        let record = sm.idempotency_get("webhook/event_789").expect("record");
+        assert_eq!(
+            record.metadata.get("provider").map(String::as_str),
+            Some("stripe")
+        );
+        assert_eq!(
+            record.metadata.get("event_type").map(String::as_str),
+            Some("checkout.session.completed")
+        );
+        assert_eq!(record.status, IdempotencyStatus::Claimed);
+    }
+
+    #[test]
     fn kv_put_uses_compare_and_swap_revision() {
         let sm = StateMachine::new();
         let created = sm.apply(Command::KvPut {
@@ -1991,15 +2529,45 @@ mod tests {
     }
 
     #[test]
+    fn kv_prefix_lists_matching_keys_in_order() {
+        let sm = StateMachine::new();
+        for (key, value) in [
+            ("flags/new-checkout", "on"),
+            ("flags/search", "off"),
+            ("config/theme", "blue"),
+        ] {
+            sm.apply(Command::KvPut {
+                key: key.to_string(),
+                value: value.to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            });
+        }
+
+        let entries = sm.kv_prefix("flags/");
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+
+        assert_eq!(keys, vec!["flags/new-checkout", "flags/search"]);
+        assert_eq!(entries[0].1.value, "on");
+    }
+
+    #[test]
     fn election_uses_fencing_tokens_for_campaign_renew_and_resign() {
         let sm = StateMachine::new();
+        let metadata = HashMap::from([
+            ("region".to_string(), "us-east".to_string()),
+            ("address".to_string(), "https://node-a.internal".to_string()),
+        ]);
         let won = sm.apply(Command::ElectionCampaign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
-            ttl_ms: 30_000,
-            metadata: HashMap::new(),
+            ttl_ms: 120_000,
+            metadata,
         });
         let token = won.output["leadership"]["fencing_token"].as_u64().unwrap();
+        let initial_expiry = won.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
         let stale_renew = sm.apply(Command::ElectionRenew {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
@@ -2012,6 +2580,7 @@ mod tests {
             fencing_token: token,
             ttl_ms: None,
         });
+        let stored_metadata = sm.election_get("scheduler").unwrap().metadata;
         let resigned = sm.apply(Command::ElectionResign {
             name: "scheduler".to_string(),
             candidate: "node-a".to_string(),
@@ -2019,8 +2588,14 @@ mod tests {
         });
 
         assert_eq!(won.output["won"], true);
+        assert_eq!(won.output["leadership"]["metadata"]["region"], "us-east");
+        assert_eq!(stored_metadata["address"], "https://node-a.internal");
         assert_eq!(stale_renew.output["renewed"], false);
         assert_eq!(renewed.output["renewed"], true);
+        let renewed_expiry = renewed.output["leadership"]["lease_expires_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(renewed_expiry >= initial_expiry.saturating_sub(1_000));
         assert_eq!(resigned.output["resigned"], true);
         assert!(sm.election_get("scheduler").is_none());
     }
@@ -2296,5 +2871,44 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].service, "router");
         assert_eq!(summaries[0].instances, 2);
+    }
+
+    #[test]
+    fn expired_service_instances_leave_no_stale_service_name() {
+        let sm = StateMachine::new();
+        sm.apply(Command::ServiceRegister {
+            service: "api".to_string(),
+            instance_id: "a-1".to_string(),
+            address: "http://10.0.0.1:8080".to_string(),
+            ttl_ms: 0,
+            metadata: HashMap::new(),
+        });
+
+        assert!(sm.service_list("api").is_empty());
+        assert!(sm.service_names().is_empty());
+    }
+
+    #[test]
+    fn service_discovery_routes_to_the_registry_coordination_domain() {
+        for command in [
+            Command::ServiceRegister {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+                address: "http://10.0.0.1:8080".to_string(),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            },
+            Command::ServiceHeartbeat {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+                ttl_ms: None,
+            },
+            Command::ServiceDeregister {
+                service: "api".to_string(),
+                instance_id: "a-1".to_string(),
+            },
+        ] {
+            assert_eq!(command.routing_key(), SERVICE_DOMAIN);
+        }
     }
 }

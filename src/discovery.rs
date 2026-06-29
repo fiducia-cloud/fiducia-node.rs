@@ -1,11 +1,11 @@
-//! Service discovery (skeleton handlers).
+//! Service discovery handlers.
 //!
 //! A registry of live service instances with TTL-based health: instances
 //! register an address, heartbeat to stay listed, and silently drop out when
 //! their lease expires (crash-safe — no stale endpoints). Mutations are proposed
-//! to the shard owning the service name; reads go through [`Node::query`]. A
-//! service's instances all route to one shard, so listing a service is a
-//! single-shard read.
+//! to the service-discovery coordinator shard; reads go through [`Node::query`].
+//! That keeps the service-name registry linearizable while still allowing each
+//! service lookup to return only that service's live instances.
 //!
 //! Routes (mounted under `/v1/services`):
 //!   * `GET    /v1/services`                                  — list services
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::Uri,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -35,7 +35,7 @@ use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
-use crate::state::Command;
+use crate::state::{Command, ServiceInstance};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
@@ -70,12 +70,15 @@ async fn list_services(State(node): State<Arc<Node>>) -> Response {
     Json(json!({ "count": services.len(), "services": services })).into_response()
 }
 
-/// `GET /v1/services/{service}` — list live (unexpired) instances.
+/// `GET /v1/services/{service}` — list live instances, optionally filtered by
+/// exact metadata matches such as `?metadata.region=us-east`.
 async fn list_instances(
     State(node): State<Arc<Node>>,
     uri: Uri,
     Path(service): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let filters = metadata_filters(&query);
     match node
         .query(ReadRequest::Service {
             service: service.clone(),
@@ -83,11 +86,40 @@ async fn list_instances(
         .await
     {
         Ok(ReadResponse::Service(instances)) => {
+            let instances = filter_instances(instances, &filters);
             Json(json!({ "service": service, "instances": instances })).into_response()
         }
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
+}
+
+fn metadata_filters(query: &HashMap<String, String>) -> HashMap<String, String> {
+    query
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("metadata.")
+                .filter(|metadata_key| !metadata_key.trim().is_empty())
+                .map(|metadata_key| (metadata_key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn filter_instances(
+    instances: Vec<ServiceInstance>,
+    filters: &HashMap<String, String>,
+) -> Vec<ServiceInstance> {
+    if filters.is_empty() {
+        return instances;
+    }
+    instances
+        .into_iter()
+        .filter(|instance| {
+            filters
+                .iter()
+                .all(|(key, value)| instance.metadata.get(key) == Some(value))
+        })
+        .collect()
 }
 
 /// `PUT /v1/services/{service}/instances/{id}` — register/refresh an instance.
@@ -173,4 +205,67 @@ async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Re
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_filters_only_accept_prefixed_nonempty_keys() {
+        let query = HashMap::from([
+            ("metadata.region".to_string(), "us-east".to_string()),
+            ("metadata.".to_string(), "ignored".to_string()),
+            ("limit".to_string(), "10".to_string()),
+        ]);
+
+        assert_eq!(
+            metadata_filters(&query),
+            HashMap::from([("region".to_string(), "us-east".to_string())])
+        );
+    }
+
+    #[test]
+    fn filter_instances_requires_all_metadata_matches() {
+        let instances = vec![
+            instance(
+                "a",
+                [
+                    ("region".to_string(), "us-east".to_string()),
+                    ("version".to_string(), "blue".to_string()),
+                ],
+            ),
+            instance(
+                "b",
+                [
+                    ("region".to_string(), "us-east".to_string()),
+                    ("version".to_string(), "green".to_string()),
+                ],
+            ),
+            instance(
+                "c",
+                [
+                    ("region".to_string(), "eu-west".to_string()),
+                    ("version".to_string(), "blue".to_string()),
+                ],
+            ),
+        ];
+        let filters = HashMap::from([
+            ("region".to_string(), "us-east".to_string()),
+            ("version".to_string(), "blue".to_string()),
+        ]);
+
+        let filtered = filter_instances(instances, &filters);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].instance_id, "a");
+    }
+
+    fn instance<const N: usize>(id: &str, metadata: [(String, String); N]) -> ServiceInstance {
+        ServiceInstance {
+            instance_id: id.to_string(),
+            address: format!("http://{id}.internal"),
+            lease_expires_ms: u64::MAX,
+            metadata: HashMap::from(metadata),
+        }
+    }
 }

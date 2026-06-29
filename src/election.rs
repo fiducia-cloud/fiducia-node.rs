@@ -1,4 +1,4 @@
-//! Leader-election API (skeleton handlers).
+//! Leader-election API.
 //!
 //! Lets *clients* run their own leader elections on top of Fiducia: campaign for
 //! a named leadership, hold it via a TTL lease, and observe who currently holds
@@ -11,7 +11,7 @@
 //! `name`.
 //!
 //! Routes (mounted under `/v1/elections`):
-//!   * `POST /v1/elections/{name}/campaign` — `{ "candidate", "ttl_ms" }`
+//!   * `POST /v1/elections/{name}/campaign` — `{ "candidate", "ttl_ms", "metadata"? }`
 //!   * `POST /v1/elections/{name}/renew`    — `{ "candidate", "fencing_token" }`
 //!   * `POST /v1/elections/{name}/resign`   — `{ "candidate", "fencing_token" }`
 //!   * `GET  /v1/elections/{name}`          — observe the current leader

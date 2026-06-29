@@ -35,7 +35,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
 use crate::state::Command;
@@ -141,6 +141,9 @@ async fn list(node: Arc<Node>, prefix: String) -> Response {
 /// committed put/delete that matches. The connection is long-lived (no request
 /// timeout layer) with periodic keep-alive comments.
 async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
+    if prefix {
+        return watch_prefix(node, key).await;
+    }
     let Some(rx) = node.watch(&key).await else {
         return Json(json!({ "error": "unavailable", "op": "kv.watch", "key": key }))
             .into_response();
@@ -168,6 +171,39 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+async fn watch_prefix(node: Arc<Node>, prefix: String) -> Response {
+    let receivers = node.watch_all().await;
+    if receivers.is_empty() {
+        return Json(json!({ "error": "unavailable", "op": "kv.watch", "prefix": prefix }))
+            .into_response();
+    }
+
+    let mut streams = StreamMap::new();
+    for (idx, receiver) in receivers.into_iter().enumerate() {
+        streams.insert(idx, BroadcastStream::new(receiver));
+    }
+    let stream = streams.filter_map(move |(_, item)| {
+        let event = item.ok()?;
+        if !is_kv_change(event.kind) || !event.key.starts_with(&prefix) {
+            return None;
+        }
+        Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(event.kind)
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
+        ))
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+fn is_kv_change(kind: &str) -> bool {
+    matches!(kind, "put" | "delete")
 }
 
 fn bad_request(detail: &str) -> Response {

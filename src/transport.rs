@@ -74,8 +74,8 @@ pub struct RequestVoteReq {
     /// PreVote round (Raft thesis §9.6): a non-binding straw poll the candidate
     /// runs *before* incrementing its term, so a partitioned node that keeps
     /// timing out can't inflate its term and force a healthy leader to step down
-    /// when it rejoins. A voter granting a pre-vote changes **no** state. Defaults
-    /// to `false` so the field is wire-compatible with peers that never send it.
+    /// when it rejoins. A voter granting a pre-vote changes **no** state.
+    /// `#[serde(default)]` keeps it wire-compatible with peers that never send it.
     #[serde(default)]
     pub pre_vote: bool,
 }
@@ -96,9 +96,12 @@ pub struct RequestVoteResp {
 /// Shared map of every loopback node's shard inboxes. Cloned (cheaply, it is an
 /// `Arc`) into each node's [`Transport::Loopback`] and into the test harness, so
 /// a node can reach any peer's shard actor by `node_id`.
+type LoopbackShardInboxes = HashMap<ShardId, mpsc::Sender<ShardMsg>>;
+type LoopbackNodes = HashMap<String, LoopbackShardInboxes>;
+
 #[derive(Clone, Default)]
 pub struct LoopbackRegistry {
-    nodes: Arc<Mutex<HashMap<String, HashMap<ShardId, mpsc::Sender<ShardMsg>>>>>,
+    nodes: Arc<Mutex<LoopbackNodes>>,
 }
 
 #[allow(dead_code)] // the loopback registry is the in-process test harness
