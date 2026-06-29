@@ -160,13 +160,8 @@ async fn watch(State(node): State<Arc<Node>>, Path(name): Path<String>) -> Respo
             .into_response();
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
-<<<<<<< HEAD
         let event = item.ok()?; // drop lag/closed notifications
         if event.scope != "election" || event.key != name {
-=======
-        let event = item.ok()?;
-        if event.key != name {
->>>>>>> origin/main
             return None;
         }
         Some(Ok::<Event, Infallible>(
