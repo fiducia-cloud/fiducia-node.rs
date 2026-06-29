@@ -1152,7 +1152,6 @@ impl ShardActor {
             follower_lag_max = self.metrics.follower_lag_max,
             "updated follower lag"
         );
->>>>>>> origin/main
     }
 
     // --- replication (follower side) --------------------------------------
