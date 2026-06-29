@@ -539,11 +539,8 @@ impl ShardActor {
         transport: Arc<Transport>,
         self_tx: mpsc::Sender<ShardMsg>,
         timing: RaftTiming,
-<<<<<<< HEAD
         store: Option<ShardStore>,
         recovered: Recovered,
-=======
->>>>>>> origin/main
     ) -> Self {
         let members = peers.len() + 1;
         let single = members == 1;
