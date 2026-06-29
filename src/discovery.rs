@@ -180,7 +180,6 @@ async fn deregister(
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
-<<<<<<< HEAD
 ///
 /// Subscribes to the owning shard's change broadcast and emits one SSE event per
 /// committed `register`/`heartbeat`/`deregister` for this service, so clients can
@@ -194,18 +193,6 @@ async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Re
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
         if event.scope != "service" || event.key != service {
-=======
-async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
-    let Some(rx) = node.watch(SERVICE_DOMAIN).await else {
-        return Json(
-            json!({ "error": "unavailable", "op": "discovery.watch", "service": service }),
-        )
-        .into_response();
-    };
-    let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let event = item.ok()?;
-        if event.key != service {
->>>>>>> origin/main
             return None;
         }
         Some(Ok::<Event, Infallible>(
