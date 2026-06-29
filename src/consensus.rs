@@ -396,16 +396,12 @@ impl ReadRequest {
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
-<<<<<<< HEAD
             ReadRequest::Service { service } => service,
             // Lock/semaphore inventory shares the single lock-coordinator shard.
             ReadRequest::LockInventory | ReadRequest::SemaphoreInventory => crate::state::LOCK_DOMAIN,
             // List reads fan out across all shards rather than routing to one.
             ReadRequest::KvList { prefix } => prefix,
             ReadRequest::ServiceList | ReadRequest::ScheduleList | ReadRequest::ElectionList => "",
-=======
-            ReadRequest::Services | ReadRequest::Service { .. } => crate::state::SERVICE_DOMAIN,
->>>>>>> origin/main
         }
     }
 }
