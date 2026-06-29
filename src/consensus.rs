@@ -3076,7 +3076,6 @@ mod tests {
             Arc::new(Transport::loopback(reg)),
             tx,
             RaftTiming::default(),
-<<<<<<< HEAD
             None,
             Recovered::default(),
         )
