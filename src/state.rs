@@ -208,18 +208,13 @@ impl Command {
             | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
-<<<<<<< HEAD
-            | Command::RateLimitCheck { key, .. } => key,
+            | Command::RateLimitCheck { key, .. }
+            | Command::IdempotencyClaim { key, .. }
+            | Command::IdempotencyComplete { key, .. } => key,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
             | Command::ScheduleRecordResult { name, .. } => name,
-=======
-            | Command::RateLimitCheck { key, .. }
-            | Command::IdempotencyClaim { key, .. }
-            | Command::IdempotencyComplete { key, .. } => key,
-            Command::ScheduleUpsert { name, .. } | Command::ScheduleRecordRun { name, .. } => name,
->>>>>>> origin/main
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
