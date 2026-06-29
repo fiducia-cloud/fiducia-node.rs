@@ -2829,7 +2829,6 @@ mod tests {
         assert!(out.output["ok"].as_bool().unwrap());
     }
 
-<<<<<<< HEAD
     /// Cluster-wide: poll until **every** shard in `0..shard_count` has settled on
     /// exactly one leader across `nodes`, or panic. Returns each shard's leader idx.
     async fn await_all_shards_converged(
