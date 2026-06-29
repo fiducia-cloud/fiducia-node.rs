@@ -1377,12 +1377,7 @@ impl ShardActor {
                 continue; // no-op
             };
             let applied = self.state.apply(command.clone());
-<<<<<<< HEAD
             self.publish_change(&command, &applied.output, applied.revision);
-            if let Some(resp) = self.pending.remove(&i) {
-                let _ = resp.send(Ok(ProposeOutcome {
-=======
-            self.publish_change(&command, applied.revision, &applied.output);
             if let Some(pending) = self.pending.remove(&i) {
                 let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
                 self.metrics.quorum_rtt_ms_last = Some(quorum_rtt_ms);
@@ -1394,7 +1389,6 @@ impl ShardActor {
                     "proposal committed on quorum"
                 );
                 let _ = pending.resp.send(Ok(ProposeOutcome {
->>>>>>> origin/main
                     shard: self.shard_id,
                     log_index: i,
                     revision: applied.revision,
