@@ -396,6 +396,7 @@ impl ReadRequest {
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
+            ReadRequest::Services => crate::state::SERVICE_DOMAIN,
             ReadRequest::Service { service } => service,
             // Lock/semaphore inventory shares the single lock-coordinator shard.
             ReadRequest::LockInventory | ReadRequest::SemaphoreInventory => crate::state::LOCK_DOMAIN,
