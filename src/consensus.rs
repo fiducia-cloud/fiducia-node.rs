@@ -66,18 +66,8 @@ pub use fiducia_routing::ShardId;
 
 /// Depth of each shard actor's inbox before senders must wait.
 const SHARD_INBOX_CAPACITY: usize = 1024;
-<<<<<<< HEAD
 /// How long a client write waits for its entry to commit before giving up.
 const COMMIT_WAIT: Duration = Duration::from_secs(5);
-=======
-/// How often a shard actor wakes to check election/heartbeat deadlines.
-const TICK: Duration = Duration::from_millis(20);
-/// Default Raft timing. WAN deployments should tune these from measured RTT.
-const DEFAULT_HEARTBEAT_MS: u64 = 50;
-const DEFAULT_ELECTION_MIN_MS: u64 = 150;
-const DEFAULT_ELECTION_JITTER_MS: u64 = 150;
-const DEFAULT_COMMIT_WAIT_MS: u64 = 5_000;
->>>>>>> origin/main
 /// Capacity of each shard's change-event broadcast (feeds KV watches).
 const CHANGE_BUFFER: usize = 256;
 
