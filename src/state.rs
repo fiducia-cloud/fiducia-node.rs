@@ -2175,7 +2175,6 @@ mod tests {
         assert_eq!(state.holder.as_deref(), Some("holder-2"));
         assert!(state.fencing_token.unwrap() > token1);
         assert!(state.wait_queue.is_empty());
->>>>>>> origin/main
     }
 
     #[test]
