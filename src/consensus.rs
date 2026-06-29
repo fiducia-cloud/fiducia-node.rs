@@ -238,15 +238,10 @@ pub struct ChangeEvent {
     /// The watched name: kv key, election name, or service name.
     pub key: String,
     pub revision: u64,
-<<<<<<< HEAD
     /// Optional payload (the new `Leadership` or `ServiceInstance`) so watchers
     /// can act on a single event without a follow-up read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
-=======
-    #[serde(skip_serializing_if = "Value::is_null")]
-    pub data: Value,
->>>>>>> origin/main
 }
 
 /// Static identity + cluster membership for this physical node.
