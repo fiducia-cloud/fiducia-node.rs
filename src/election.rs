@@ -149,14 +149,11 @@ async fn observe(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<Strin
 }
 
 /// `GET /v1/elections/{name}/watch` — SSE stream of leadership changes.
-<<<<<<< HEAD
 ///
 /// Subscribes to the owning shard's change broadcast and emits one SSE event per
 /// committed `elected`/`renewed`/`resigned` for this election. A client watches
 /// this to learn, e.g., that the old leader's lease lapsed and a new candidate
 /// won — then re-routes to the new leader without polling.
-=======
->>>>>>> origin/main
 async fn watch(State(node): State<Arc<Node>>, Path(name): Path<String>) -> Response {
     let Some(rx) = node.watch(&name).await else {
         return Json(json!({ "error": "unavailable", "op": "election.watch", "name": name }))
