@@ -1992,7 +1992,6 @@ impl Node {
             }
         }
         receivers
->>>>>>> origin/main
     }
 
     /// Per-shard consensus status across all shards this node hosts.
