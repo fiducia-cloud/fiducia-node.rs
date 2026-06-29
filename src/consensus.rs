@@ -3020,9 +3020,6 @@ mod tests {
         assert_eq!(t.election_min_ms, 1000);
     }
 
-    /// Build a bare follower shard actor (3-member group) for white-box tests of
-    /// the pre-vote decision. Not wired into any cluster.
-=======
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn leadership_fails_over_when_the_leader_becomes_unresponsive() {
         let reg = LoopbackRegistry::new();
