@@ -1578,6 +1578,12 @@ impl ShardActor {
             ReadRequest::Service { service } => {
                 ReadResponse::Service(self.state.service_list(&service))
             }
+            ReadRequest::KvPrefix { prefix } => {
+                ReadResponse::KvPrefix(self.state.kv_prefix(&prefix))
+            }
+            ReadRequest::Idempotency { key } => {
+                ReadResponse::Idempotency(self.state.idempotency_get(&key))
+            }
         }
     }
 
