@@ -125,7 +125,6 @@ async fn delete_key(
     propose_response(result, &uri)
 }
 
-<<<<<<< HEAD
 /// `GET /v1/kv?prefix=...` — list live keys under a prefix.
 ///
 /// A prefix can span shards, so this fans the range read out across every shard
@@ -134,21 +133,6 @@ async fn delete_key(
 async fn list(node: Arc<Node>, prefix: String) -> Response {
     let keys = node.list_kv(&prefix).await;
     Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response()
-=======
-/// `GET /v1/kv?prefix=...` — list keys under a prefix.
-async fn list(node: Arc<Node>, uri: Uri, prefix: Option<String>) -> Response {
-    let prefix = prefix.unwrap_or_default();
-    match node.query_kv_prefix(prefix.clone()).await {
-        Ok(entries) => {
-            let entries: Vec<_> = entries
-                .into_iter()
-                .map(|(key, entry)| json!({ "key": key, "entry": entry }))
-                .collect();
-            Json(json!({ "prefix": prefix, "entries": entries })).into_response()
-        }
-        Err(err) => read_error_response(err, &uri),
-    }
->>>>>>> origin/main
 }
 
 /// SSE stream of change events for a key (or, when `prefix`, every key under it).
