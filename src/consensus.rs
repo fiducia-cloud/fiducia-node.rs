@@ -2394,7 +2394,6 @@ mod tests {
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn observability_reads_surface_locks_elections_and_quorum() {
         let reg = LoopbackRegistry::new();
         let n = node("solo", &[], 4, &reg);
