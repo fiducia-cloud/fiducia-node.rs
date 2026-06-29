@@ -2750,7 +2750,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn election_campaign_publishes_candidate_metadata() {
         let sm = StateMachine::new();
         let mut metadata = HashMap::new();
