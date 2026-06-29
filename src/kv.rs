@@ -87,11 +87,7 @@ async fn get_or_list(
             Err(err) => read_error_response(err, &uri),
             _ => Json(json!({ "error": "unavailable" })).into_response(),
         },
-<<<<<<< HEAD
         None => list(node, q.prefix.unwrap_or_default()).await,
-=======
-        None => list(node, uri, q.prefix).await,
->>>>>>> origin/main
     }
 }
 
