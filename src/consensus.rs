@@ -418,7 +418,6 @@ pub enum ReadResponse {
     Schedule(Option<Schedule>),
     ScheduleHistory(Vec<ScheduleRun>),
     Election(Option<Leadership>),
-    Services(Vec<String>),
     Service(Vec<ServiceInstance>),
     KvList(Vec<KvListItem>),
     ServiceList(Vec<ServiceSummary>),
