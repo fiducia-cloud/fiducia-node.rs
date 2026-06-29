@@ -1084,7 +1084,6 @@ impl ShardActor {
         }
     }
 
-<<<<<<< HEAD
     // --- CheckQuorum / leader lease ---------------------------------------
 
     /// Whether this leader has confirmed contact with a majority of the group
