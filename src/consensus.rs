@@ -2699,7 +2699,6 @@ mod tests {
                 other => panic!("expected not-leader for follower shard, got {other:?}"),
             }
         }
->>>>>>> origin/main
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
