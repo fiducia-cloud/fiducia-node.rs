@@ -1416,59 +1416,7 @@ impl ShardActor {
                 kind: "delete",
                 key: key.clone(),
                 revision,
-<<<<<<< HEAD
                 detail: None,
-=======
-                data: output.clone(),
-            }),
-            Command::IdempotencyClaim { key, .. } => Some(ChangeEvent {
-                kind: "idempotency_claim",
-                key: key.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::IdempotencyComplete { key, .. } => Some(ChangeEvent {
-                kind: "idempotency_complete",
-                key: key.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::ElectionCampaign { name, .. } => Some(ChangeEvent {
-                kind: "election_campaign",
-                key: name.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::ElectionRenew { name, .. } => Some(ChangeEvent {
-                kind: "election_renew",
-                key: name.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::ElectionResign { name, .. } => Some(ChangeEvent {
-                kind: "election_resign",
-                key: name.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::ServiceRegister { service, .. } => Some(ChangeEvent {
-                kind: "service_register",
-                key: service.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::ServiceHeartbeat { service, .. } => Some(ChangeEvent {
-                kind: "service_heartbeat",
-                key: service.clone(),
-                revision,
-                data: output.clone(),
-            }),
-            Command::ServiceDeregister { service, .. } => Some(ChangeEvent {
-                kind: "service_deregister",
-                key: service.clone(),
-                revision,
-                data: output.clone(),
->>>>>>> origin/main
             }),
             Command::ElectionCampaign { name, .. } if flagged("won") => Some(ChangeEvent {
                 scope: "election",
