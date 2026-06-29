@@ -1732,7 +1732,6 @@ impl Node {
                 _ => Err(ProposeError::Unavailable { shard }),
             }
         }
-<<<<<<< HEAD
         .await;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
         self.metrics.record(op, elapsed_ms, result.is_ok());
