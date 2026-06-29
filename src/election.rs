@@ -43,14 +43,10 @@ use crate::state::Command;
 pub struct CampaignBody {
     pub candidate: String,
     pub ttl_ms: u64,
-<<<<<<< HEAD
     /// Optional candidate facts (address, region, version, …) published with the
     /// leadership so observers/watchers can discover the leader's endpoint.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
-=======
-    pub metadata: Option<HashMap<String, String>>,
->>>>>>> origin/main
 }
 
 #[derive(Debug, Deserialize)]
