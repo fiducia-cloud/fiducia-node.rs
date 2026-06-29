@@ -327,11 +327,8 @@ pub enum ShardMsg {
         resp: oneshot::Sender<RequestVoteResp>,
     },
     /// A peer's reply to a `RequestVote` this shard sent (routed back to self).
-<<<<<<< HEAD
     /// `pre_vote` echoes whether the request that produced it was a pre-vote, so
     /// the candidate counts it toward the right round.
-=======
->>>>>>> origin/main
     VoteReply {
         from: String,
         pre_vote: bool,
