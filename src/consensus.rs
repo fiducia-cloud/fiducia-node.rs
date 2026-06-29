@@ -632,18 +632,12 @@ impl ShardActor {
                 pre_vote,
                 resp,
             } => self.handle_vote_reply(from, pre_vote, resp),
-<<<<<<< HEAD
-            ShardMsg::AppendReply { from, up_to, resp } => {
-                self.handle_append_reply(from, up_to, resp)
-            }
-=======
             ShardMsg::AppendReply {
                 from,
                 up_to,
                 rtt_ms,
                 resp,
             } => self.handle_append_reply(from, up_to, rtt_ms, resp),
->>>>>>> origin/main
             ShardMsg::Subscribe { resp } => {
                 let _ = resp.send(self.changes.subscribe());
             }
