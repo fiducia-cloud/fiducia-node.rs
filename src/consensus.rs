@@ -277,8 +277,8 @@ impl Default for NodeConfig {
             shard_count: std::env::var("FIDUCIA_SHARD_COUNT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-<<<<<<< HEAD
-                .unwrap_or(16),
+                .unwrap_or(16)
+                .max(1),
             // Default to the conventional PVC mount; a deployment can override
             // with FIDUCIA_DATA_DIR. The directory must be writable (the pod
             // mounts a PersistentVolume there).
@@ -287,53 +287,8 @@ impl Default for NodeConfig {
                     .unwrap_or_else(|_| "/var/lib/fiducia".to_string())
                     .into(),
             ),
-=======
-                .unwrap_or(16)
-                .max(1),
-            timing: RaftTiming::default(),
->>>>>>> origin/main
         }
     }
-}
-
-impl Default for RaftTiming {
-    fn default() -> Self {
-        let mut heartbeat_ms = env_u64("FIDUCIA_RAFT_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS).max(1);
-        let mut election_min_ms =
-            env_u64("FIDUCIA_RAFT_ELECTION_MIN_MS", DEFAULT_ELECTION_MIN_MS).max(1);
-        let election_jitter_ms = env_u64(
-            "FIDUCIA_RAFT_ELECTION_JITTER_MS",
-            DEFAULT_ELECTION_JITTER_MS,
-        );
-        let commit_wait_ms = env_u64("FIDUCIA_RAFT_COMMIT_WAIT_MS", DEFAULT_COMMIT_WAIT_MS).max(1);
-
-        if let Some(rtt_ms) = env_optional_u64("FIDUCIA_RAFT_RTT_MS") {
-            heartbeat_ms = heartbeat_ms.max(rtt_ms.max(1));
-            election_min_ms = election_min_ms.max(heartbeat_ms.saturating_mul(10));
-        }
-        election_min_ms = election_min_ms.max(heartbeat_ms.saturating_mul(3));
-
-        let pre_vote = std::env::var("FIDUCIA_RAFT_PREVOTE")
-            .ok()
-            .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-            .unwrap_or(true);
-
-        Self {
-            heartbeat_ms,
-            election_min_ms,
-            election_jitter_ms,
-            commit_wait_ms,
-            pre_vote,
-        }
-    }
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    env_optional_u64(name).unwrap_or(default)
-}
-
-fn env_optional_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
 
 // ---------------------------------------------------------------------------
