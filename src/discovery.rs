@@ -35,7 +35,7 @@ use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
-use crate::state::{Command, ServiceInstance, SERVICE_DOMAIN};
+use crate::state::{Command, ServiceInstance};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
