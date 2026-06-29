@@ -2869,36 +2869,6 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].service, "router");
         assert_eq!(summaries[0].instances, 2);
-=======
-    fn service_names_are_sorted_and_pruned_when_empty() {
-        let sm = StateMachine::new();
-        sm.apply(Command::ServiceRegister {
-            service: "worker".to_string(),
-            instance_id: "w-1".to_string(),
-            address: "http://10.0.0.2:8080".to_string(),
-            ttl_ms: 30_000,
-            metadata: HashMap::new(),
-        });
-        sm.apply(Command::ServiceRegister {
-            service: "api".to_string(),
-            instance_id: "a-1".to_string(),
-            address: "http://10.0.0.1:8080".to_string(),
-            ttl_ms: 30_000,
-            metadata: HashMap::new(),
-        });
-
-        assert_eq!(
-            sm.service_names(),
-            vec!["api".to_string(), "worker".to_string()]
-        );
-
-        sm.apply(Command::ServiceDeregister {
-            service: "api".to_string(),
-            instance_id: "a-1".to_string(),
-        });
-
-        assert_eq!(sm.service_names(), vec!["worker".to_string()]);
-        assert!(sm.service_list("api").is_empty());
     }
 
     #[test]
