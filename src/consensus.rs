@@ -662,11 +662,7 @@ impl ShardActor {
         match self.role {
             Role::Leader => {
                 if now >= self.heartbeat_deadline {
-<<<<<<< HEAD
                     self.heartbeat_deadline = now + self.timing.heartbeat;
-=======
-                    self.heartbeat_deadline = now + self.timing.heartbeat_duration();
->>>>>>> origin/main
                     self.broadcast_append_entries();
                 }
                 // CheckQuorum: a leader that can no longer reach a majority steps
