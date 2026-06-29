@@ -3066,7 +3066,6 @@ mod tests {
 
     /// Bare follower shard actor (3-member group) for white-box tests of the
     /// pre-vote decision. Not wired into any cluster.
->>>>>>> origin/main
     fn follower_actor() -> ShardActor {
         let reg = LoopbackRegistry::new();
         let (tx, _rx) = mpsc::channel(16);
