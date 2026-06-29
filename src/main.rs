@@ -29,6 +29,7 @@ mod state;
 mod transport;
 mod validate;
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
