@@ -192,8 +192,7 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/append");
-                client
-                    .post(url)
+                with_internal_auth(client.post(url))
                     .json(&req)
                     .send()
                     .await
@@ -221,8 +220,7 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/vote");
-                client
-                    .post(url)
+                with_internal_auth(client.post(url))
                     .json(&req)
                     .send()
                     .await
@@ -232,5 +230,14 @@ impl Transport {
                     .ok()
             }
         }
+    }
+}
+
+/// Attach the trusted-hop header to an outbound `/raft` RPC when the cluster
+/// secret is configured, so peers running with the guard enabled accept it.
+fn with_internal_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match crate::internal_auth::secret() {
+        Some(secret) => builder.header(crate::internal_auth::INTERNAL_AUTH_HEADER, secret),
+        None => builder,
     }
 }

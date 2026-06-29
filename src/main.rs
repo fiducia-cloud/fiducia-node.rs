@@ -10,23 +10,29 @@
 //! marked with `TODO`s in the respective modules.
 
 mod consensus;
+mod cron;
 mod discovery;
 mod election;
 mod indexed_queue;
+mod internal_auth;
 mod kv;
 mod locks;
+mod metrics;
+mod observe;
 mod persist;
 mod raft_api;
 mod rate_limit;
 mod schedule;
+mod schedule_runner;
 mod semaphore;
 mod state;
 mod transport;
+mod validate;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{routing::get, Json, Router};
+use axum::{middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
 use tower_http::{catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
@@ -54,6 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let node = Arc::new(Node::bootstrap_http(config));
 
+    // The cron firing loop: fires due schedules on the shards this node leads.
+    schedule_runner::spawn(node.clone());
+
+    // Log whether the internal trust boundary (LB→node, node→node) is enforced.
+    internal_auth::init_and_log();
+
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
@@ -63,14 +75,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/ratelimit", rate_limit::router())
         .nest("/cron", schedule::router())
         .nest("/elections", election::router())
-        .nest("/services", discovery::router());
+        .nest("/services", discovery::router())
+        .nest("/observe", observe::router());
 
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        .nest("/v1", v1)
+        // `/v1` (client data plane, reached via the LB) and `/raft` (peer RPC) are
+        // cluster-internal: when FIDUCIA_INTERNAL_SECRET is set, both require the
+        // trusted-hop header. Health probes stay open for k8s. The guard is a
+        // no-op when the secret is unset (dev / single-node), so this is additive.
+        .nest("/v1", v1.layer(middleware::from_fn(internal_auth::guard)))
         // Internal node↔node Raft RPC (peer transport server side); not under /v1.
-        .nest("/raft", raft_api::router())
+        .nest(
+            "/raft",
+            raft_api::router().layer(middleware::from_fn(internal_auth::guard)),
+        )
         .with_state(node)
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.

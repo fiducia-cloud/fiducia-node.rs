@@ -83,6 +83,11 @@ async fn acquire(
     uri: Uri,
     Json(body): Json<AcquireBody>,
 ) -> Response {
+    if let Err(rejection) =
+        crate::validate::semaphore_acquire(&body.key, &body.holder, body.limit, body.ttl_ms)
+    {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::SemaphoreAcquire {
             key: body.key,

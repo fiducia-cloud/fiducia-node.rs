@@ -50,8 +50,9 @@ use tokio::time::{Duration, Instant};
 
 use crate::persist::{Recovered, ShardStore};
 use crate::state::{
-    Command, KvEntry, KvListItem, Leadership, LockState, RateLimitSnapshot, Schedule, ScheduleRun,
-    SemaphoreState, ServiceInstance, ServiceSummary, StateMachine,
+    Command, ElectionEntry, KvEntry, KvListItem, Leadership, LockInventory, LockState,
+    RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState, ServiceInstance, ServiceSummary,
+    StateMachine,
 };
 use crate::transport::{
     AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
@@ -93,6 +94,20 @@ pub struct RaftTiming {
     /// incrementing the term, so a partitioned/laggy node can't disrupt a healthy
     /// leader on rejoin. Strictly safer on a WAN; on by default.
     pub pre_vote: bool,
+    /// CheckQuorum + leader lease (Raft thesis §6.2 / §6.4). A leader that has not
+    /// heard back from a majority of the group within one `election_min_ms` window
+    /// must assume it may have been partitioned away and a new leader elected
+    /// elsewhere, so it (a) steps down on the next tick and (b) refuses to serve a
+    /// linearizable read in the meantime. Without this, a partitioned-but-unaware
+    /// leader keeps `role == Leader` (it only steps down on seeing a *higher* term)
+    /// and can answer a stale read — e.g. "lock L is free" after a new leader on the
+    /// majority side already granted it. The lease is correct only under bounded
+    /// clock drift: it is sized at `election_min_ms`, i.e. no longer than a
+    /// follower's own election timeout, so a fresh leader cannot have committed
+    /// before the old lease expires. On by default (strictly safer); the one
+    /// liveness cost is that an isolated leader gives up leadership a lease sooner.
+    /// Disable with `FIDUCIA_RAFT_CHECK_QUORUM=off`.
+    pub check_quorum: bool,
 }
 
 impl Default for RaftTiming {
@@ -103,6 +118,7 @@ impl Default for RaftTiming {
             election_min_ms: 150,
             election_jitter_ms: 150,
             pre_vote: true,
+            check_quorum: true,
         }
     }
 }
@@ -131,6 +147,10 @@ impl RaftTiming {
                 .ok()
                 .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
                 .unwrap_or(d.pre_vote),
+            check_quorum: std::env::var("FIDUCIA_RAFT_CHECK_QUORUM")
+                .ok()
+                .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+                .unwrap_or(d.check_quorum),
         }
         .sanitized()
     }
@@ -345,6 +365,18 @@ pub enum ReadRequest {
     /// Every service with live instances on one shard. Fanned out by
     /// [`Node::list_services`] and served serializably.
     ServiceList,
+    /// Every schedule definition on one shard. Fanned out by
+    /// [`Node::list_schedules`] for the firing loop to find due fires.
+    ScheduleList,
+    /// Whole-coordinator lock inventory: every grant + the FIFO wait queue. All
+    /// lock state lives on the [`LOCK_DOMAIN`](crate::state::LOCK_DOMAIN) shard,
+    /// so this routes to that single shard.
+    LockInventory,
+    /// Snapshot of every counting semaphore on the lock-coordinator shard.
+    SemaphoreInventory,
+    /// Every named election with live leadership on one shard. Elections route by
+    /// name, so [`Node::list_elections`] fans this out and merges.
+    ElectionList,
 }
 
 impl ReadRequest {
@@ -358,9 +390,11 @@ impl ReadRequest {
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
             ReadRequest::Service { service } => service,
+            // Lock/semaphore inventory shares the single lock-coordinator shard.
+            ReadRequest::LockInventory | ReadRequest::SemaphoreInventory => crate::state::LOCK_DOMAIN,
             // List reads fan out across all shards rather than routing to one.
             ReadRequest::KvList { prefix } => prefix,
-            ReadRequest::ServiceList => "",
+            ReadRequest::ServiceList | ReadRequest::ScheduleList | ReadRequest::ElectionList => "",
         }
     }
 }
@@ -378,6 +412,10 @@ pub enum ReadResponse {
     Service(Vec<ServiceInstance>),
     KvList(Vec<KvListItem>),
     ServiceList(Vec<ServiceSummary>),
+    ScheduleList(Vec<Schedule>),
+    LockInventory(LockInventory),
+    SemaphoreInventory(Vec<SemaphoreState>),
+    ElectionList(Vec<ElectionEntry>),
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +432,12 @@ struct LeaderState {
     /// Whether an `AppendEntries` is already outstanding to a peer (so we don't
     /// pile on duplicates, which would over-rewind `next_index`).
     in_flight: HashMap<String, bool>,
+    /// When we last received a reply from each peer *at our current term* — proof
+    /// the peer still acknowledges us as leader. Drives CheckQuorum / the leader
+    /// lease: if a majority's most-recent contact has aged past one election
+    /// timeout, we may have been partitioned and must step down (see
+    /// [`RaftTiming::check_quorum`]).
+    last_contact: HashMap<String, Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +630,12 @@ impl ShardActor {
                     self.heartbeat_deadline = now + self.timing.heartbeat;
                     self.broadcast_append_entries();
                 }
+                // CheckQuorum: a leader that can no longer reach a majority steps
+                // down so it can't keep accepting doomed writes or answering stale
+                // reads while a new leader forms on the majority side.
+                if self.timing.check_quorum && self.members > 1 && !self.leader_lease_held() {
+                    self.relinquish_no_quorum();
+                }
             }
             Role::Follower | Role::Candidate => {
                 if now >= self.election_deadline {
@@ -758,13 +808,20 @@ impl ShardActor {
             members = self.members,
             "raft: won election — now leader for shard"
         );
-        self.votes.clear();
+        // The peers that just voted for us *are* fresh majority contact, so seed the
+        // leader lease from them — otherwise the very first lease window would look
+        // expired and we'd step down before the first heartbeat round returns.
+        let voters = std::mem::take(&mut self.votes);
+        let now = Instant::now();
         let mut ls = LeaderState::default();
         let next = self.last_log_index() + 1;
         for peer in &self.peers {
             ls.next_index.insert(peer.clone(), next);
             ls.match_index.insert(peer.clone(), 0);
             ls.in_flight.insert(peer.clone(), false);
+            if voters.contains(peer) {
+                ls.last_contact.insert(peer.clone(), now);
+            }
         }
         self.leader = Some(ls);
 
@@ -792,7 +849,7 @@ impl ShardActor {
                 shard = ?self.shard_id,
                 node = %self.node_id,
                 term,
-                "raft: stepped down to follower (observed a higher term)"
+                "raft: stepped down to follower"
             );
         }
         self.current_term = term;
@@ -923,6 +980,9 @@ impl ShardActor {
         }
         let mut more = false;
         if let Some(ls) = self.leader.as_mut() {
+            // Any reply at our term is proof this peer still sees us as leader —
+            // refresh the lease clock regardless of log success/mismatch.
+            ls.last_contact.insert(from.clone(), Instant::now());
             if resp.success {
                 ls.match_index.insert(from.clone(), up_to);
                 ls.next_index.insert(from.clone(), up_to + 1);
@@ -965,6 +1025,54 @@ impl ShardActor {
             self.apply_committed();
             self.persist_hard_state(); // record the advanced commit pointer
         }
+    }
+
+    // --- CheckQuorum / leader lease ---------------------------------------
+
+    /// Whether this leader has confirmed contact with a majority of the group
+    /// within the last election timeout — i.e. holds a valid leader lease and may
+    /// safely act as leader (serve a linearizable read, stay leader).
+    ///
+    /// Returns `true` when CheckQuorum is disabled or this is a single-member group
+    /// (the node alone *is* the majority), so the feature is byte-identical to the
+    /// old behaviour when off.
+    fn leader_lease_held(&self) -> bool {
+        if !self.timing.check_quorum || self.members == 1 {
+            return true;
+        }
+        let Some(ls) = self.leader.as_ref() else {
+            return false; // not actually leading
+        };
+        // Most-recent-contact instant per member: `now` for self, last reply for
+        // each peer (absent ⇒ never). The majority-th most recent of these is the
+        // latest moment at which a majority was in contact; the lease holds for one
+        // election timeout past it.
+        let now = Instant::now();
+        let never = now.checked_sub(Duration::from_secs(86_400)).unwrap_or(now);
+        let mut contacts: Vec<Instant> = Vec::with_capacity(self.members);
+        contacts.push(now); // self
+        for peer in &self.peers {
+            contacts.push(ls.last_contact.get(peer).copied().unwrap_or(never));
+        }
+        contacts.sort_unstable_by(|a, b| b.cmp(a)); // most-recent first
+        let majority_contact = contacts[self.majority() - 1];
+        majority_contact.elapsed() < Duration::from_millis(self.timing.election_min_ms)
+    }
+
+    /// Step down because the leader lease lapsed (CheckQuorum). We keep the same
+    /// term — we have *not* observed a newer one, we have simply lost contact — and
+    /// become a follower so we stop serving authoritative reads/writes. The normal
+    /// election timeout then governs whether we (or someone with quorum) campaign.
+    fn relinquish_no_quorum(&mut self) {
+        tracing::warn!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            term = self.current_term,
+            "raft: leader lease lapsed (no majority contact within an election timeout) \
+             — stepping down to avoid split-brain / stale reads (check-quorum)"
+        );
+        let term = self.current_term;
+        self.step_down(term, None);
     }
 
     // --- replication (follower side) --------------------------------------
@@ -1258,6 +1366,25 @@ impl ShardActor {
                 leader: self.leader_id.clone(),
             });
         }
+        // Linearizable read gate (leader lease): a leader that hasn't confirmed a
+        // majority within the last election timeout might already be deposed, so it
+        // must not answer authoritatively. Closes the sub-tick window before
+        // CheckQuorum's `on_tick` step-down fires. The client retries (503) and is
+        // rerouted to whoever actually holds quorum. Serializable list/fan-out reads
+        // (handle_query_local) deliberately skip this — stale results are allowed
+        // there by contract.
+        if !matches!(
+            request,
+            ReadRequest::KvList { .. }
+                | ReadRequest::ServiceList
+                | ReadRequest::ScheduleList
+                | ReadRequest::ElectionList
+        ) && !self.leader_lease_held()
+        {
+            return Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            });
+        }
         match request {
             ReadRequest::Kv { key } => Ok(ReadResponse::Kv(self.state.kv_get(&key))),
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
@@ -1279,11 +1406,20 @@ impl ShardActor {
             ReadRequest::Service { service } => {
                 Ok(ReadResponse::Service(self.state.service_list(&service)))
             }
+            // Lock/semaphore inventory is a linearizable read of the single
+            // coordinator shard, so it stays leader-gated like the per-key reads.
+            ReadRequest::LockInventory => {
+                Ok(ReadResponse::LockInventory(self.state.lock_inventory()))
+            }
+            ReadRequest::SemaphoreInventory => Ok(ReadResponse::SemaphoreInventory(
+                self.state.semaphore_inventory(),
+            )),
             // List reads are served serializably; route them through the local
             // path even if they reach here.
-            list @ (ReadRequest::KvList { .. } | ReadRequest::ServiceList) => {
-                Ok(self.handle_query_local(list))
-            }
+            list @ (ReadRequest::KvList { .. }
+            | ReadRequest::ServiceList
+            | ReadRequest::ScheduleList
+            | ReadRequest::ElectionList) => Ok(self.handle_query_local(list)),
         }
     }
 
@@ -1294,6 +1430,16 @@ impl ShardActor {
         match request {
             ReadRequest::KvList { prefix } => ReadResponse::KvList(self.state.kv_list(&prefix)),
             ReadRequest::ServiceList => ReadResponse::ServiceList(self.state.service_names()),
+            ReadRequest::ScheduleList => ReadResponse::ScheduleList(self.state.schedule_list()),
+            ReadRequest::ElectionList => {
+                ReadResponse::ElectionList(self.state.election_inventory())
+            }
+            ReadRequest::LockInventory => {
+                ReadResponse::LockInventory(self.state.lock_inventory())
+            }
+            ReadRequest::SemaphoreInventory => {
+                ReadResponse::SemaphoreInventory(self.state.semaphore_inventory())
+            }
             // A single-key read arriving on the local path: serve it off applied
             // state too rather than erroring.
             ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
@@ -1318,13 +1464,43 @@ impl ShardActor {
     }
 
     fn status(&self) -> ShardStatus {
+        // Quorum + replication are leader-side knowledge: only the leader tracks
+        // each peer's match_index. A follower reports an empty replication view and
+        // `has_quorum = false` (it cannot vouch for the group's health).
+        let (replication, healthy_replicas, has_quorum) = if self.role == Role::Leader {
+            let last = self.last_log_index();
+            let mut reps = Vec::with_capacity(self.peers.len());
+            let mut caught_up = 1usize; // self always has the committed prefix
+            if let Some(ls) = &self.leader {
+                for peer in &self.peers {
+                    let match_index = ls.match_index.get(peer).copied().unwrap_or(0);
+                    if match_index >= self.commit_index {
+                        caught_up += 1;
+                    }
+                    reps.push(PeerReplication {
+                        peer: peer.clone(),
+                        match_index,
+                        lag: last.saturating_sub(match_index),
+                        in_flight: ls.in_flight.get(peer).copied().unwrap_or(false),
+                    });
+                }
+            }
+            reps.sort_by(|a, b| a.peer.cmp(&b.peer));
+            (reps, caught_up, caught_up >= self.majority())
+        } else {
+            (Vec::new(), 0, false)
+        };
         ShardStatus {
             shard_id: self.shard_id,
             role: self.role,
             term: self.current_term,
             leader_id: self.leader_id.clone(),
             commit_index: self.commit_index,
+            last_applied: self.last_applied,
             last_log_index: self.last_log_index(),
+            healthy_replicas,
+            has_quorum,
+            replication,
         }
     }
 }
@@ -1344,6 +1520,8 @@ pub struct Node {
     /// Shard actor handles — used by `shutdown` (failover tests / graceful stop).
     #[allow(dead_code)]
     tasks: Vec<JoinHandle<()>>,
+    /// In-process per-operation latency + outcome metrics (see `/v1/observe/metrics`).
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Node {
@@ -1392,6 +1570,7 @@ impl Node {
             shards,
             transport,
             tasks,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         }
     }
 
@@ -1435,6 +1614,7 @@ impl Node {
         }
         .await;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+        self.metrics.record(op, elapsed_ms, result.is_ok());
         match &result {
             Ok(_) => tracing::info!(
                 op,
@@ -1467,15 +1647,20 @@ impl Node {
     pub async fn query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
         let routing_key = request.routing_key().to_string();
         let shard = self.shard_for(&routing_key);
+        let started = std::time::Instant::now();
         let Some(tx) = self.sender(shard) else {
             tracing::debug!(shard = ?shard, key = %routing_key, "query unavailable: shard not hosted here");
+            self.metrics.record("read", started.elapsed().as_secs_f64() * 1e3, false);
             return Err(ProposeError::Unavailable { shard });
         };
         let (resp, rx) = oneshot::channel();
         if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
+            self.metrics.record("read", started.elapsed().as_secs_f64() * 1e3, false);
             return Err(ProposeError::Unavailable { shard });
         }
         let result = rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }));
+        self.metrics
+            .record("read", started.elapsed().as_secs_f64() * 1e3, result.is_ok());
         tracing::debug!(
             shard = ?shard,
             key = %routing_key,
@@ -1582,6 +1767,65 @@ impl Node {
             .collect()
     }
 
+    /// Every schedule definition across all shards this node hosts. The firing
+    /// loop reads this, keeps only schedules whose shard it currently leads, and
+    /// fires the due ones.
+    pub async fn list_schedules(&self) -> Vec<Schedule> {
+        self.query_all_shards(|| ReadRequest::ScheduleList)
+            .await
+            .into_iter()
+            .filter_map(|r| match r {
+                ReadResponse::ScheduleList(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The whole-coordinator lock inventory (every grant + the wait queue). All
+    /// lock state lives on one shard, so this is a single leader-gated read; a
+    /// non-leader of the lock shard returns `NotLeader` for the caller to redirect.
+    pub async fn lock_inventory(&self) -> Result<LockInventory, ProposeError> {
+        match self.query(ReadRequest::LockInventory).await? {
+            ReadResponse::LockInventory(inv) => Ok(inv),
+            _ => Err(ProposeError::Unavailable {
+                shard: self.shard_for(crate::state::LOCK_DOMAIN),
+            }),
+        }
+    }
+
+    /// A snapshot of every counting semaphore on the lock-coordinator shard.
+    pub async fn semaphore_inventory(&self) -> Result<Vec<SemaphoreState>, ProposeError> {
+        match self.query(ReadRequest::SemaphoreInventory).await? {
+            ReadResponse::SemaphoreInventory(list) => Ok(list),
+            _ => Err(ProposeError::Unavailable {
+                shard: self.shard_for(crate::state::LOCK_DOMAIN),
+            }),
+        }
+    }
+
+    /// Every named election's current leader, merged across all shards this node
+    /// hosts (elections route by name) and sorted by name.
+    pub async fn list_elections(&self) -> Vec<ElectionEntry> {
+        let mut out: Vec<ElectionEntry> = self
+            .query_all_shards(|| ReadRequest::ElectionList)
+            .await
+            .into_iter()
+            .filter_map(|r| match r {
+                ReadResponse::ElectionList(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Aggregated per-operation call metrics (counts, error rate, latency).
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
+    }
+
     /// Per-shard consensus status across all shards this node hosts.
     pub async fn status(&self) -> NodeStatus {
         let mut shards: Vec<ShardStatus> = Vec::with_capacity(self.shards.len());
@@ -1678,7 +1922,7 @@ fn now_nanos() -> u64 {
 // Status + result types.
 // ---------------------------------------------------------------------------
 
-/// Per-shard consensus status, surfaced by `/v1/status`.
+/// Per-shard consensus status, surfaced by `/v1/status` and `/v1/observe/shards`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardStatus {
     pub shard_id: ShardId,
@@ -1686,7 +1930,30 @@ pub struct ShardStatus {
     pub term: u64,
     pub leader_id: Option<String>,
     pub commit_index: u64,
+    /// Highest log index applied to the state machine (≤ `commit_index`); the gap
+    /// is apply lag.
+    pub last_applied: u64,
     pub last_log_index: u64,
+    /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
+    pub healthy_replicas: usize,
+    /// Whether a majority of the group is caught up — i.e. the shard can survive
+    /// the loss of one more member without losing quorum. Leader-only.
+    pub has_quorum: bool,
+    /// Per-peer replication progress. Populated only while this node leads.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replication: Vec<PeerReplication>,
+}
+
+/// One follower's replication progress, as seen by the shard leader.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerReplication {
+    pub peer: String,
+    /// Highest log index the leader knows this peer has stored.
+    pub match_index: u64,
+    /// How far behind the leader's log tail this peer is (`last_log_index - match`).
+    pub lag: u64,
+    /// Whether an `AppendEntries` to this peer is currently outstanding.
+    pub in_flight: bool,
 }
 
 /// Whole-node status: identity, membership, and a row per hosted shard.
@@ -1947,6 +2214,54 @@ mod tests {
             Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "on"),
             other => panic!("unexpected read: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn observability_reads_surface_locks_elections_and_quorum() {
+        let reg = LoopbackRegistry::new();
+        let n = node("solo", &[], 4, &reg);
+
+        // Take a lock and win an election, then read them back through the
+        // observability fan-outs (not the per-key getters).
+        n.propose(Command::LockAcquire {
+            keys: vec!["orders/42".to_string()],
+            holder: "worker-a".to_string(),
+            ttl_ms: 30_000,
+            wait: false,
+        })
+        .await
+        .expect("lock commit");
+        n.propose(Command::ElectionCampaign {
+            name: "scheduler".to_string(),
+            candidate: "node-a".to_string(),
+            ttl_ms: 30_000,
+            metadata: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("campaign commit");
+
+        let inv = n.lock_inventory().await.expect("lock inventory");
+        assert_eq!(inv.held.len(), 1);
+        assert_eq!(inv.held[0].holder, "worker-a");
+
+        let elections = n.list_elections().await;
+        assert_eq!(elections.len(), 1);
+        assert_eq!(elections[0].name, "scheduler");
+        assert_eq!(elections[0].leadership.leader, "node-a");
+
+        // A single-node group is its own majority, so every led shard reports
+        // quorum, and the metrics registry recorded the proposals above.
+        let status = n.status().await;
+        assert!(status.shards.iter().all(|s| s.has_quorum));
+        assert!(status
+            .shards
+            .iter()
+            .all(|s| s.last_applied == s.commit_index));
+        let ops = n.metrics().snapshot();
+        assert!(
+            ops.iter().any(|o| o.op == "lock.acquire" && o.count >= 1),
+            "propose path should have recorded lock.acquire latency"
+        );
     }
 
     #[tokio::test]
@@ -2239,6 +2554,7 @@ mod tests {
             election_min_ms: emin,
             election_jitter_ms: 0,
             pre_vote: true,
+            check_quorum: true,
         };
 
         // Zero tick/heartbeat would panic tokio's interval — floored to 1ms.
@@ -2277,6 +2593,91 @@ mod tests {
             None,
             Recovered::default(),
         )
+    }
+
+    /// A 3-member actor forced into the leader role with empty replication state,
+    /// for exercising the leader lease / CheckQuorum logic without a live cluster.
+    fn leader_actor() -> ShardActor {
+        let mut a = follower_actor();
+        a.role = Role::Leader;
+        a.leader_id = Some("a".to_string());
+        let mut ls = LeaderState::default();
+        for p in &a.peers {
+            ls.next_index.insert(p.clone(), 1);
+            ls.match_index.insert(p.clone(), 0);
+            ls.in_flight.insert(p.clone(), false);
+        }
+        a.leader = Some(ls);
+        a
+    }
+
+    /// CheckQuorum/leader-lease: a leader holds the lease only while a *majority*
+    /// has contacted it within an election timeout. Once the lease lapses it must
+    /// refuse linearizable reads and (on the next tick) step down — closing the
+    /// stale-leader read hole where a partitioned old leader answers authoritatively
+    /// after a new leader has formed on the majority side.
+    #[test]
+    fn leader_lease_gates_reads_and_steps_down_on_lost_quorum() {
+        let mut a = leader_actor();
+        let read = || ReadRequest::Kv {
+            key: "k".to_string(),
+        };
+
+        // No peer has acked yet: self alone is a minority of 3 → lease not held, and
+        // a linearizable read is refused (retryable Unavailable, not a stale answer).
+        assert!(!a.leader_lease_held());
+        assert!(matches!(
+            a.handle_query(read()),
+            Err(ProposeError::Unavailable { .. })
+        ));
+
+        // One peer acks → self + b = majority → lease held → read served.
+        a.leader
+            .as_mut()
+            .unwrap()
+            .last_contact
+            .insert("b".to_string(), Instant::now());
+        assert!(a.leader_lease_held());
+        assert!(a.handle_query(read()).is_ok());
+
+        // That contact ages past the election timeout → lease lapses → read refused.
+        a.leader.as_mut().unwrap().last_contact.insert(
+            "b".to_string(),
+            Instant::now() - Duration::from_millis(a.timing.election_min_ms + 50),
+        );
+        assert!(!a.leader_lease_held());
+        assert!(matches!(
+            a.handle_query(read()),
+            Err(ProposeError::Unavailable { .. })
+        ));
+
+        // A tick with the lease lapsed steps the leader down (no higher term seen —
+        // it simply lost contact). Keep the heartbeat deadline in the future so the
+        // tick exercises only the lease check, not network I/O.
+        a.heartbeat_deadline = Instant::now() + Duration::from_secs(60);
+        a.on_tick();
+        assert_eq!(a.role, Role::Follower);
+        assert!(a.leader.is_none());
+    }
+
+    /// With CheckQuorum disabled the lease logic is byte-identical to the old
+    /// behaviour: a leader with zero majority contact still serves reads and never
+    /// steps down for want of acks (it only steps down on a higher term).
+    #[test]
+    fn check_quorum_off_preserves_old_unconfirmed_leader_behaviour() {
+        let mut a = leader_actor();
+        a.timing.check_quorum = false;
+
+        assert!(a.leader_lease_held(), "disabled ⇒ always held");
+        assert!(a
+            .handle_query(ReadRequest::Kv {
+                key: "k".to_string()
+            })
+            .is_ok());
+
+        a.heartbeat_deadline = Instant::now() + Duration::from_secs(60);
+        a.on_tick();
+        assert_eq!(a.role, Role::Leader, "no step-down when check-quorum is off");
     }
 
     fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {

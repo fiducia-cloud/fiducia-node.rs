@@ -97,13 +97,19 @@ async fn register(
     Path((service, id)): Path<(String, String)>,
     Json(body): Json<RegisterBody>,
 ) -> Response {
+    let metadata = body.metadata.unwrap_or_default();
+    if let Err(rejection) =
+        crate::validate::service_register(&service, &id, &body.address, body.ttl_ms, &metadata)
+    {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::ServiceRegister {
             service,
             instance_id: id,
             address: body.address,
             ttl_ms: body.ttl_ms,
-            metadata: body.metadata.unwrap_or_default(),
+            metadata,
         })
         .await;
     propose_response(result, &uri)

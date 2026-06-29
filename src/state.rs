@@ -86,11 +86,30 @@ pub enum Command {
         target: ScheduleTarget,
         delivery: DeliverySemantics,
         max_retries: u32,
+        /// Proposer-stamped wall clock, so every replica computes the same initial
+        /// `next_fire` deterministically (the state machine must not read the clock).
+        now_ms: u64,
     },
     ScheduleRecordRun {
         name: String,
         fire_id: String,
         fired_at_ms: u64,
+    },
+    /// Claim one due fire for delivery. Committed through Raft, so exactly one
+    /// claim per `fire_id_ms` wins even across a leader change — this is what makes
+    /// firing leader-elected with no duplicates. The state machine validates the
+    /// fire is the schedule's legitimate next fire and advances the cursor.
+    ScheduleClaimFire {
+        name: String,
+        fire_id_ms: u64,
+    },
+    /// Record the outcome of delivering a claimed fire (after retries).
+    ScheduleRecordResult {
+        name: String,
+        fire_id_ms: u64,
+        delivered: bool,
+        attempts: u32,
+        error: Option<String>,
     },
 
     // --- Leader election ---------------------------------------------------
@@ -163,7 +182,10 @@ impl Command {
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
             | Command::RateLimitCheck { key, .. } => key,
-            Command::ScheduleUpsert { name, .. } | Command::ScheduleRecordRun { name, .. } => name,
+            Command::ScheduleUpsert { name, .. }
+            | Command::ScheduleRecordRun { name, .. }
+            | Command::ScheduleClaimFire { name, .. }
+            | Command::ScheduleRecordResult { name, .. } => name,
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
@@ -186,6 +208,8 @@ impl Command {
             Command::RateLimitCheck { .. } => "ratelimit.check",
             Command::ScheduleUpsert { .. } => "schedule.upsert",
             Command::ScheduleRecordRun { .. } => "schedule.record_run",
+            Command::ScheduleClaimFire { .. } => "schedule.claim_fire",
+            Command::ScheduleRecordResult { .. } => "schedule.record_result",
             Command::ElectionCampaign { .. } => "election.campaign",
             Command::ElectionRenew { .. } => "election.renew",
             Command::ElectionResign { .. } => "election.resign",
@@ -253,6 +277,24 @@ pub struct LockWaiter {
     /// The full key set this waiter is trying to acquire.
     pub keys: Vec<String>,
     pub requested_ms: u64,
+}
+
+/// One held union-lock grant, as surfaced by the observability inventory: who
+/// holds which key set, under what fencing token, until when.
+#[derive(Debug, Clone, Serialize)]
+pub struct LockHolding {
+    pub holder: String,
+    pub keys: Vec<String>,
+    pub fencing_token: u64,
+    pub lease_expires_ms: u64,
+}
+
+/// A whole-coordinator view of the lock primitive: every active grant plus the
+/// single FIFO wait queue behind them. Built for `/v1/observe/locks`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LockInventory {
+    pub held: Vec<LockHolding>,
+    pub wait_queue: Vec<LockWaiter>,
 }
 
 /// One held union-lock acquisition.
@@ -363,6 +405,15 @@ pub struct Leadership {
     pub metadata: HashMap<String, String>,
 }
 
+/// One named election and its current leadership — a row of the election
+/// inventory surfaced by `/v1/observe/elections`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ElectionEntry {
+    pub name: String,
+    #[serde(flatten)]
+    pub leadership: Leadership,
+}
+
 /// A KV entry paired with its key — one row of a prefix listing.
 #[derive(Debug, Clone, Serialize)]
 pub struct KvListItem {
@@ -388,6 +439,22 @@ pub struct Schedule {
     pub delivery: DeliverySemantics,
     pub max_retries: u32,
     pub enabled: bool,
+    /// The next time (epoch ms) this schedule should fire — the durable cursor the
+    /// firing loop reads and the state machine advances on each claim. `None` when
+    /// the schedule is exhausted (a delivered one-shot, or a cron that won't fire).
+    pub next_fire_ms: Option<u64>,
+}
+
+/// Lifecycle of one fire's delivery, recorded durably in the schedule's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// Claimed and being delivered (or interrupted before the result was recorded).
+    Pending,
+    /// Delivered successfully.
+    Delivered,
+    /// Gave up after exhausting retries.
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -397,6 +464,8 @@ pub struct ScheduleRun {
     pub attempts: u32,
     pub duplicate: bool,
     pub target: ScheduleTarget,
+    pub status: RunStatus,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +573,7 @@ impl StateMachine {
                 target,
                 delivery,
                 max_retries,
+                now_ms,
             } => store.apply_schedule_upsert(
                 name,
                 cron,
@@ -511,12 +581,23 @@ impl StateMachine {
                 target,
                 delivery,
                 max_retries,
+                now_ms,
             ),
             Command::ScheduleRecordRun {
                 name,
                 fire_id,
                 fired_at_ms,
             } => store.apply_schedule_record_run(name, fire_id, fired_at_ms),
+            Command::ScheduleClaimFire { name, fire_id_ms } => {
+                store.apply_schedule_claim_fire(name, fire_id_ms)
+            }
+            Command::ScheduleRecordResult {
+                name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                error,
+            } => store.apply_schedule_record_result(name, fire_id_ms, delivered, attempts, error),
             Command::ElectionCampaign {
                 name,
                 candidate,
@@ -609,6 +690,17 @@ impl StateMachine {
             .unwrap_or_default()
     }
 
+    /// Every schedule definition on this shard (for the firing loop to scan).
+    pub fn schedule_list(&self) -> Vec<Schedule> {
+        self.store
+            .lock()
+            .unwrap()
+            .schedules
+            .values()
+            .map(|record| record.definition.clone())
+            .collect()
+    }
+
     pub fn service_list(&self, service: &str) -> Vec<ServiceInstance> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
@@ -650,6 +742,66 @@ impl StateMachine {
                 instances: instances.len(),
             })
             .collect()
+    }
+
+    /// Every live lock grant plus the FIFO wait queue — the observability view of
+    /// the whole lock coordinator (all lock state lives on one shard, so this is a
+    /// single-shard read). Expired grants/waiters are dropped first so the
+    /// inventory reflects only live state. Grants are sorted by fencing token and
+    /// the queue by request time, so the output is deterministic for tests/diffs.
+    pub fn lock_inventory(&self) -> LockInventory {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut held: Vec<LockHolding> = store
+            .locks
+            .grants
+            .values()
+            .map(|g| LockHolding {
+                holder: g.holder.clone(),
+                keys: g.keys.clone(),
+                fencing_token: g.fencing_token,
+                lease_expires_ms: g.lease_expires_ms,
+            })
+            .collect();
+        held.sort_by_key(|h| h.fencing_token);
+        let wait_queue: Vec<LockWaiter> = store
+            .locks
+            .queue
+            .iter()
+            .map(|(_, q)| LockWaiter {
+                holder: q.holder.clone(),
+                keys: q.keys.clone(),
+                requested_ms: q.requested_ms,
+            })
+            .collect();
+        LockInventory { held, wait_queue }
+    }
+
+    /// A snapshot of every counting semaphore on this shard (holders, free
+    /// permits, wait queue). Sorted by key for deterministic output.
+    pub fn semaphore_inventory(&self) -> Vec<SemaphoreState> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut keys: Vec<String> = store.semaphores.keys().cloned().collect();
+        keys.sort();
+        keys.iter().map(|k| store.semaphore_snapshot(k)).collect()
+    }
+
+    /// Every named election with live leadership on this shard, sorted by name.
+    /// Callers fan this out across shards (elections route by name) and merge.
+    pub fn election_inventory(&self) -> Vec<ElectionEntry> {
+        let mut store = self.store.lock().unwrap();
+        store.expire_due(now_ms());
+        let mut out: Vec<ElectionEntry> = store
+            .elections
+            .iter()
+            .map(|(name, leadership)| ElectionEntry {
+                name: name.clone(),
+                leadership: leadership.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 }
 
@@ -1129,7 +1281,13 @@ impl Store {
         target: ScheduleTarget,
         delivery: DeliverySemantics,
         max_retries: u32,
+        now_ms: u64,
     ) -> Value {
+        // The initial cursor: a one-shot fires at its time; a cron fires at its
+        // first occurrence after now. (`now_ms` is committed in the command, so
+        // every replica computes the same cursor — the state machine stays
+        // deterministic and never reads the wall clock itself.)
+        let next_fire_ms = next_fire_for(&cron, one_shot_at_ms, now_ms);
         let definition = Schedule {
             name: name.clone(),
             cron,
@@ -1138,6 +1296,7 @@ impl Store {
             delivery,
             max_retries,
             enabled: true,
+            next_fire_ms,
         };
         self.schedules
             .entry(name.clone())
@@ -1146,7 +1305,7 @@ impl Store {
                 definition,
                 history: Vec::new(),
             });
-        json!({ "scheduled": true, "name": name })
+        json!({ "scheduled": true, "name": name, "next_fire_ms": next_fire_ms })
     }
 
     fn apply_schedule_record_run(
@@ -1167,9 +1326,83 @@ impl Store {
                 attempts: 1,
                 duplicate: false,
                 target: record.definition.target.clone(),
+                status: RunStatus::Delivered,
+                error: None,
             });
+            trim_history(record);
         }
         json!({ "recorded": !duplicate, "duplicate": duplicate, "name": name, "fire_id": fire_id })
+    }
+
+    /// Claim one due fire for delivery. Succeeds only if `fire_id_ms` is the
+    /// schedule's current expected next fire (the cursor) — so a second claim of
+    /// the same fire fails after the cursor advances, which is the dedup that makes
+    /// firing leader-elected with no duplicates. Records a `Pending` run and
+    /// advances the cursor to the following occurrence.
+    fn apply_schedule_claim_fire(&mut self, name: String, fire_id_ms: u64) -> Value {
+        let Some(record) = self.schedules.get_mut(&name) else {
+            return json!({ "claimed": false, "reason": "not_found", "name": name });
+        };
+        if !record.definition.enabled {
+            return json!({ "claimed": false, "reason": "disabled", "name": name });
+        }
+        if record.definition.next_fire_ms != Some(fire_id_ms) {
+            return json!({
+                "claimed": false,
+                "reason": "stale_or_duplicate",
+                "name": name,
+                "expected": record.definition.next_fire_ms,
+            });
+        }
+        record.history.push(ScheduleRun {
+            fire_id: fire_id_ms.to_string(),
+            fired_at_ms: fire_id_ms,
+            attempts: 0,
+            duplicate: false,
+            target: record.definition.target.clone(),
+            status: RunStatus::Pending,
+            error: None,
+        });
+        trim_history(record);
+        // Advance the cursor: one-shots are now exhausted; crons step to the next.
+        let next = if record.definition.one_shot_at_ms.is_some() {
+            None
+        } else {
+            next_fire_for(&record.definition.cron, None, fire_id_ms)
+        };
+        record.definition.next_fire_ms = next;
+        json!({
+            "claimed": true,
+            "name": name,
+            "fire_id_ms": fire_id_ms,
+            "target": record.definition.target,
+            "delivery": record.definition.delivery,
+            "max_retries": record.definition.max_retries,
+            "next_fire_ms": next,
+        })
+    }
+
+    /// Record the delivery outcome of a claimed fire (after retries).
+    fn apply_schedule_record_result(
+        &mut self,
+        name: String,
+        fire_id_ms: u64,
+        delivered: bool,
+        attempts: u32,
+        error: Option<String>,
+    ) -> Value {
+        let Some(record) = self.schedules.get_mut(&name) else {
+            return json!({ "recorded": false, "reason": "not_found", "name": name });
+        };
+        let fire_id = fire_id_ms.to_string();
+        if let Some(run) = record.history.iter_mut().rev().find(|r| r.fire_id == fire_id) {
+            run.status = if delivered { RunStatus::Delivered } else { RunStatus::Failed };
+            run.attempts = attempts;
+            run.error = error;
+            json!({ "recorded": true, "name": name, "fire_id_ms": fire_id_ms, "delivered": delivered })
+        } else {
+            json!({ "recorded": false, "reason": "no_run", "name": name, "fire_id_ms": fire_id_ms })
+        }
     }
 
     fn apply_election_campaign(
@@ -1386,7 +1619,29 @@ fn now_ms() -> u64 {
 }
 
 pub fn valid_cron_expression(value: &str) -> bool {
-    value.split_whitespace().count() == 5
+    crate::cron::CronSchedule::parse(value).is_ok()
+}
+
+/// The next fire time for a schedule given a cursor: a one-shot fires once at its
+/// appointed time; a cron at its first occurrence strictly after `after_ms`.
+fn next_fire_for(cron: &Option<String>, one_shot_at_ms: Option<u64>, after_ms: u64) -> Option<u64> {
+    if let Some(at) = one_shot_at_ms {
+        return Some(at);
+    }
+    cron.as_deref()
+        .and_then(|expr| crate::cron::CronSchedule::parse(expr).ok())
+        .and_then(|c| c.next_after(after_ms))
+}
+
+/// Cap on retained run history per schedule (bounds memory + the WAL; full
+/// retention is the durability follow-up in future-work.md).
+const MAX_SCHEDULE_HISTORY: usize = 100;
+
+fn trim_history(record: &mut ScheduleRecord) {
+    let len = record.history.len();
+    if len > MAX_SCHEDULE_HISTORY {
+        record.history.drain(0..len - MAX_SCHEDULE_HISTORY);
+    }
 }
 
 #[cfg(test)]
@@ -1401,6 +1656,78 @@ mod tests {
             wait,
         })
         .output
+    }
+
+    #[test]
+    fn lock_inventory_lists_every_grant_and_the_whole_wait_queue() {
+        let sm = StateMachine::new();
+        // Two independent grants on disjoint key sets, plus one waiter blocked on
+        // a set that overlaps the first grant.
+        acquire(&sm, &["orders/42"], "worker-a", false);
+        acquire(&sm, &["inventory/sku-7"], "worker-b", false);
+        let queued = acquire(&sm, &["orders/42", "inventory/sku-9"], "worker-c", true);
+        assert_eq!(queued["queued"], true);
+
+        let inv = sm.lock_inventory();
+        assert_eq!(inv.held.len(), 2, "two active grants");
+        // Sorted by fencing token, so worker-a (acquired first) comes first.
+        assert_eq!(inv.held[0].holder, "worker-a");
+        assert_eq!(inv.held[1].holder, "worker-b");
+        assert!(inv.held[0].fencing_token < inv.held[1].fencing_token);
+        assert_eq!(inv.wait_queue.len(), 1, "one waiter");
+        assert_eq!(inv.wait_queue[0].holder, "worker-c");
+        assert_eq!(
+            inv.wait_queue[0].keys,
+            vec!["inventory/sku-9".to_string(), "orders/42".to_string()]
+        );
+    }
+
+    #[test]
+    fn semaphore_inventory_snapshots_each_semaphore_sorted_by_key() {
+        let sm = StateMachine::new();
+        let acquire_permit = |key: &str, holder: &str| {
+            sm.apply(Command::SemaphoreAcquire {
+                key: key.to_string(),
+                holder: holder.to_string(),
+                limit: 1,
+                ttl_ms: 30_000,
+                wait: true,
+            })
+        };
+        acquire_permit("db/pool-z", "h1"); // holds the single permit
+        acquire_permit("db/pool-z", "h2"); // queues
+        acquire_permit("db/pool-a", "h3"); // holds the single permit
+
+        let inv = sm.semaphore_inventory();
+        assert_eq!(inv.len(), 2);
+        // Sorted by key: pool-a before pool-z.
+        assert_eq!(inv[0].key, "db/pool-a");
+        assert_eq!(inv[1].key, "db/pool-z");
+        assert_eq!(inv[1].holders.len(), 1);
+        assert_eq!(inv[1].available, 0);
+        assert_eq!(inv[1].wait_queue.len(), 1);
+    }
+
+    #[test]
+    fn election_inventory_lists_current_leaders_sorted_by_name() {
+        let sm = StateMachine::new();
+        let campaign = |name: &str, candidate: &str| {
+            sm.apply(Command::ElectionCampaign {
+                name: name.to_string(),
+                candidate: candidate.to_string(),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            })
+        };
+        campaign("scheduler", "node-z");
+        campaign("gc-leader", "node-a");
+
+        let inv = sm.election_inventory();
+        assert_eq!(inv.len(), 2);
+        assert_eq!(inv[0].name, "gc-leader");
+        assert_eq!(inv[0].leadership.leader, "node-a");
+        assert_eq!(inv[1].name, "scheduler");
+        assert_eq!(inv[1].leadership.leader, "node-z");
     }
 
     #[test]
@@ -1710,6 +2037,7 @@ mod tests {
             },
             delivery: DeliverySemantics::ExactlyOnce,
             max_retries: 3,
+            now_ms: 0,
         });
         let first = sm.apply(Command::ScheduleRecordRun {
             name: "nightly".to_string(),
@@ -1725,6 +2053,98 @@ mod tests {
         assert_eq!(first.output["recorded"], true);
         assert_eq!(second.output["duplicate"], true);
         assert_eq!(sm.schedule_history("nightly").len(), 1);
+    }
+
+    #[test]
+    fn claim_fire_advances_the_cursor_and_dedups_a_second_claim() {
+        let sm = StateMachine::new();
+        // Daily at midnight, anchored at epoch 0 → first fire is day 1 midnight.
+        sm.apply(Command::ScheduleUpsert {
+            name: "nightly".to_string(),
+            cron: Some("0 0 * * *".to_string()),
+            one_shot_at_ms: None,
+            target: ScheduleTarget::Webhook {
+                url: "https://example.com/hook".to_string(),
+            },
+            delivery: DeliverySemantics::AtLeastOnce,
+            max_retries: 3,
+            now_ms: 0,
+        });
+        let day = 86_400_000u64;
+        let first_fire = sm.schedule_get("nightly").unwrap().next_fire_ms.unwrap();
+        assert_eq!(first_fire, day, "first daily fire is day 1 midnight");
+
+        // Claiming it succeeds and advances the cursor to the next occurrence.
+        let claim = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "nightly".to_string(),
+                fire_id_ms: first_fire,
+            })
+            .output;
+        assert_eq!(claim["claimed"], true);
+        assert_eq!(
+            sm.schedule_get("nightly").unwrap().next_fire_ms,
+            Some(2 * day),
+            "cursor advanced to the following day",
+        );
+
+        // Claiming the SAME fire again fails — this is the no-duplicate-fires dedup.
+        let dup = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "nightly".to_string(),
+                fire_id_ms: first_fire,
+            })
+            .output;
+        assert_eq!(dup["claimed"], false);
+        assert_eq!(dup["reason"], "stale_or_duplicate");
+
+        // The claim recorded a Pending run; recording the result resolves it.
+        let history = sm.schedule_history("nightly");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, RunStatus::Pending);
+        sm.apply(Command::ScheduleRecordResult {
+            name: "nightly".to_string(),
+            fire_id_ms: first_fire,
+            delivered: true,
+            attempts: 2,
+            error: None,
+        });
+        let resolved = &sm.schedule_history("nightly")[0];
+        assert_eq!(resolved.status, RunStatus::Delivered);
+        assert_eq!(resolved.attempts, 2);
+    }
+
+    #[test]
+    fn one_shot_fires_once_then_is_exhausted() {
+        let sm = StateMachine::new();
+        sm.apply(Command::ScheduleUpsert {
+            name: "once".to_string(),
+            cron: None,
+            one_shot_at_ms: Some(5_000),
+            target: ScheduleTarget::Queue {
+                name: "https://queue.local/ingress".to_string(),
+            },
+            delivery: DeliverySemantics::ExactlyOnce,
+            max_retries: 0,
+            now_ms: 0,
+        });
+        assert_eq!(sm.schedule_get("once").unwrap().next_fire_ms, Some(5_000));
+        let claim = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "once".to_string(),
+                fire_id_ms: 5_000,
+            })
+            .output;
+        assert_eq!(claim["claimed"], true);
+        // A one-shot has no next fire once claimed.
+        assert_eq!(sm.schedule_get("once").unwrap().next_fire_ms, None);
+        let dup = sm
+            .apply(Command::ScheduleClaimFire {
+                name: "once".to_string(),
+                fire_id_ms: 5_000,
+            })
+            .output;
+        assert_eq!(dup["claimed"], false, "exhausted one-shot can't re-fire");
     }
 
     #[test]

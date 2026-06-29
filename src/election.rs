@@ -80,6 +80,11 @@ async fn campaign(
     Path(name): Path<String>,
     Json(body): Json<CampaignBody>,
 ) -> Response {
+    if let Err(rejection) =
+        crate::validate::election_campaign(&name, &body.candidate, body.ttl_ms, &body.metadata)
+    {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::ElectionCampaign {
             name,
