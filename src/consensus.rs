@@ -2438,7 +2438,10 @@ mod tests {
         assert!(
             ops.iter().any(|o| o.op == "lock.acquire" && o.count >= 1),
             "propose path should have recorded lock.acquire latency"
-=======
+        );
+    }
+
+    #[tokio::test]
     async fn kv_prefix_query_fans_out_across_shards() {
         let reg = LoopbackRegistry::new();
         let n = node("solo-prefix", &[], 8, &reg);
