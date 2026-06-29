@@ -2603,7 +2603,6 @@ mod tests {
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn committed_state_survives_a_restart_via_the_durable_store() {
         // A single-node group with a real on-disk store. Commit a write, drop the
         // node (simulating a pod restart), boot a fresh node on the SAME data dir,
