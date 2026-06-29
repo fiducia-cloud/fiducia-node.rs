@@ -1409,11 +1409,7 @@ impl ShardActor {
                 kind: "put",
                 key: key.clone(),
                 revision,
-<<<<<<< HEAD
                 detail: None,
-=======
-                data: output.clone(),
->>>>>>> origin/main
             }),
             Command::KvDelete { key } => Some(ChangeEvent {
                 scope: "kv",
