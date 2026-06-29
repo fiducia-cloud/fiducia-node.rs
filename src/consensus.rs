@@ -1311,18 +1311,12 @@ impl ShardActor {
         let log_ok = (req.last_log_term > self.last_log_term())
             || (req.last_log_term == self.last_log_term()
                 && req.last_log_index >= self.last_log_index());
-<<<<<<< HEAD
         // A leader is presumed alive if we know one AND we've heard from it within
         // an election timeout. At cold start `leader_id` is `None`, so the first
         // election is granted; once a known leader stops heartbeating, contact goes
         // stale and pre-votes flow again so failover can proceed.
         let leader_alive = self.leader_id.is_some()
             && self.last_leader_contact.elapsed() < Duration::from_millis(self.timing.election_min_ms);
-=======
-        let leader_alive = self.leader_id.is_some()
-            && self.last_leader_contact.elapsed()
-                < Duration::from_millis(self.timing.election_min_ms);
->>>>>>> origin/main
         RequestVoteResp {
             term: self.current_term,
             granted: req.term >= self.current_term && log_ok && !leader_alive,
