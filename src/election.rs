@@ -90,11 +90,7 @@ async fn campaign(
             name,
             candidate: body.candidate,
             ttl_ms: body.ttl_ms,
-<<<<<<< HEAD
             metadata: body.metadata,
-=======
-            metadata: body.metadata.unwrap_or_default(),
->>>>>>> origin/main
         })
         .await;
     propose_response(result, &uri)
