@@ -915,14 +915,6 @@ impl StateMachine {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
-=======
-    pub fn service_names(&self) -> Vec<String> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        let mut names: Vec<String> = store.services.keys().cloned().collect();
-        names.sort();
-        names
->>>>>>> origin/main
     }
 }
 
