@@ -2021,7 +2021,7 @@ impl Node {
             node_id: self.config.node_id.clone(),
             peers: self.config.peers.clone(),
             shard_count: self.config.shard_count,
-            timing: self.config.timing,
+            timing: RaftTiming::from_env(),
             hosted_shards,
             leader_count: leading_shards.len(),
             follower_count: following_shards.len(),
