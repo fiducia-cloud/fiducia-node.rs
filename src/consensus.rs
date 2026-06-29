@@ -563,15 +563,9 @@ impl ShardActor {
             members,
             transport,
             self_tx,
-<<<<<<< HEAD
             // We always restart as a follower (even if we last led) so a stale term
             // can't serve writes before re-validation; a single-node shard is the
             // exception — it has no one to elect against, so it leads from t=0.
-=======
-            timing,
-            // A single-node shard leads itself from t=0 (no one to elect against);
-            // a real group starts as a follower and runs an election.
->>>>>>> origin/main
             role: if single { Role::Leader } else { Role::Follower },
             current_term,
             voted_for: recovered.voted_for,
