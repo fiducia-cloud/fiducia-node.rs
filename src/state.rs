@@ -2028,7 +2028,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn wait_queue_is_recreated_by_replaying_the_log_after_a_restart() {
         // The wait queue is derived state inside the replicated state machine, so a
         // node that goes down recovers it by **replaying its committed log** — there
