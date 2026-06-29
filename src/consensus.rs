@@ -485,7 +485,6 @@ struct ShardActor {
     /// A clone of this actor's own inbox, so spawned RPC tasks can route replies
     /// back in as `VoteReply` / `AppendReply`.
     self_tx: mpsc::Sender<ShardMsg>,
-    timing: RaftTiming,
 
     // --- Raft state. `current_term`, `voted_for`, and `log` are the bits Raft
     //     must persist before acting on them; `store`, when present, is their
