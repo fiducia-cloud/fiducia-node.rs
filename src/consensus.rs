@@ -2109,7 +2109,6 @@ pub struct ShardStatus {
     /// is apply lag.
     pub last_applied: u64,
     pub last_log_index: u64,
-<<<<<<< HEAD
     /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
     pub healthy_replicas: usize,
     /// Whether a majority of the group is caught up — i.e. the shard can survive
@@ -2118,6 +2117,7 @@ pub struct ShardStatus {
     /// Per-peer replication progress. Populated only while this node leads.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replication: Vec<PeerReplication>,
+    pub metrics: ShardMetrics,
 }
 
 /// One follower's replication progress, as seen by the shard leader.
@@ -2130,9 +2130,6 @@ pub struct PeerReplication {
     pub lag: u64,
     /// Whether an `AppendEntries` to this peer is currently outstanding.
     pub in_flight: bool,
-=======
-    pub metrics: ShardMetrics,
->>>>>>> origin/main
 }
 
 /// Whole-node status: identity, membership, and a row per hosted shard.
