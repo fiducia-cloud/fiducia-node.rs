@@ -118,6 +118,15 @@ pub enum Command {
         fencing_token: u64,
         ttl_ms: u64,
     },
+    /// Release a still-claimed key so a retry can re-execute immediately, instead
+    /// of waiting out the in-flight lease. Used when the holder's operation failed
+    /// transiently (5xx / timeout) and left nothing durable to replay. Refused
+    /// once completed — a stored result must survive — or for a non-holder.
+    IdempotencyAbandon {
+        key: String,
+        owner: String,
+        fencing_token: u64,
+    },
 
     // --- Cron / scheduling -------------------------------------------------
     ScheduleUpsert {
