@@ -1571,6 +1571,27 @@ impl Store {
         })
     }
 
+    fn apply_idempotency_abandon(
+        &mut self,
+        revision: u64,
+        key: String,
+        owner: String,
+        fencing_token: u64,
+    ) -> Value {
+        let Some(record) = self.idempotency.get(&key) else {
+            return json!({ "abandoned": false, "reason": "not_found", "key": key, "revision": revision });
+        };
+        if record.owner != owner || record.fencing_token != fencing_token {
+            return json!({ "abandoned": false, "reason": "not_holder", "key": key, "revision": revision });
+        }
+        if record.status == IdempotencyStatus::Completed {
+            // A completed record's result must survive for replay; never drop it.
+            return json!({ "abandoned": false, "reason": "already_completed", "key": key, "revision": revision });
+        }
+        self.idempotency.remove(&key);
+        json!({ "abandoned": true, "key": key, "revision": revision })
+    }
+
     fn apply_schedule_upsert(
         &mut self,
         name: String,
