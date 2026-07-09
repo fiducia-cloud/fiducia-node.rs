@@ -712,6 +712,11 @@ impl StateMachine {
                 fencing_token,
                 ttl_ms,
             } => store.apply_idempotency_renew(revision, now, key, owner, fencing_token, ttl_ms),
+            Command::IdempotencyAbandon {
+                key,
+                owner,
+                fencing_token,
+            } => store.apply_idempotency_abandon(revision, key, owner, fencing_token),
             Command::ScheduleUpsert {
                 name,
                 cron,
