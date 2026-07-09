@@ -1429,6 +1429,7 @@ impl Store {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_idempotency_claim(
         &mut self,
         revision: u64,
@@ -1436,6 +1437,7 @@ impl Store {
         key: String,
         owner: String,
         ttl_ms: u64,
+        retention_ms: Option<u64>,
         metadata: HashMap<String, String>,
     ) -> Value {
         if key.trim().is_empty() {
@@ -1452,13 +1454,19 @@ impl Store {
         }
 
         let token = self.next_token();
+        // Held only for the short in-flight window while `Claimed`; `complete`
+        // extends it to `retention_ms`. A retention shorter than the in-flight
+        // lease would let a completed record expire early, so floor it at `ttl_ms`.
+        let ttl_ms = ttl_ms.max(1);
+        let retention_ms = retention_ms.unwrap_or(ttl_ms).max(ttl_ms);
         let record = IdempotencyRecord {
             key: key.clone(),
             owner,
             fencing_token: token,
             status: IdempotencyStatus::Claimed,
             first_seen_ms: now,
-            lease_expires_ms: now.saturating_add(ttl_ms.max(1)),
+            lease_expires_ms: now.saturating_add(ttl_ms),
+            retention_ms,
             metadata,
             result: None,
         };
@@ -1477,6 +1485,7 @@ impl Store {
     fn apply_idempotency_complete(
         &mut self,
         revision: u64,
+        now: u64,
         key: String,
         owner: String,
         fencing_token: u64,
@@ -1499,10 +1508,48 @@ impl Store {
         }
         record.status = IdempotencyStatus::Completed;
         record.result = result;
+        // Extend the lease from the short in-flight window to the full retention
+        // window, measured from completion, so the replayable record survives.
+        record.lease_expires_ms = now.saturating_add(record.retention_ms.max(1));
         json!({
             "completed": true,
             "duplicate": false,
             "key": key,
+            "record": record,
+            "revision": revision,
+        })
+    }
+
+    fn apply_idempotency_renew(
+        &mut self,
+        revision: u64,
+        now: u64,
+        key: String,
+        owner: String,
+        fencing_token: u64,
+        ttl_ms: u64,
+    ) -> Value {
+        let Some(record) = self.idempotency.get_mut(&key) else {
+            return json!({ "renewed": false, "reason": "not_found", "key": key, "revision": revision });
+        };
+        if record.owner != owner || record.fencing_token != fencing_token {
+            return json!({ "renewed": false, "reason": "not_holder", "key": key, "revision": revision });
+        }
+        if record.status == IdempotencyStatus::Completed {
+            // Nothing to renew: the retention lease already governs a completed record.
+            return json!({
+                "renewed": false,
+                "reason": "already_completed",
+                "key": key,
+                "record": record,
+                "revision": revision,
+            });
+        }
+        record.lease_expires_ms = now.saturating_add(ttl_ms.max(1));
+        json!({
+            "renewed": true,
+            "key": key,
+            "lease_expires_ms": record.lease_expires_ms,
             "record": record,
             "revision": revision,
         })
