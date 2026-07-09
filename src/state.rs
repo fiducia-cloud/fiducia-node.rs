@@ -2765,6 +2765,66 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_abandon_frees_claimed_key_but_never_a_completed_one() {
+        let sm = StateMachine::new();
+        let claimed = sm.apply(Command::IdempotencyClaim {
+            key: "orders/charge/transient".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 120_000,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        let token = claimed.output["fencing_token"].as_u64().unwrap();
+
+        // A non-holder cannot abandon.
+        let intruder = sm.apply(Command::IdempotencyAbandon {
+            key: "orders/charge/transient".to_string(),
+            owner: "worker-b".to_string(),
+            fencing_token: token,
+        });
+        assert_eq!(intruder.output["abandoned"], false);
+        assert_eq!(intruder.output["reason"], "not_holder");
+
+        // The holder abandons after a transient failure; the key is freed at once.
+        let abandoned = sm.apply(Command::IdempotencyAbandon {
+            key: "orders/charge/transient".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+        });
+        assert_eq!(abandoned.output["abandoned"], true);
+        assert!(sm.idempotency_get("orders/charge/transient").is_none());
+
+        // A retry re-claims immediately (no waiting out the in-flight lease).
+        let reclaim = sm.apply(Command::IdempotencyClaim {
+            key: "orders/charge/transient".to_string(),
+            owner: "worker-c".to_string(),
+            ttl_ms: 120_000,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        assert_eq!(reclaim.output["claimed"], true);
+
+        // A completed record can never be abandoned — its result must survive.
+        let token2 = reclaim.output["fencing_token"].as_u64().unwrap();
+        sm.apply(Command::IdempotencyComplete {
+            key: "orders/charge/transient".to_string(),
+            owner: "worker-c".to_string(),
+            fencing_token: token2,
+            result: Some(json!({ "charge": "ok" })),
+        });
+        let after_complete = sm.apply(Command::IdempotencyAbandon {
+            key: "orders/charge/transient".to_string(),
+            owner: "worker-c".to_string(),
+            fencing_token: token2,
+        });
+        assert_eq!(after_complete.output["abandoned"], false);
+        assert_eq!(after_complete.output["reason"], "already_completed");
+        assert!(sm
+            .idempotency_get("orders/charge/transient")
+            .is_some_and(|r| r.status == IdempotencyStatus::Completed));
+    }
+
+    #[test]
     fn kv_put_uses_compare_and_swap_revision() {
         let sm = StateMachine::new();
         let created = sm.apply(Command::KvPut {
