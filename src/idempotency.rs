@@ -159,6 +159,16 @@ fn claim_ttl_ms(body: &ClaimBody) -> Result<u64, &'static str> {
     }
 }
 
+fn renew_ttl_ms(body: &RenewBody) -> Result<u64, &'static str> {
+    match (body.ttl_ms, body.ttl.as_deref()) {
+        (Some(_), Some(_)) => Err("set only one of ttl_ms or ttl"),
+        (Some(ttl_ms), None) if ttl_ms > 0 => Ok(ttl_ms),
+        (Some(_), None) => Err("ttl_ms must be greater than zero"),
+        (None, Some(ttl)) => parse_ttl_ms(ttl),
+        (None, None) => Ok(DEFAULT_TTL_MS),
+    }
+}
+
 fn parse_ttl_ms(value: &str) -> Result<u64, &'static str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
