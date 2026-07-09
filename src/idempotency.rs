@@ -72,6 +72,7 @@ pub fn router() -> Router<Arc<Node>> {
         .route("/", get(get_record))
         .route("/claim", post(claim))
         .route("/renew", post(renew))
+        .route("/abandon", post(abandon))
         .route("/complete", post(complete))
 }
 
