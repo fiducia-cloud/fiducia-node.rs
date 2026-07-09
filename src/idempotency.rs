@@ -32,9 +32,15 @@ const DEFAULT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub struct ClaimBody {
     pub key: String,
     pub owner: Option<String>,
+    /// In-flight lease: how long a *claimed-but-not-completed* record is held
+    /// before an abandoned claim frees the key. Short — sized to the max request
+    /// duration. `complete` extends the record to `retention_ms`.
     pub ttl_ms: Option<u64>,
-    /// Human-friendly TTL such as `60s`, `15m`, `24h`, or `7d`.
+    /// Human-friendly in-flight TTL such as `60s`, `15m`, `24h`, or `7d`.
     pub ttl: Option<String>,
+    /// How long the *completed* record lives so duplicates can replay it.
+    /// Defaults to the in-flight lease when omitted.
+    pub retention_ms: Option<u64>,
     pub metadata: Option<HashMap<String, String>>,
 }
 
@@ -44,6 +50,16 @@ pub struct CompleteBody {
     pub owner: String,
     pub fencing_token: u64,
     pub result: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenewBody {
+    pub key: String,
+    pub owner: String,
+    pub fencing_token: u64,
+    pub ttl_ms: Option<u64>,
+    /// Human-friendly in-flight TTL such as `60s`, `15m`.
+    pub ttl: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
