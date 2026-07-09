@@ -233,7 +233,8 @@ impl Command {
             | Command::KvDelete { key }
             | Command::RateLimitCheck { key, .. }
             | Command::IdempotencyClaim { key, .. }
-            | Command::IdempotencyComplete { key, .. } => key,
+            | Command::IdempotencyComplete { key, .. }
+            | Command::IdempotencyRenew { key, .. } => key,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
