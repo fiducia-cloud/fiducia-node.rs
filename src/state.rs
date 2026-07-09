@@ -455,8 +455,10 @@ pub enum IdempotencyStatus {
     Completed,
 }
 
-/// One active idempotency record. It lives until `lease_expires_ms`, even after
-/// completion, so duplicate calls can be suppressed or replayed for the full TTL.
+/// One active idempotency record. While `Claimed` it lives only until the short
+/// in-flight `lease_expires_ms` (so an abandoned claim frees the key quickly);
+/// `complete` then extends `lease_expires_ms` by `retention_ms` so a `Completed`
+/// record — and its replayable result — survives for the full retention window.
 #[derive(Debug, Clone, Serialize)]
 pub struct IdempotencyRecord {
     pub key: String,
@@ -465,6 +467,10 @@ pub struct IdempotencyRecord {
     pub status: IdempotencyStatus,
     pub first_seen_ms: u64,
     pub lease_expires_ms: u64,
+    /// How long the record lives *after* completion (ms). Captured at claim so
+    /// `complete` can extend the lease from the in-flight window to the full
+    /// retention window without the state machine reading the wall clock.
+    pub retention_ms: u64,
     pub metadata: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
