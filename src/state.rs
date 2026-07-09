@@ -679,14 +679,22 @@ impl StateMachine {
                 key,
                 owner,
                 ttl_ms,
+                retention_ms,
                 metadata,
-            } => store.apply_idempotency_claim(revision, now, key, owner, ttl_ms, metadata),
+            } => store
+                .apply_idempotency_claim(revision, now, key, owner, ttl_ms, retention_ms, metadata),
             Command::IdempotencyComplete {
                 key,
                 owner,
                 fencing_token,
                 result,
-            } => store.apply_idempotency_complete(revision, key, owner, fencing_token, result),
+            } => store.apply_idempotency_complete(revision, now, key, owner, fencing_token, result),
+            Command::IdempotencyRenew {
+                key,
+                owner,
+                fencing_token,
+                ttl_ms,
+            } => store.apply_idempotency_renew(revision, now, key, owner, fencing_token, ttl_ms),
             Command::ScheduleUpsert {
                 name,
                 cron,
