@@ -140,6 +140,19 @@ async fn renew(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<RenewBo
     propose_response(result, &uri)
 }
 
+/// `POST /v1/idempotency/abandon` - release a still-claimed key so a retry can
+/// re-execute after a transient failure. No-op-safe: refused once completed.
+async fn abandon(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<AbandonBody>) -> Response {
+    let result = node
+        .propose(Command::IdempotencyAbandon {
+            key: body.key,
+            owner: body.owner,
+            fencing_token: body.fencing_token,
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
 /// `POST /v1/idempotency/complete` - attach an optional result to the claim.
 async fn complete(
     State(node): State<Arc<Node>>,
