@@ -272,6 +272,7 @@ impl Command {
             Command::IdempotencyClaim { .. } => "idempotency.claim",
             Command::IdempotencyComplete { .. } => "idempotency.complete",
             Command::IdempotencyRenew { .. } => "idempotency.renew",
+            Command::IdempotencyAbandon { .. } => "idempotency.abandon",
             Command::ScheduleUpsert { .. } => "schedule.upsert",
             Command::ScheduleRecordRun { .. } => "schedule.record_run",
             Command::ScheduleClaimFire { .. } => "schedule.claim_fire",
