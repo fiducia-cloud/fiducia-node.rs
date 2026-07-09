@@ -63,6 +63,13 @@ pub struct RenewBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AbandonBody {
+    pub key: String,
+    pub owner: String,
+    pub fencing_token: u64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct KeyParam {
     pub key: String,
 }
