@@ -79,21 +79,44 @@ pub enum Command {
     },
 
     // --- Idempotency / dedupe ----------------------------------------------
-    /// Claim an idempotency key for the TTL window. First claim wins; later
-    /// claims return the existing active record as a duplicate.
+    /// Claim an idempotency key. First claim wins; later claims return the
+    /// existing active record as a duplicate.
+    ///
+    /// The lease is split in two: `ttl_ms` is the **in-flight lease** — how long a
+    /// *claimed-but-not-completed* record is held before an abandoned claim
+    /// expires and the key becomes re-claimable. It is short (sized to the max
+    /// request duration), so a holder that crashes between claim and complete
+    /// frees the key in seconds instead of poisoning it for the whole retention
+    /// window. `retention_ms` is how long the record lives *after* completion so
+    /// duplicates can replay the stored result; `complete` extends the lease to
+    /// it. `None` retention falls back to `ttl_ms`, preserving the old
+    /// single-window behaviour for log entries written before the split.
     IdempotencyClaim {
         key: String,
         owner: String,
         ttl_ms: u64,
+        #[serde(default)]
+        retention_ms: Option<u64>,
         metadata: HashMap<String, String>,
     },
     /// Mark a claimed key complete and optionally store the domain result for
-    /// duplicate callers to replay.
+    /// duplicate callers to replay. Extends the lease from the short in-flight
+    /// window to the record's full `retention_ms`.
     IdempotencyComplete {
         key: String,
         owner: String,
         fencing_token: u64,
         result: Option<Value>,
+    },
+    /// Extend the in-flight lease on a still-claimed key without completing it.
+    /// Lets a holder running a long operation keep its claim alive past the
+    /// initial `ttl_ms`. Rejected once the record is completed (the retention
+    /// lease governs then) or by a non-holder.
+    IdempotencyRenew {
+        key: String,
+        owner: String,
+        fencing_token: u64,
+        ttl_ms: u64,
     },
 
     // --- Cron / scheduling -------------------------------------------------
