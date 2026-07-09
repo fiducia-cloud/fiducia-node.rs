@@ -107,7 +107,26 @@ async fn claim(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ClaimBo
             key: body.key,
             owner: body.owner.unwrap_or_else(|| "anonymous".to_string()),
             ttl_ms,
+            retention_ms: body.retention_ms,
             metadata: body.metadata.unwrap_or_default(),
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
+/// `POST /v1/idempotency/renew` - extend the in-flight lease on a still-claimed
+/// key so a long-running holder does not lose its claim before completing.
+async fn renew(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<RenewBody>) -> Response {
+    let ttl_ms = match renew_ttl_ms(&body) {
+        Ok(ttl_ms) => ttl_ms,
+        Err(reason) => return bad_request(reason),
+    };
+    let result = node
+        .propose(Command::IdempotencyRenew {
+            key: body.key,
+            owner: body.owner,
+            fencing_token: body.fencing_token,
+            ttl_ms,
         })
         .await;
     propose_response(result, &uri)
