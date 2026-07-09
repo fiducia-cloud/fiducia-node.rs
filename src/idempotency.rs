@@ -254,6 +254,7 @@ mod tests {
             owner: None,
             ttl_ms: Some(1),
             ttl: Some("1s".to_string()),
+            retention_ms: None,
             metadata: None,
         };
         let zero = ClaimBody {
@@ -261,6 +262,7 @@ mod tests {
             owner: None,
             ttl_ms: Some(0),
             ttl: None,
+            retention_ms: None,
             metadata: None,
         };
 
