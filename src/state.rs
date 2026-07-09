@@ -243,7 +243,8 @@ impl Command {
             | Command::RateLimitCheck { key, .. }
             | Command::IdempotencyClaim { key, .. }
             | Command::IdempotencyComplete { key, .. }
-            | Command::IdempotencyRenew { key, .. } => key,
+            | Command::IdempotencyRenew { key, .. }
+            | Command::IdempotencyAbandon { key, .. } => key,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
