@@ -2409,6 +2409,7 @@ mod tests {
             key: "stripe-webhook/event_123".to_string(),
             owner: "worker-a".to_string(),
             ttl_ms: 50,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
         let token = first.output["fencing_token"].as_u64().unwrap();
@@ -2416,6 +2417,7 @@ mod tests {
             key: "stripe-webhook/event_123".to_string(),
             owner: "worker-b".to_string(),
             ttl_ms: 50,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
 
@@ -2430,6 +2432,7 @@ mod tests {
             key: "stripe-webhook/event_123".to_string(),
             owner: "worker-b".to_string(),
             ttl_ms: 50,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
 
@@ -2445,12 +2448,14 @@ mod tests {
             key: " event with spaces ".to_string(),
             owner: "worker-a".to_string(),
             ttl_ms: 30_000,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
         let blank = sm.apply(Command::IdempotencyClaim {
             key: "   ".to_string(),
             owner: "worker-a".to_string(),
             ttl_ms: 30_000,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
 
@@ -2471,6 +2476,7 @@ mod tests {
             key: "orders/fulfill/123".to_string(),
             owner: "worker-a".to_string(),
             ttl_ms: 30_000,
+            retention_ms: None,
             metadata: [("source".to_string(), "stripe".to_string())]
                 .into_iter()
                 .collect(),
@@ -2492,6 +2498,7 @@ mod tests {
             key: "orders/fulfill/123".to_string(),
             owner: "worker-c".to_string(),
             ttl_ms: 30_000,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
 
@@ -2528,6 +2535,7 @@ mod tests {
             key: "orders/fulfill/456".to_string(),
             owner: "worker-a".to_string(),
             ttl_ms: 30_000,
+            retention_ms: None,
             metadata: HashMap::new(),
         });
         let token = claimed.output["fencing_token"].as_u64().unwrap();
@@ -2561,6 +2569,7 @@ mod tests {
             key: "webhook/event_789".to_string(),
             owner: "worker-a".to_string(),
             ttl_ms: 30_000,
+            retention_ms: None,
             metadata: [
                 ("provider".to_string(), "stripe".to_string()),
                 (
@@ -2582,6 +2591,140 @@ mod tests {
             Some("checkout.session.completed")
         );
         assert_eq!(record.status, IdempotencyStatus::Claimed);
+    }
+
+    #[test]
+    fn idempotency_abandoned_claim_expires_at_inflight_lease_not_retention() {
+        // The poisoning fix: a claim that is never completed must free the key at
+        // the *short* in-flight lease, even though its retention window is long.
+        // Otherwise a holder that dies between claim and complete would lock the
+        // key for the whole retention window.
+        let sm = StateMachine::new();
+        let first = sm.apply(Command::IdempotencyClaim {
+            key: "orders/charge/abandoned".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 40,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        assert_eq!(first.output["claimed"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(70));
+
+        // The claim was abandoned (never completed); it must be re-claimable.
+        let reclaim = sm.apply(Command::IdempotencyClaim {
+            key: "orders/charge/abandoned".to_string(),
+            owner: "worker-b".to_string(),
+            ttl_ms: 40,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        assert_eq!(reclaim.output["claimed"], true);
+        assert_eq!(reclaim.output["duplicate"], false);
+        assert_ne!(
+            reclaim.output["fencing_token"],
+            first.output["fencing_token"]
+        );
+    }
+
+    #[test]
+    fn idempotency_complete_extends_lease_to_retention_window() {
+        // A completed record must outlive the short in-flight lease so duplicates
+        // can still replay it deep into the retention window.
+        let sm = StateMachine::new();
+        let claimed = sm.apply(Command::IdempotencyClaim {
+            key: "orders/charge/completed".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 40,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        let token = claimed.output["fencing_token"].as_u64().unwrap();
+        let completed = sm.apply(Command::IdempotencyComplete {
+            key: "orders/charge/completed".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            result: Some(json!({ "charge": "ok" })),
+        });
+        assert_eq!(completed.output["completed"], true);
+
+        // Past the in-flight lease, but well within retention.
+        std::thread::sleep(std::time::Duration::from_millis(70));
+
+        let duplicate = sm.apply(Command::IdempotencyClaim {
+            key: "orders/charge/completed".to_string(),
+            owner: "worker-b".to_string(),
+            ttl_ms: 40,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        assert_eq!(duplicate.output["duplicate"], true);
+        assert_eq!(duplicate.output["record"]["status"], "completed");
+        assert_eq!(
+            duplicate.output["record"]["result"],
+            json!({ "charge": "ok" })
+        );
+    }
+
+    #[test]
+    fn idempotency_renew_extends_inflight_lease_only_for_holder() {
+        let sm = StateMachine::new();
+        let claimed = sm.apply(Command::IdempotencyClaim {
+            key: "jobs/long-running".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 40,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        let token = claimed.output["fencing_token"].as_u64().unwrap();
+
+        // A non-holder cannot renew.
+        let intruder = sm.apply(Command::IdempotencyRenew {
+            key: "jobs/long-running".to_string(),
+            owner: "worker-b".to_string(),
+            fencing_token: token,
+            ttl_ms: 5_000,
+        });
+        assert_eq!(intruder.output["renewed"], false);
+        assert_eq!(intruder.output["reason"], "not_holder");
+
+        // The holder renews well past the original in-flight lease.
+        let renewed = sm.apply(Command::IdempotencyRenew {
+            key: "jobs/long-running".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            ttl_ms: 5_000,
+        });
+        assert_eq!(renewed.output["renewed"], true);
+
+        std::thread::sleep(std::time::Duration::from_millis(70));
+
+        // Still held after the original 40ms lease because it was renewed.
+        let duplicate = sm.apply(Command::IdempotencyClaim {
+            key: "jobs/long-running".to_string(),
+            owner: "worker-c".to_string(),
+            ttl_ms: 40,
+            retention_ms: Some(3_600_000),
+            metadata: HashMap::new(),
+        });
+        assert_eq!(duplicate.output["duplicate"], true);
+        assert_eq!(duplicate.output["record"]["fencing_token"], token);
+
+        // Renew is rejected once completed — the retention lease governs then.
+        sm.apply(Command::IdempotencyComplete {
+            key: "jobs/long-running".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            result: None,
+        });
+        let after_complete = sm.apply(Command::IdempotencyRenew {
+            key: "jobs/long-running".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: token,
+            ttl_ms: 5_000,
+        });
+        assert_eq!(after_complete.output["renewed"], false);
+        assert_eq!(after_complete.output["reason"], "already_completed");
     }
 
     #[test]
