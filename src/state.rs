@@ -261,6 +261,7 @@ impl Command {
             Command::RateLimitCheck { .. } => "ratelimit.check",
             Command::IdempotencyClaim { .. } => "idempotency.claim",
             Command::IdempotencyComplete { .. } => "idempotency.complete",
+            Command::IdempotencyRenew { .. } => "idempotency.renew",
             Command::ScheduleUpsert { .. } => "schedule.upsert",
             Command::ScheduleRecordRun { .. } => "schedule.record_run",
             Command::ScheduleClaimFire { .. } => "schedule.claim_fire",
