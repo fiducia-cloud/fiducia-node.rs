@@ -417,6 +417,7 @@ impl Command {
             Command::HandoffOffer { name, .. }
             | Command::HandoffAccept { name, .. }
             | Command::HandoffReject { name, .. } => name,
+            Command::DecisionPropose { name, .. } | Command::DecisionVote { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
