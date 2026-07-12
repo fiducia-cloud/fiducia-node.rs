@@ -8,6 +8,7 @@
 //! The routing, consensus, state-machine primitives, replication, watches, and
 //! TTL expiry are implemented in the respective modules.
 
+mod barriers;
 mod consensus;
 mod counters;
 mod cron;
