@@ -257,6 +257,8 @@ impl Command {
             | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
+            | Command::CounterAdd { key, .. }
+            | Command::CounterSet { key, .. }
             | Command::RateLimitCheck { key, .. }
             | Command::IdempotencyClaim { key, .. }
             | Command::IdempotencyComplete { key, .. }
