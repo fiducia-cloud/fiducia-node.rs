@@ -3089,6 +3089,50 @@ mod tests {
     }
 
     #[test]
+    fn counter_add_creates_accumulates_and_compare_and_sets() {
+        let sm = StateMachine::new();
+        // Absent counter is read as None (callers treat that as 0).
+        assert!(sm.counter_get("rollout/v2/failures").is_none());
+
+        // First add creates it at 0 then applies the delta.
+        let first = sm.apply(Command::CounterAdd {
+            key: "rollout/v2/failures".to_string(),
+            delta: 1,
+            prev_revision: None,
+        });
+        assert_eq!(first.output["ok"], true);
+        assert_eq!(first.output["value"], 1);
+
+        // A negative delta accumulates.
+        let second = sm.apply(Command::CounterAdd {
+            key: "rollout/v2/failures".to_string(),
+            delta: 4,
+            prev_revision: None,
+        });
+        assert_eq!(second.output["value"], 5);
+        let revision = second.output["mod_revision"].as_u64().unwrap();
+
+        // A compare-and-set add against a stale revision is rejected.
+        let stale = sm.apply(Command::CounterAdd {
+            key: "rollout/v2/failures".to_string(),
+            delta: 100,
+            prev_revision: Some(0),
+        });
+        assert_eq!(stale.output["ok"], false);
+        assert_eq!(stale.output["reason"], "cas_mismatch");
+        assert_eq!(sm.counter_get("rollout/v2/failures").unwrap().value, 5);
+
+        // Set with the correct revision resets it to 0.
+        let reset = sm.apply(Command::CounterSet {
+            key: "rollout/v2/failures".to_string(),
+            value: 0,
+            prev_revision: Some(revision),
+        });
+        assert_eq!(reset.output["ok"], true);
+        assert_eq!(sm.counter_get("rollout/v2/failures").unwrap().value, 0);
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
