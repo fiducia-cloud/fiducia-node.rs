@@ -4334,6 +4334,48 @@ mod tests {
     }
 
     #[test]
+    fn handoff_transfers_ownership_atomically_with_a_higher_token() {
+        let sm = StateMachine::new();
+        // research-agent currently owns the task under fencing token 7.
+        let offer = sm.apply(Command::HandoffOffer {
+            name: "ticket-482/handoff".to_string(),
+            resource: "task:ticket-482".to_string(),
+            from: "research-agent".to_string(),
+            to: "legal-agent".to_string(),
+            from_token: 7,
+            context: json!({ "summary": "needs legal review" }),
+            ttl_ms: 30_000,
+        });
+        assert_eq!(offer.output["ok"], true);
+        // While offered, ownership has not moved.
+        assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Offered);
+
+        // Only the offered recipient may accept.
+        let wrong = sm.apply(Command::HandoffAccept {
+            name: "ticket-482/handoff".to_string(),
+            to: "random-agent".to_string(),
+        });
+        assert_eq!(wrong.output["reason"], "not_recipient");
+
+        // The recipient accepts and receives a strictly higher fencing token.
+        let accept = sm.apply(Command::HandoffAccept {
+            name: "ticket-482/handoff".to_string(),
+            to: "legal-agent".to_string(),
+        });
+        assert_eq!(accept.output["ok"], true);
+        let to_token = accept.output["to_token"].as_u64().unwrap();
+        assert!(to_token > 7, "new owner's token must exceed the old owner's");
+        assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Accepted);
+
+        // A second accept on the resolved handoff is rejected.
+        let again = sm.apply(Command::HandoffAccept {
+            name: "ticket-482/handoff".to_string(),
+            to: "legal-agent".to_string(),
+        });
+        assert_eq!(again.output["reason"], "not_offered");
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
