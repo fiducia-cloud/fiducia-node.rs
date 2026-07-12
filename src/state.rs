@@ -487,6 +487,11 @@ impl Command {
             | Command::BudgetReserve { name, .. }
             | Command::BudgetCommit { name, .. }
             | Command::BudgetRelease { name, .. } => name,
+            Command::ClaimAssert { name, .. }
+            | Command::ClaimSupport { name, .. }
+            | Command::ClaimContest { name, .. }
+            | Command::ClaimResolve { name, .. }
+            | Command::ClaimSupersede { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
