@@ -142,17 +142,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_guard_allows_everything() {
-        assert!(authorized(None, None));
-        assert!(authorized(None, Some("whatever")));
+    fn unset_secret_fails_closed_by_default() {
+        // No secret and no explicit opt-out: reject everything (fail closed), so a
+        // misconfigured prod node cannot silently trust forged internal headers.
+        assert!(!authorized(None, None, false));
+        assert!(!authorized(None, Some("whatever"), false));
+    }
+
+    #[test]
+    fn unset_secret_allows_only_with_insecure_optout() {
+        // The explicit local-dev opt-out re-enables the old no-op behavior.
+        assert!(authorized(None, None, true));
+        assert!(authorized(None, Some("whatever"), true));
     }
 
     #[test]
     fn enabled_guard_requires_exact_secret() {
-        assert!(authorized(Some("s3cret"), Some("s3cret")));
-        assert!(!authorized(Some("s3cret"), Some("s3cre7")));
-        assert!(!authorized(Some("s3cret"), Some("s3cret-extra"))); // length mismatch
-        assert!(!authorized(Some("s3cret"), None)); // header absent
+        // A configured secret always enforces, regardless of the insecure flag.
+        for allow_insecure in [false, true] {
+            assert!(authorized(Some("s3cret"), Some("s3cret"), allow_insecure));
+            assert!(!authorized(Some("s3cret"), Some("s3cre7"), allow_insecure));
+            // length mismatch
+            assert!(!authorized(Some("s3cret"), Some("s3cret-extra"), allow_insecure));
+            // header absent
+            assert!(!authorized(Some("s3cret"), None, allow_insecure));
+        }
     }
 
     #[test]
