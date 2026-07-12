@@ -360,6 +360,7 @@ pub enum ReadRequest {
     KvPrefix { prefix: String },
     Counter { key: String },
     Barrier { name: String },
+    Task { name: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
