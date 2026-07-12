@@ -1837,6 +1837,94 @@ impl Store {
         json!({ "ok": true, "task": record.view(&name) })
     }
 
+    fn apply_effect_prepare(
+        &mut self,
+        name: String,
+        effect_type: String,
+        payload: Value,
+        risk: String,
+        idempotency_key: String,
+        required_approvals: u32,
+    ) -> Value {
+        if let Some(existing) = self.effects.get(&name) {
+            return json!({ "ok": true, "created": false, "effect": existing.view(&name) });
+        }
+        let status = if required_approvals == 0 {
+            EffectStatus::Approved
+        } else {
+            EffectStatus::Prepared
+        };
+        let record = EffectRecord {
+            effect_type,
+            payload,
+            risk,
+            idempotency_key,
+            status,
+            required_approvals,
+            approvals: std::collections::BTreeSet::new(),
+            result: None,
+            generation: 1,
+        };
+        let view = record.view(&name);
+        self.effects.insert(name, record);
+        json!({ "ok": true, "created": true, "effect": view })
+    }
+
+    fn apply_effect_approve(&mut self, name: String, principal: String) -> Value {
+        let Some(record) = self.effects.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "effect": record.view(&name) });
+        }
+        record.approvals.insert(principal);
+        if record.approvals.len() as u32 >= record.required_approvals {
+            record.status = EffectStatus::Approved;
+        }
+        record.generation += 1;
+        json!({ "ok": true, "effect": record.view(&name) })
+    }
+
+    fn apply_effect_commit(&mut self, name: String, result: Value) -> Value {
+        let Some(record) = self.effects.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        match record.status {
+            // Idempotent replay: already committed, do not re-execute.
+            EffectStatus::Committed => {
+                json!({ "ok": true, "committed": false, "effect": record.view(&name) })
+            }
+            EffectStatus::Aborted => {
+                json!({ "ok": false, "reason": "aborted", "effect": record.view(&name) })
+            }
+            EffectStatus::Prepared => json!({
+                "ok": false,
+                "reason": "not_approved",
+                "approvals": record.approvals.len(),
+                "required_approvals": record.required_approvals,
+                "effect": record.view(&name),
+            }),
+            EffectStatus::Approved => {
+                record.status = EffectStatus::Committed;
+                record.result = Some(result);
+                record.generation += 1;
+                json!({ "ok": true, "committed": true, "effect": record.view(&name) })
+            }
+        }
+    }
+
+    fn apply_effect_abort(&mut self, name: String) -> Value {
+        let Some(record) = self.effects.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "effect": record.view(&name) });
+        }
+        record.status = EffectStatus::Aborted;
+        record.generation += 1;
+        json!({ "ok": true, "effect": record.view(&name) })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
