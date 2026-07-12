@@ -1814,6 +1814,26 @@ impl StateMachine {
                 name,
                 reservation_id,
             } => store.apply_budget_release(name, reservation_id),
+            Command::ClaimAssert {
+                name,
+                subject,
+                predicate,
+                value,
+                confidence,
+                author,
+                evidence,
+                valid_until_ms,
+            } => store.apply_claim_assert(
+                name, subject, predicate, value, confidence, author, evidence, valid_until_ms,
+            ),
+            Command::ClaimSupport { name, agent } => store.apply_claim_support(name, agent),
+            Command::ClaimContest { name, agent, reason } => {
+                store.apply_claim_contest(name, agent, reason)
+            }
+            Command::ClaimResolve { name, accepted } => store.apply_claim_resolve(name, accepted),
+            Command::ClaimSupersede { name, superseded_by } => {
+                store.apply_claim_supersede(name, superseded_by)
+            }
             Command::LockAcquire {
                 keys,
                 holder,
