@@ -1572,6 +1572,145 @@ impl Store {
         json!({ "ok": true, "resolved": view.status.is_terminal(), "barrier": view })
     }
 
+    fn apply_task_create(
+        &mut self,
+        name: String,
+        task_type: String,
+        payload: Value,
+        deadline_ms: Option<u64>,
+    ) -> Value {
+        if let Some(existing) = self.tasks.get(&name) {
+            return json!({ "ok": true, "created": false, "task": existing.view(&name) });
+        }
+        let record = TaskRecord {
+            task_type,
+            payload,
+            status: TaskStatus::Pending,
+            owner: None,
+            fencing_token: 0,
+            lease_ttl_ms: 0,
+            lease_expires_ms: None,
+            progress: 0,
+            checkpoint: Value::Null,
+            result: None,
+            deadline_ms,
+            generation: 1,
+        };
+        let view = record.view(&name);
+        self.tasks.insert(name, record);
+        json!({ "ok": true, "created": true, "task": view })
+    }
+
+    fn apply_task_claim(&mut self, now: u64, name: String, worker: String, ttl_ms: u64) -> Value {
+        let token = self.next_token();
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "task": record.view(&name) });
+        }
+        if !record.claimable(now) {
+            return json!({
+                "ok": false,
+                "reason": "already_claimed",
+                "owner": record.owner,
+                "task": record.view(&name),
+            });
+        }
+        record.owner = Some(worker);
+        record.fencing_token = token;
+        record.lease_ttl_ms = ttl_ms;
+        record.lease_expires_ms = Some(now.saturating_add(ttl_ms));
+        record.status = TaskStatus::Claimed;
+        record.generation += 1;
+        json!({ "ok": true, "fencing_token": token, "task": record.view(&name) })
+    }
+
+    fn apply_task_progress(
+        &mut self,
+        now: u64,
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        percent: u32,
+        checkpoint: Value,
+    ) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if !record.owned_now(now, &worker, fencing_token) {
+            return json!({ "ok": false, "reason": "fenced", "task": record.view(&name) });
+        }
+        record.status = TaskStatus::Running;
+        record.progress = percent.min(100);
+        record.checkpoint = checkpoint;
+        record.lease_expires_ms = Some(now.saturating_add(record.lease_ttl_ms));
+        record.generation += 1;
+        json!({ "ok": true, "task": record.view(&name) })
+    }
+
+    fn apply_task_complete(
+        &mut self,
+        now: u64,
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        result: Value,
+    ) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if !record.owned_now(now, &worker, fencing_token) {
+            return json!({ "ok": false, "reason": "fenced", "task": record.view(&name) });
+        }
+        record.status = TaskStatus::Completed;
+        record.progress = 100;
+        record.result = Some(result);
+        record.lease_expires_ms = None;
+        record.generation += 1;
+        json!({ "ok": true, "task": record.view(&name) })
+    }
+
+    fn apply_task_fail(
+        &mut self,
+        now: u64,
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        retryable: bool,
+    ) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if !record.owned_now(now, &worker, fencing_token) {
+            return json!({ "ok": false, "reason": "fenced", "task": record.view(&name) });
+        }
+        if retryable {
+            // Return to the claimable pool for another worker.
+            record.status = TaskStatus::Pending;
+            record.owner = None;
+            record.lease_expires_ms = None;
+        } else {
+            record.status = TaskStatus::Failed;
+        }
+        record.generation += 1;
+        json!({ "ok": true, "retryable": retryable, "task": record.view(&name) })
+    }
+
+    fn apply_task_cancel(&mut self, name: String) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "task": record.view(&name) });
+        }
+        record.status = TaskStatus::Cancelled;
+        record.owner = None;
+        record.lease_expires_ms = None;
+        record.generation += 1;
+        json!({ "ok": true, "task": record.view(&name) })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
