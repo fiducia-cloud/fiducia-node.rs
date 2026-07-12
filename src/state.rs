@@ -166,6 +166,27 @@ pub enum Command {
         to: String,
     },
 
+    // --- Decisions (typed weighted voting) ------------------------------
+    /// Propose a decision with typed options and a resolution policy.
+    DecisionPropose {
+        name: String,
+        question: String,
+        options: Vec<String>,
+        policy: DecisionPolicy,
+        deadline_ms: Option<u64>,
+    },
+    /// Cast (or replace) one voter's vote. `option` of `None` abstains; `veto`
+    /// aborts the decision; `weight` drives resolution and `evidence` records why.
+    DecisionVote {
+        name: String,
+        voter: String,
+        option: Option<String>,
+        confidence: f32,
+        weight: u64,
+        veto: bool,
+        evidence: Vec<String>,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
