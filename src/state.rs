@@ -4342,13 +4342,30 @@ mod tests {
     #[test]
     fn handoff_transfers_ownership_atomically_with_a_higher_token() {
         let sm = StateMachine::new();
-        // research-agent currently owns the task under fencing token 7.
+        // research-agent really owns the task, holding a fencing token minted by
+        // the node's single monotonic counter.
+        sm.apply(Command::TaskCreate {
+            name: "task:ticket-482".to_string(),
+            task_type: "research".to_string(),
+            payload: Value::Null,
+            deadline_ms: None,
+        });
+        let from_token = sm
+            .apply(Command::TaskClaim {
+                name: "task:ticket-482".to_string(),
+                worker: "research-agent".to_string(),
+                ttl_ms: 60_000,
+            })
+            .output["fencing_token"]
+            .as_u64()
+            .unwrap();
+
         let offer = sm.apply(Command::HandoffOffer {
             name: "ticket-482/handoff".to_string(),
             resource: "task:ticket-482".to_string(),
             from: "research-agent".to_string(),
             to: "legal-agent".to_string(),
-            from_token: 7,
+            from_token,
             context: json!({ "summary": "needs legal review" }),
             ttl_ms: 30_000,
         });
