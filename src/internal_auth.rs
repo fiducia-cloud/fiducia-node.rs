@@ -96,7 +96,7 @@ pub async fn guard(request: Request, next: Next) -> Response {
         .headers()
         .get(INTERNAL_AUTH_HEADER)
         .and_then(|v| v.to_str().ok());
-    if !authorized(configured().as_deref(), provided) {
+    if !authorized(configured().as_deref(), provided, allow_insecure()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
