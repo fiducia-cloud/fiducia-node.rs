@@ -45,6 +45,10 @@ pub const MAX_METADATA_ENTRIES: usize = 64;
 pub const MAX_METADATA_KEY_BYTES: usize = 256;
 /// Max bytes for a single metadata value.
 pub const MAX_METADATA_VALUE_BYTES: usize = 4096;
+/// Max bytes for a rate-limit `{tenant}` / `{key}` path segment. Each distinct
+/// tenant+key becomes a long-lived limiter bucket (a map entry), so an unbounded
+/// value is both a memory-growth vector and a way to mint arbitrary bucket names.
+pub const MAX_RATE_LIMIT_SEGMENT_BYTES: usize = 256;
 
 /// A rejected write. Renders as `400 Bad Request` with a stable machine code and
 /// a human-readable detail, matching the node's other error bodies.
