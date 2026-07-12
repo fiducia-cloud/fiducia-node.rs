@@ -995,6 +995,79 @@ impl EffectRecord {
     }
 }
 
+/// The lifecycle of an ownership handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffStatus {
+    Offered,
+    Accepted,
+    Rejected,
+    Expired,
+}
+
+impl HandoffStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, HandoffStatus::Offered)
+    }
+}
+
+/// Read view of an atomic ownership handoff. While `Offered`, the original owner
+/// (`from`, holding `from_token`) still owns the resource; on `Accepted`, `to`
+/// receives a strictly higher `to_token`, so the resource's fencing rejects the
+/// old owner — there is never a moment when both or neither own it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffState {
+    pub name: String,
+    pub resource: String,
+    pub from: String,
+    pub to: String,
+    pub from_token: u64,
+    pub to_token: Option<u64>,
+    pub status: HandoffStatus,
+    pub context: Value,
+    pub expires_ms: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HandoffRecord {
+    resource: String,
+    from: String,
+    to: String,
+    from_token: u64,
+    to_token: Option<u64>,
+    status: HandoffStatus,
+    context: Value,
+    expires_ms: Option<u64>,
+    generation: u64,
+}
+
+impl HandoffRecord {
+    /// Lazily expire an offer whose deadline has passed.
+    fn effective_status(&self, now: u64) -> HandoffStatus {
+        if self.status == HandoffStatus::Offered && self.expires_ms.is_some_and(|e| now >= e) {
+            HandoffStatus::Expired
+        } else {
+            self.status
+        }
+    }
+
+    fn view(&self, name: &str, now: u64) -> HandoffState {
+        HandoffState {
+            name: name.to_string(),
+            resource: self.resource.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            from_token: self.from_token,
+            to_token: self.to_token,
+            status: self.effective_status(now),
+            context: self.context.clone(),
+            expires_ms: self.expires_ms,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1004,6 +1077,7 @@ struct Store {
     barriers: HashMap<String, BarrierRecord>,
     tasks: HashMap<String, TaskRecord>,
     effects: HashMap<String, EffectRecord>,
+    handoffs: HashMap<String, HandoffRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
