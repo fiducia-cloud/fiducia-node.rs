@@ -3359,6 +3359,97 @@ mod tests {
     }
 
     #[test]
+    fn barrier_quorum_resolves_on_second_distinct_arrival() {
+        let sm = StateMachine::new();
+        sm.apply(Command::BarrierCreate {
+            name: "release/reviewers".to_string(),
+            policy: BarrierPolicy::Quorum { required: 2 },
+            expected: 3,
+            deadline_ms: None,
+        });
+        let first = sm.apply(Command::BarrierArrive {
+            name: "release/reviewers".to_string(),
+            participant: "reviewer-a".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        assert_eq!(first.output["resolved"], false);
+        // A repeat arrival by the same participant is idempotent (still 1 distinct).
+        let repeat = sm.apply(Command::BarrierArrive {
+            name: "release/reviewers".to_string(),
+            participant: "reviewer-a".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        assert_eq!(repeat.output["resolved"], false);
+        let second = sm.apply(Command::BarrierArrive {
+            name: "release/reviewers".to_string(),
+            participant: "reviewer-b".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        assert_eq!(second.output["resolved"], true);
+        assert_eq!(second.output["barrier"]["status"], "satisfied");
+        assert_eq!(second.output["barrier"]["arrived_count"], 2);
+    }
+
+    #[test]
+    fn barrier_any_veto_aborts() {
+        let sm = StateMachine::new();
+        sm.apply(Command::BarrierCreate {
+            name: "deploy/safety".to_string(),
+            policy: BarrierPolicy::AnyVeto,
+            expected: 2,
+            deadline_ms: None,
+        });
+        sm.apply(Command::BarrierArrive {
+            name: "deploy/safety".to_string(),
+            participant: "compliance".to_string(),
+            weight: 1,
+            veto: true,
+        });
+        assert_eq!(sm.barrier_get("deploy/safety").unwrap().status, BarrierStatus::Vetoed);
+    }
+
+    #[test]
+    fn barrier_weighted_quorum_sums_weights() {
+        let sm = StateMachine::new();
+        sm.apply(Command::BarrierCreate {
+            name: "vote".to_string(),
+            policy: BarrierPolicy::WeightedQuorum { required_weight: 5 },
+            expected: 0,
+            deadline_ms: None,
+        });
+        sm.apply(Command::BarrierArrive {
+            name: "vote".to_string(),
+            participant: "specialist".to_string(),
+            weight: 3,
+            veto: false,
+        });
+        assert_eq!(sm.barrier_get("vote").unwrap().status, BarrierStatus::Pending);
+        sm.apply(Command::BarrierArrive {
+            name: "vote".to_string(),
+            participant: "generalist".to_string(),
+            weight: 2,
+            veto: false,
+        });
+        assert_eq!(sm.barrier_get("vote").unwrap().status, BarrierStatus::Satisfied);
+    }
+
+    #[test]
+    fn barrier_arrive_auto_creates_single_participant_all() {
+        let sm = StateMachine::new();
+        let out = sm.apply(Command::BarrierArrive {
+            name: "adhoc".to_string(),
+            participant: "solo".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        // Auto-created `all` with expected=1 → one arrival satisfies it.
+        assert_eq!(out.output["resolved"], true);
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
