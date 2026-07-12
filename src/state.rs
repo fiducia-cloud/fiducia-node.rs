@@ -1182,6 +1182,11 @@ impl StateMachine {
         store.barriers.get(name).map(|record| record.view(name, now_ms()))
     }
 
+    /// Read a durable task's current state.
+    pub fn task_get(&self, name: &str) -> Option<TaskState> {
+        self.store.lock().unwrap().tasks.get(name).map(|record| record.view(name))
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
