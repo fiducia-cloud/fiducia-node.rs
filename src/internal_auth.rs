@@ -11,11 +11,14 @@
 //! This middleware closes that gap with a shared cluster secret. When
 //! `FIDUCIA_INTERNAL_SECRET` is set, every `/v1` and `/raft` request must carry a
 //! matching [`INTERNAL_AUTH_HEADER`] (compared in constant time); the LB and the
-//! peer transport attach it. When the secret is **unset**, the guard is a no-op —
-//! so single-node/dev and the in-process loopback tests are byte-identical. It is
-//! a coarse "are you inside the trust boundary" gate, **not** a replacement for
-//! the LB's user-level auth; it is the cheap, deployable complement to a proper
-//! mTLS / NetworkPolicy posture (see future-work #1).
+//! peer transport attach it. When the secret is **unset**, the guard fails
+//! **closed** — every internal request is rejected — so a node that boots without
+//! its secret (a misconfigured prod deploy) refuses forged `x-fiducia-*` headers
+//! and forged `AppendEntries` instead of silently trusting them. Local single-node
+//! dev opts out explicitly with `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` (logged loudly
+//! once at boot). It is a coarse "are you inside the trust boundary" gate,
+//! **not** a replacement for the LB's user-level auth; it is the cheap, deployable
+//! complement to a proper mTLS / NetworkPolicy posture (see future-work #1).
 
 use std::sync::OnceLock;
 
