@@ -734,6 +734,7 @@ struct Store {
     next_fencing_token: u64,
     kv: HashMap<String, KvEntry>,
     counters: HashMap<String, CounterEntry>,
+    barriers: HashMap<String, BarrierRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
