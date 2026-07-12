@@ -3771,6 +3771,107 @@ mod tests {
     }
 
     #[test]
+    fn task_claim_is_exclusive_and_fences_stale_workers() {
+        let sm = StateMachine::new();
+        let task = "repo/acme/api/issue/482".to_string();
+        sm.apply(Command::TaskCreate {
+            name: task.clone(),
+            task_type: "implement".to_string(),
+            payload: json!({ "issue": 482 }),
+            deadline_ms: None,
+        });
+
+        // Worker A claims and receives a fencing token.
+        let claim = sm.apply(Command::TaskClaim {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            ttl_ms: 60_000,
+        });
+        assert_eq!(claim.output["ok"], true);
+        let token = claim.output["fencing_token"].as_u64().unwrap();
+
+        // Worker B cannot claim an actively-owned task.
+        let contended = sm.apply(Command::TaskClaim {
+            name: task.clone(),
+            worker: "agent-b".to_string(),
+            ttl_ms: 60_000,
+        });
+        assert_eq!(contended.output["ok"], false);
+        assert_eq!(contended.output["reason"], "already_claimed");
+
+        // A progress write with the wrong (stale) token is fenced.
+        let stale = sm.apply(Command::TaskProgress {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            fencing_token: token + 1,
+            percent: 50,
+            checkpoint: json!({}),
+        });
+        assert_eq!(stale.output["ok"], false);
+        assert_eq!(stale.output["reason"], "fenced");
+
+        // The current token holder makes progress, then completes.
+        sm.apply(Command::TaskProgress {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            fencing_token: token,
+            percent: 50,
+            checkpoint: json!({ "step": "coded" }),
+        });
+        let done = sm.apply(Command::TaskComplete {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            fencing_token: token,
+            result: json!({ "pr": 991 }),
+        });
+        assert_eq!(done.output["ok"], true);
+        assert_eq!(sm.task_get(&task).unwrap().status, TaskStatus::Completed);
+
+        // A claim on a completed task is rejected as terminal.
+        let after = sm.apply(Command::TaskClaim {
+            name: task,
+            worker: "agent-c".to_string(),
+            ttl_ms: 1_000,
+        });
+        assert_eq!(after.output["reason"], "terminal");
+    }
+
+    #[test]
+    fn task_retryable_failure_returns_to_the_claimable_pool() {
+        let sm = StateMachine::new();
+        sm.apply(Command::TaskCreate {
+            name: "backfill".to_string(),
+            task_type: "job".to_string(),
+            payload: Value::Null,
+            deadline_ms: None,
+        });
+        let token = sm
+            .apply(Command::TaskClaim {
+                name: "backfill".to_string(),
+                worker: "w1".to_string(),
+                ttl_ms: 60_000,
+            })
+            .output["fencing_token"]
+            .as_u64()
+            .unwrap();
+        sm.apply(Command::TaskFail {
+            name: "backfill".to_string(),
+            worker: "w1".to_string(),
+            fencing_token: token,
+            retryable: true,
+        });
+        // Back to Pending, so another worker can claim it (with a higher token).
+        assert_eq!(sm.task_get("backfill").unwrap().status, TaskStatus::Pending);
+        let reclaim = sm.apply(Command::TaskClaim {
+            name: "backfill".to_string(),
+            worker: "w2".to_string(),
+            ttl_ms: 60_000,
+        });
+        assert_eq!(reclaim.output["ok"], true);
+        assert!(reclaim.output["fencing_token"].as_u64().unwrap() > token);
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
