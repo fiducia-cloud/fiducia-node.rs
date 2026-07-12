@@ -67,6 +67,51 @@ pub enum Command {
         veto: bool,
     },
 
+    // --- Durable tasks --------------------------------------------------
+    /// Create a durable task if it does not already exist. Idempotent: a repeat
+    /// create returns the existing task unchanged.
+    TaskCreate {
+        name: String,
+        task_type: String,
+        payload: Value,
+        deadline_ms: Option<u64>,
+    },
+    /// Claim a pending (or lease-expired) task, minting a fresh fencing token and
+    /// an ownership lease. An actively owned task is not re-granted.
+    TaskClaim {
+        name: String,
+        worker: String,
+        ttl_ms: u64,
+    },
+    /// Report progress and a checkpoint, renewing the lease. Rejected unless the
+    /// caller presents the current owner + fencing token.
+    TaskProgress {
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        percent: u32,
+        checkpoint: Value,
+    },
+    /// Complete a task with a durable result. Requires the current fencing token.
+    TaskComplete {
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        result: Value,
+    },
+    /// Fail a task. `retryable` returns it to Pending for reassignment; otherwise
+    /// it ends Failed. Requires the current fencing token.
+    TaskFail {
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        retryable: bool,
+    },
+    /// Cancel a task (terminal), regardless of owner.
+    TaskCancel {
+        name: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
