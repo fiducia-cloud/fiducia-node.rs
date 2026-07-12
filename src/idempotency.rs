@@ -32,9 +32,15 @@ const DEFAULT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub struct ClaimBody {
     pub key: String,
     pub owner: Option<String>,
+    /// In-flight lease: how long a *claimed-but-not-completed* record is held
+    /// before an abandoned claim frees the key. Short — sized to the max request
+    /// duration. `complete` extends the record to `retention_ms`.
     pub ttl_ms: Option<u64>,
-    /// Human-friendly TTL such as `60s`, `15m`, `24h`, or `7d`.
+    /// Human-friendly in-flight TTL such as `60s`, `15m`, `24h`, or `7d`.
     pub ttl: Option<String>,
+    /// How long the *completed* record lives so duplicates can replay it.
+    /// Defaults to the in-flight lease when omitted.
+    pub retention_ms: Option<u64>,
     pub metadata: Option<HashMap<String, String>>,
 }
 
@@ -47,6 +53,23 @@ pub struct CompleteBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RenewBody {
+    pub key: String,
+    pub owner: String,
+    pub fencing_token: u64,
+    pub ttl_ms: Option<u64>,
+    /// Human-friendly in-flight TTL such as `60s`, `15m`.
+    pub ttl: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AbandonBody {
+    pub key: String,
+    pub owner: String,
+    pub fencing_token: u64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct KeyParam {
     pub key: String,
 }
@@ -55,6 +78,8 @@ pub fn router() -> Router<Arc<Node>> {
     Router::new()
         .route("/", get(get_record))
         .route("/claim", post(claim))
+        .route("/renew", post(renew))
+        .route("/abandon", post(abandon))
         .route("/complete", post(complete))
 }
 
@@ -90,7 +115,39 @@ async fn claim(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ClaimBo
             key: body.key,
             owner: body.owner.unwrap_or_else(|| "anonymous".to_string()),
             ttl_ms,
+            retention_ms: body.retention_ms,
             metadata: body.metadata.unwrap_or_default(),
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
+/// `POST /v1/idempotency/renew` - extend the in-flight lease on a still-claimed
+/// key so a long-running holder does not lose its claim before completing.
+async fn renew(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<RenewBody>) -> Response {
+    let ttl_ms = match renew_ttl_ms(&body) {
+        Ok(ttl_ms) => ttl_ms,
+        Err(reason) => return bad_request(reason),
+    };
+    let result = node
+        .propose(Command::IdempotencyRenew {
+            key: body.key,
+            owner: body.owner,
+            fencing_token: body.fencing_token,
+            ttl_ms,
+        })
+        .await;
+    propose_response(result, &uri)
+}
+
+/// `POST /v1/idempotency/abandon` - release a still-claimed key so a retry can
+/// re-execute after a transient failure. No-op-safe: refused once completed.
+async fn abandon(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<AbandonBody>) -> Response {
+    let result = node
+        .propose(Command::IdempotencyAbandon {
+            key: body.key,
+            owner: body.owner,
+            fencing_token: body.fencing_token,
         })
         .await;
     propose_response(result, &uri)
@@ -114,6 +171,16 @@ async fn complete(
 }
 
 fn claim_ttl_ms(body: &ClaimBody) -> Result<u64, &'static str> {
+    match (body.ttl_ms, body.ttl.as_deref()) {
+        (Some(_), Some(_)) => Err("set only one of ttl_ms or ttl"),
+        (Some(ttl_ms), None) if ttl_ms > 0 => Ok(ttl_ms),
+        (Some(_), None) => Err("ttl_ms must be greater than zero"),
+        (None, Some(ttl)) => parse_ttl_ms(ttl),
+        (None, None) => Ok(DEFAULT_TTL_MS),
+    }
+}
+
+fn renew_ttl_ms(body: &RenewBody) -> Result<u64, &'static str> {
     match (body.ttl_ms, body.ttl.as_deref()) {
         (Some(_), Some(_)) => Err("set only one of ttl_ms or ttl"),
         (Some(ttl_ms), None) if ttl_ms > 0 => Ok(ttl_ms),
@@ -208,6 +275,7 @@ mod tests {
             owner: None,
             ttl_ms: Some(1),
             ttl: Some("1s".to_string()),
+            retention_ms: None,
             metadata: None,
         };
         let zero = ClaimBody {
@@ -215,6 +283,7 @@ mod tests {
             owner: None,
             ttl_ms: Some(0),
             ttl: None,
+            retention_ms: None,
             metadata: None,
         };
 
