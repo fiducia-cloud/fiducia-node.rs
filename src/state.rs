@@ -187,6 +187,35 @@ pub enum Command {
         evidence: Vec<String>,
     },
 
+    // --- Hierarchical budgets -------------------------------------------
+    /// Create or re-cap a budget with a per-axis ceiling (usd_micros, tokens,
+    /// tool_calls); a `None` axis is unlimited.
+    BudgetSet {
+        name: String,
+        limit: BudgetAmount,
+    },
+    /// Reserve `amount` against a budget under `reservation_id`. Rejected if it
+    /// would exceed any limited axis, so concurrent holders cannot each spend the
+    /// same remaining dollar.
+    BudgetReserve {
+        name: String,
+        reservation_id: String,
+        holder: String,
+        amount: BudgetAmount,
+    },
+    /// Commit a reservation with the `actual` spend (≤ reserved). Frees the
+    /// difference between reserved and actual.
+    BudgetCommit {
+        name: String,
+        reservation_id: String,
+        actual: BudgetAmount,
+    },
+    /// Release a still-held reservation, returning its full headroom.
+    BudgetRelease {
+        name: String,
+        reservation_id: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
