@@ -50,8 +50,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::persist::{Recovered, ShardStore};
 use crate::state::{
-    Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem, Leadership,
-    LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
+    BarrierState, Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem,
+    Leadership, LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
     ServiceInstance,
     ServiceSummary, StateMachine,
 };
