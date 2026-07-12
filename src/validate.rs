@@ -183,6 +183,15 @@ pub fn task(name: &str, worker: Option<&str>) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// Validate an effect name, and a principal id when the operation names one.
+pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
+    check_str("effect name", name, MAX_NAME_BYTES, false)?;
+    if let Some(principal) = principal {
+        check_str("principal", principal, MAX_HOLDER_BYTES, false)?;
+    }
+    Ok(())
+}
+
 /// Validate a service registration: name, instance id, address, TTL, metadata.
 pub fn service_register(
     service: &str,
