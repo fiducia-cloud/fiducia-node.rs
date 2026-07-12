@@ -358,6 +358,7 @@ pub enum ShardMsg {
 pub enum ReadRequest {
     Kv { key: String },
     KvPrefix { prefix: String },
+    Counter { key: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
