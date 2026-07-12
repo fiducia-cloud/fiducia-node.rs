@@ -447,6 +447,10 @@ impl Command {
             | Command::HandoffAccept { name, .. }
             | Command::HandoffReject { name, .. } => name,
             Command::DecisionPropose { name, .. } | Command::DecisionVote { name, .. } => name,
+            Command::BudgetSet { name, .. }
+            | Command::BudgetReserve { name, .. }
+            | Command::BudgetCommit { name, .. }
+            | Command::BudgetRelease { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
