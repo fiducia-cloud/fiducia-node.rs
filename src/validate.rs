@@ -337,6 +337,34 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_accepts_normal_segments() {
+        assert!(rate_limit("acme", "login").is_ok());
+        assert!(rate_limit("tenant-42", "api/v1:read").is_ok());
+    }
+
+    #[test]
+    fn rate_limit_rejects_empty_segments() {
+        assert_eq!(rate_limit("", "k").unwrap_err().code, "empty_field");
+        assert_eq!(rate_limit("t", "").unwrap_err().code, "empty_field");
+    }
+
+    #[test]
+    fn rate_limit_rejects_oversized_segments() {
+        let long = big(MAX_RATE_LIMIT_SEGMENT_BYTES + 1);
+        assert_eq!(rate_limit(&long, "k").unwrap_err().code, "field_too_long");
+        assert_eq!(rate_limit("t", &long).unwrap_err().code, "field_too_long");
+        // Exactly at the cap is allowed.
+        assert!(rate_limit(&big(MAX_RATE_LIMIT_SEGMENT_BYTES), "k").is_ok());
+    }
+
+    #[test]
+    fn rate_limit_rejects_control_and_whitespace() {
+        assert_eq!(rate_limit("a b", "k").unwrap_err().code, "invalid_field");
+        assert_eq!(rate_limit("t", "a\nb").unwrap_err().code, "invalid_field");
+        assert_eq!(rate_limit("t", "a\0b").unwrap_err().code, "invalid_field");
+    }
+
+    #[test]
     fn metadata_entry_count_is_capped() {
         let md: HashMap<String, String> = (0..MAX_METADATA_ENTRIES + 1)
             .map(|i| (format!("k{i}"), "v".to_string()))
