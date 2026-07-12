@@ -52,7 +52,7 @@ use crate::persist::{Recovered, ShardStore};
 use crate::state::{
     BarrierState, Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem,
     Leadership, LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
-    ServiceInstance,
+    ServiceInstance, TaskState,
     ServiceSummary, StateMachine,
 };
 use crate::transport::{
