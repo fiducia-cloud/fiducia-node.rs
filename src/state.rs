@@ -216,6 +216,42 @@ pub enum Command {
         reservation_id: String,
     },
 
+    // --- Claims (contestable ledger) ------------------------------------
+    /// Assert (or re-assert) a claim: a versioned subject/predicate/value with
+    /// confidence and evidence. Re-asserting bumps the version and resets it to
+    /// Asserted.
+    ClaimAssert {
+        name: String,
+        subject: String,
+        predicate: String,
+        value: Value,
+        confidence: f32,
+        author: String,
+        evidence: Vec<String>,
+        valid_until_ms: Option<u64>,
+    },
+    /// Record an agent's support for a claim.
+    ClaimSupport {
+        name: String,
+        agent: String,
+    },
+    /// Record an agent's contest of a claim, moving it to Contested.
+    ClaimContest {
+        name: String,
+        agent: String,
+        reason: String,
+    },
+    /// An authorized process accepts or rejects a claim (terminal).
+    ClaimResolve {
+        name: String,
+        accepted: bool,
+    },
+    /// Supersede a claim with a newer one (terminal), pointing to its successor.
+    ClaimSupersede {
+        name: String,
+        superseded_by: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
