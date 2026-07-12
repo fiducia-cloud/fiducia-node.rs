@@ -393,6 +393,9 @@ impl Command {
             | Command::EffectApprove { name, .. }
             | Command::EffectCommit { name, .. }
             | Command::EffectAbort { name } => name,
+            Command::HandoffOffer { name, .. }
+            | Command::HandoffAccept { name, .. }
+            | Command::HandoffReject { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
