@@ -195,6 +195,15 @@ pub fn handoff(name: &str, from: Option<&str>, to: Option<&str>) -> Result<(), R
     Ok(())
 }
 
+/// Validate a decision name, and a voter id when the operation names one.
+pub fn decision(name: &str, voter: Option<&str>) -> Result<(), Rejection> {
+    check_str("decision name", name, MAX_NAME_BYTES, false)?;
+    if let Some(voter) = voter {
+        check_str("voter", voter, MAX_HOLDER_BYTES, false)?;
+    }
+    Ok(())
+}
+
 /// Validate an effect name, and a principal id when the operation names one.
 pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
     check_str("effect name", name, MAX_NAME_BYTES, false)?;

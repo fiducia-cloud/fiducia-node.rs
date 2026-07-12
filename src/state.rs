@@ -166,6 +166,27 @@ pub enum Command {
         to: String,
     },
 
+    // --- Decisions (typed weighted voting) ------------------------------
+    /// Propose a decision with typed options and a resolution policy.
+    DecisionPropose {
+        name: String,
+        question: String,
+        options: Vec<String>,
+        policy: DecisionPolicy,
+        deadline_ms: Option<u64>,
+    },
+    /// Cast (or replace) one voter's vote. `option` of `None` abstains; `veto`
+    /// aborts the decision; `weight` drives resolution and `evidence` records why.
+    DecisionVote {
+        name: String,
+        voter: String,
+        option: Option<String>,
+        confidence: f32,
+        weight: u64,
+        veto: bool,
+        evidence: Vec<String>,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -396,6 +417,7 @@ impl Command {
             Command::HandoffOffer { name, .. }
             | Command::HandoffAccept { name, .. }
             | Command::HandoffReject { name, .. } => name,
+            Command::DecisionPropose { name, .. } | Command::DecisionVote { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -432,6 +454,8 @@ impl Command {
             Command::HandoffOffer { .. } => "handoff.offer",
             Command::HandoffAccept { .. } => "handoff.accept",
             Command::HandoffReject { .. } => "handoff.reject",
+            Command::DecisionPropose { .. } => "decision.propose",
+            Command::DecisionVote { .. } => "decision.vote",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -1099,6 +1123,179 @@ impl HandoffRecord {
     }
 }
 
+/// How a decision resolves from its weighted votes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionPolicy {
+    /// Once `min_votes` are cast, the option with the most total weight wins.
+    Plurality { min_votes: u32 },
+    /// The first option whose summed weight reaches `required_weight` wins.
+    Threshold { required_weight: u64 },
+    /// Once `min_votes` are cast, resolves only if all voters chose one option.
+    Unanimous { min_votes: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionStatus {
+    Open,
+    Resolved,
+    Vetoed,
+    TimedOut,
+}
+
+/// A per-option weight tally.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionTally {
+    pub option: String,
+    pub weight: u64,
+}
+
+/// One agent's vote in a decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionVoteView {
+    pub voter: String,
+    /// The chosen option, or `None` to abstain.
+    pub option: Option<String>,
+    pub confidence: f32,
+    pub weight: u64,
+    pub veto: bool,
+    pub evidence: Vec<String>,
+}
+
+/// Read view of a decision, with its outcome derived at read time.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionState {
+    pub name: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub policy: DecisionPolicy,
+    pub status: DecisionStatus,
+    pub winner: Option<String>,
+    /// Per-option summed weight, sorted by option for determinism.
+    pub tallies: Vec<DecisionTally>,
+    pub votes: Vec<DecisionVoteView>,
+    pub deadline_ms: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionVoteRecord {
+    option: Option<String>,
+    confidence: f32,
+    weight: u64,
+    veto: bool,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionRecord {
+    question: String,
+    options: Vec<String>,
+    policy: DecisionPolicy,
+    votes: std::collections::BTreeMap<String, DecisionVoteRecord>,
+    deadline_ms: Option<u64>,
+    generation: u64,
+}
+
+impl DecisionRecord {
+    /// Per-option weight from non-veto, non-abstain votes (sorted by option).
+    fn tallies(&self) -> Vec<(String, u64)> {
+        let mut sums: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for vote in self.votes.values() {
+            if vote.veto {
+                continue;
+            }
+            if let Some(option) = &vote.option {
+                *sums.entry(option.clone()).or_default() += vote.weight;
+            }
+        }
+        sums.into_iter().collect()
+    }
+
+    /// Resolve to `(status, winner)`. A veto aborts; otherwise the policy decides,
+    /// with ties broken by the lexicographically smallest option. A passed
+    /// deadline forces a plurality outcome (or `TimedOut` with no usable votes).
+    fn resolve(&self, now: u64) -> (DecisionStatus, Option<String>) {
+        if self.votes.values().any(|vote| vote.veto) {
+            return (DecisionStatus::Vetoed, None);
+        }
+        let tallies = self.tallies();
+        let cast = self.votes.values().filter(|v| !v.veto && v.option.is_some()).count() as u32;
+        let deadline_passed = self.deadline_ms.is_some_and(|deadline| now >= deadline);
+        // Highest-weight option, ties → smallest option name (tallies are sorted).
+        let top = tallies.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).cloned();
+
+        match &self.policy {
+            DecisionPolicy::Plurality { min_votes } => {
+                if cast >= *min_votes || (deadline_passed && cast > 0) {
+                    match top {
+                        Some((option, _)) => (DecisionStatus::Resolved, Some(option)),
+                        None => (DecisionStatus::Open, None),
+                    }
+                } else if deadline_passed {
+                    (DecisionStatus::TimedOut, None)
+                } else {
+                    (DecisionStatus::Open, None)
+                }
+            }
+            DecisionPolicy::Threshold { required_weight } => {
+                let met = tallies.iter().find(|(_, weight)| *weight >= *required_weight);
+                if let Some((option, _)) = met {
+                    (DecisionStatus::Resolved, Some(option.clone()))
+                } else if deadline_passed {
+                    (DecisionStatus::TimedOut, None)
+                } else {
+                    (DecisionStatus::Open, None)
+                }
+            }
+            DecisionPolicy::Unanimous { min_votes } => {
+                let unanimous = tallies.len() == 1;
+                if cast >= *min_votes && unanimous {
+                    (DecisionStatus::Resolved, top.map(|(option, _)| option))
+                } else if deadline_passed {
+                    (DecisionStatus::TimedOut, None)
+                } else {
+                    (DecisionStatus::Open, None)
+                }
+            }
+        }
+    }
+
+    fn view(&self, name: &str, now: u64) -> DecisionState {
+        let (status, winner) = self.resolve(now);
+        let mut votes: Vec<DecisionVoteView> = self
+            .votes
+            .iter()
+            .map(|(voter, vote)| DecisionVoteView {
+                voter: voter.clone(),
+                option: vote.option.clone(),
+                confidence: vote.confidence,
+                weight: vote.weight,
+                veto: vote.veto,
+                evidence: vote.evidence.clone(),
+            })
+            .collect();
+        votes.sort_by(|a, b| a.voter.cmp(&b.voter));
+        DecisionState {
+            name: name.to_string(),
+            question: self.question.clone(),
+            options: self.options.clone(),
+            policy: self.policy.clone(),
+            status,
+            winner,
+            tallies: self
+                .tallies()
+                .into_iter()
+                .map(|(option, weight)| DecisionTally { option, weight })
+                .collect(),
+            votes,
+            deadline_ms: self.deadline_ms,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1109,6 +1306,7 @@ struct Store {
     tasks: HashMap<String, TaskRecord>,
     effects: HashMap<String, EffectRecord>,
     handoffs: HashMap<String, HandoffRecord>,
+    decisions: HashMap<String, DecisionRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -1252,6 +1450,24 @@ impl StateMachine {
             ),
             Command::HandoffAccept { name, to } => store.apply_handoff_accept(now, name, to),
             Command::HandoffReject { name, to } => store.apply_handoff_reject(now, name, to),
+            Command::DecisionPropose {
+                name,
+                question,
+                options,
+                policy,
+                deadline_ms,
+            } => store.apply_decision_propose(now, name, question, options, policy, deadline_ms),
+            Command::DecisionVote {
+                name,
+                voter,
+                option,
+                confidence,
+                weight,
+                veto,
+                evidence,
+            } => store.apply_decision_vote(
+                now, name, voter, option, confidence, weight, veto, evidence,
+            ),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1435,6 +1651,12 @@ impl StateMachine {
     pub fn handoff_get(&self, name: &str) -> Option<HandoffState> {
         let store = self.store.lock().unwrap();
         store.handoffs.get(name).map(|record| record.view(name, now_ms()))
+    }
+
+    /// Read a decision's current state, with its outcome derived at `now`.
+    pub fn decision_get(&self, name: &str) -> Option<DecisionState> {
+        let store = self.store.lock().unwrap();
+        store.decisions.get(name).map(|record| record.view(name, now_ms()))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -2124,6 +2346,68 @@ impl Store {
         record.status = HandoffStatus::Rejected;
         record.generation += 1;
         json!({ "ok": true, "handoff": record.view(&name, now) })
+    }
+
+    fn apply_decision_propose(
+        &mut self,
+        now: u64,
+        name: String,
+        question: String,
+        options: Vec<String>,
+        policy: DecisionPolicy,
+        deadline_ms: Option<u64>,
+    ) -> Value {
+        if let Some(existing) = self.decisions.get(&name) {
+            return json!({ "ok": true, "created": false, "decision": existing.view(&name, now) });
+        }
+        let record = DecisionRecord {
+            question,
+            options,
+            policy,
+            votes: std::collections::BTreeMap::new(),
+            deadline_ms,
+            generation: 1,
+        };
+        let view = record.view(&name, now);
+        self.decisions.insert(name, record);
+        json!({ "ok": true, "created": true, "decision": view })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_decision_vote(
+        &mut self,
+        now: u64,
+        name: String,
+        voter: String,
+        option: Option<String>,
+        confidence: f32,
+        weight: u64,
+        veto: bool,
+        evidence: Vec<String>,
+    ) -> Value {
+        let Some(record) = self.decisions.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        // A vote for an option outside the declared set is rejected (abstain and
+        // veto need no option).
+        if let Some(choice) = &option {
+            if !record.options.contains(choice) {
+                return json!({ "ok": false, "reason": "unknown_option", "decision": record.view(&name, now) });
+            }
+        }
+        // Re-voting replaces the voter's prior vote (idempotent per voter).
+        record.votes.insert(
+            voter,
+            DecisionVoteRecord {
+                option,
+                confidence,
+                weight,
+                veto,
+                evidence,
+            },
+        );
+        record.generation += 1;
+        json!({ "ok": true, "decision": record.view(&name, now) })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -4396,6 +4680,51 @@ mod tests {
             to: "legal-agent".to_string(),
         });
         assert_eq!(again.output["reason"], "not_offered");
+    }
+
+    #[test]
+    fn decision_resolves_by_weight_and_vetoes_abort() {
+        let sm = StateMachine::new();
+        let propose = |name: &str| {
+            sm.apply(Command::DecisionPropose {
+                name: name.to_string(),
+                question: "Is this deploy safe?".to_string(),
+                options: vec!["approve".to_string(), "reject".to_string()],
+                policy: DecisionPolicy::Plurality { min_votes: 3 },
+                deadline_ms: None,
+            });
+        };
+        let vote = |name: &str, voter: &str, option: Option<&str>, weight: u64, veto: bool| {
+            sm.apply(Command::DecisionVote {
+                name: name.to_string(),
+                voter: voter.to_string(),
+                option: option.map(str::to_string),
+                confidence: 0.9,
+                weight,
+                veto,
+                evidence: vec![],
+            })
+        };
+
+        propose("deploy/safe");
+        vote("deploy/safe", "a", Some("approve"), 1, false);
+        vote("deploy/safe", "b", Some("reject"), 1, false);
+        // Not enough votes yet (min_votes = 3).
+        assert_eq!(sm.decision_get("deploy/safe").unwrap().status, DecisionStatus::Open);
+        // A heavier third vote for approve resolves it to approve.
+        vote("deploy/safe", "c", Some("approve"), 5, false);
+        let resolved = sm.decision_get("deploy/safe").unwrap();
+        assert_eq!(resolved.status, DecisionStatus::Resolved);
+        assert_eq!(resolved.winner.as_deref(), Some("approve"));
+
+        // A vote for an option outside the declared set is rejected.
+        let bad = vote("deploy/safe", "d", Some("maybe"), 1, false);
+        assert_eq!(bad.output["reason"], "unknown_option");
+
+        // Any veto aborts a separate decision.
+        propose("release/gate");
+        vote("release/gate", "compliance", None, 1, true);
+        assert_eq!(sm.decision_get("release/gate").unwrap().status, DecisionStatus::Vetoed);
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod barriers;
 mod consensus;
 mod counters;
 mod cron;
+mod decisions;
 mod discovery;
 mod effects;
 mod election;
@@ -80,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/tasks", tasks::router())
         .nest("/effects", effects::router())
         .nest("/handoffs", handoffs::router())
+        .nest("/decisions", decisions::router())
         .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())
