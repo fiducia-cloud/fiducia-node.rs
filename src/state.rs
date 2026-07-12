@@ -454,6 +454,8 @@ impl Command {
             Command::HandoffOffer { .. } => "handoff.offer",
             Command::HandoffAccept { .. } => "handoff.accept",
             Command::HandoffReject { .. } => "handoff.reject",
+            Command::DecisionPropose { .. } => "decision.propose",
+            Command::DecisionVote { .. } => "decision.vote",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
