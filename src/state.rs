@@ -141,6 +141,31 @@ pub enum Command {
         name: String,
     },
 
+    // --- Atomic ownership handoffs --------------------------------------
+    /// Offer to transfer ownership of `resource` from `from` (presenting its
+    /// current `from_token`) to `to`, with a context manifest and an accept
+    /// deadline. The original owner keeps authority until the offer is accepted.
+    HandoffOffer {
+        name: String,
+        resource: String,
+        from: String,
+        to: String,
+        from_token: u64,
+        context: Value,
+        ttl_ms: u64,
+    },
+    /// Accept an offered handoff, minting a strictly higher fencing token for the
+    /// new owner. Only the offered recipient may accept.
+    HandoffAccept {
+        name: String,
+        to: String,
+    },
+    /// Reject an offered handoff; ownership stays with the original owner.
+    HandoffReject {
+        name: String,
+        to: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -368,6 +393,9 @@ impl Command {
             | Command::EffectApprove { name, .. }
             | Command::EffectCommit { name, .. }
             | Command::EffectAbort { name } => name,
+            Command::HandoffOffer { name, .. }
+            | Command::HandoffAccept { name, .. }
+            | Command::HandoffReject { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -401,6 +429,9 @@ impl Command {
             Command::EffectApprove { .. } => "effect.approve",
             Command::EffectCommit { .. } => "effect.commit",
             Command::EffectAbort { .. } => "effect.abort",
+            Command::HandoffOffer { .. } => "handoff.offer",
+            Command::HandoffAccept { .. } => "handoff.accept",
+            Command::HandoffReject { .. } => "handoff.reject",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -995,6 +1026,79 @@ impl EffectRecord {
     }
 }
 
+/// The lifecycle of an ownership handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffStatus {
+    Offered,
+    Accepted,
+    Rejected,
+    Expired,
+}
+
+impl HandoffStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, HandoffStatus::Offered)
+    }
+}
+
+/// Read view of an atomic ownership handoff. While `Offered`, the original owner
+/// (`from`, holding `from_token`) still owns the resource; on `Accepted`, `to`
+/// receives a strictly higher `to_token`, so the resource's fencing rejects the
+/// old owner — there is never a moment when both or neither own it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffState {
+    pub name: String,
+    pub resource: String,
+    pub from: String,
+    pub to: String,
+    pub from_token: u64,
+    pub to_token: Option<u64>,
+    pub status: HandoffStatus,
+    pub context: Value,
+    pub expires_ms: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HandoffRecord {
+    resource: String,
+    from: String,
+    to: String,
+    from_token: u64,
+    to_token: Option<u64>,
+    status: HandoffStatus,
+    context: Value,
+    expires_ms: Option<u64>,
+    generation: u64,
+}
+
+impl HandoffRecord {
+    /// Lazily expire an offer whose deadline has passed.
+    fn effective_status(&self, now: u64) -> HandoffStatus {
+        if self.status == HandoffStatus::Offered && self.expires_ms.is_some_and(|e| now >= e) {
+            HandoffStatus::Expired
+        } else {
+            self.status
+        }
+    }
+
+    fn view(&self, name: &str, now: u64) -> HandoffState {
+        HandoffState {
+            name: name.to_string(),
+            resource: self.resource.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            from_token: self.from_token,
+            to_token: self.to_token,
+            status: self.effective_status(now),
+            context: self.context.clone(),
+            expires_ms: self.expires_ms,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1004,6 +1108,7 @@ struct Store {
     barriers: HashMap<String, BarrierRecord>,
     tasks: HashMap<String, TaskRecord>,
     effects: HashMap<String, EffectRecord>,
+    handoffs: HashMap<String, HandoffRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -1134,6 +1239,19 @@ impl StateMachine {
             }
             Command::EffectCommit { name, result } => store.apply_effect_commit(name, result),
             Command::EffectAbort { name } => store.apply_effect_abort(name),
+            Command::HandoffOffer {
+                name,
+                resource,
+                from,
+                to,
+                from_token,
+                context,
+                ttl_ms,
+            } => store.apply_handoff_offer(
+                now, name, resource, from, to, from_token, context, ttl_ms,
+            ),
+            Command::HandoffAccept { name, to } => store.apply_handoff_accept(now, name, to),
+            Command::HandoffReject { name, to } => store.apply_handoff_reject(now, name, to),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1311,6 +1429,12 @@ impl StateMachine {
     /// Read an approval-escrow effect's current state.
     pub fn effect_get(&self, name: &str) -> Option<EffectState> {
         self.store.lock().unwrap().effects.get(name).map(|record| record.view(name))
+    }
+
+    /// Read an ownership handoff's current state.
+    pub fn handoff_get(&self, name: &str) -> Option<HandoffState> {
+        let store = self.store.lock().unwrap();
+        store.handoffs.get(name).map(|record| record.view(name, now_ms()))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -1928,6 +2052,78 @@ impl Store {
         record.status = EffectStatus::Aborted;
         record.generation += 1;
         json!({ "ok": true, "effect": record.view(&name) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_handoff_offer(
+        &mut self,
+        now: u64,
+        name: String,
+        resource: String,
+        from: String,
+        to: String,
+        from_token: u64,
+        context: Value,
+        ttl_ms: u64,
+    ) -> Value {
+        // A pending offer for this name cannot be replaced; resolve it first.
+        if let Some(existing) = self.handoffs.get(&name) {
+            if existing.effective_status(now) == HandoffStatus::Offered {
+                return json!({ "ok": false, "reason": "already_offered", "handoff": existing.view(&name, now) });
+            }
+        }
+        let record = HandoffRecord {
+            resource,
+            from,
+            to,
+            from_token,
+            to_token: None,
+            status: HandoffStatus::Offered,
+            context,
+            expires_ms: Some(now.saturating_add(ttl_ms)),
+            generation: 1,
+        };
+        let view = record.view(&name, now);
+        self.handoffs.insert(name, record);
+        json!({ "ok": true, "handoff": view })
+    }
+
+    fn apply_handoff_accept(&mut self, now: u64, name: String, to: String) -> Value {
+        // Validate against an immutable borrow first, so a rejected accept does
+        // not consume a fencing token.
+        match self.handoffs.get(&name) {
+            None => return json!({ "ok": false, "reason": "not_found" }),
+            Some(record) if record.effective_status(now) != HandoffStatus::Offered => {
+                return json!({ "ok": false, "reason": "not_offered", "handoff": record.view(&name, now) })
+            }
+            Some(record) if record.to != to => {
+                return json!({ "ok": false, "reason": "not_recipient", "handoff": record.view(&name, now) })
+            }
+            _ => {}
+        }
+        // A single monotonic counter mints every fencing token, and `from` holds
+        // one minted earlier, so this is strictly higher than `from_token`.
+        let token = self.next_token();
+        let record = self.handoffs.get_mut(&name).expect("handoff present");
+        record.status = HandoffStatus::Accepted;
+        record.to_token = Some(token);
+        record.generation += 1;
+        json!({ "ok": true, "to_token": token, "handoff": record.view(&name, now) })
+    }
+
+    fn apply_handoff_reject(&mut self, now: u64, name: String, to: String) -> Value {
+        let Some(record) = self.handoffs.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.effective_status(now) != HandoffStatus::Offered {
+            return json!({ "ok": false, "reason": "not_offered", "handoff": record.view(&name, now) });
+        }
+        if record.to != to {
+            return json!({ "ok": false, "reason": "not_recipient", "handoff": record.view(&name, now) });
+        }
+        record.status = HandoffStatus::Rejected;
+        record.generation += 1;
+        json!({ "ok": true, "handoff": record.view(&name, now) })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -4141,6 +4337,65 @@ mod tests {
             sm.effect_get(&name).unwrap().result.unwrap()["confirmation"],
             "pay_123"
         );
+    }
+
+    #[test]
+    fn handoff_transfers_ownership_atomically_with_a_higher_token() {
+        let sm = StateMachine::new();
+        // research-agent really owns the task, holding a fencing token minted by
+        // the node's single monotonic counter.
+        sm.apply(Command::TaskCreate {
+            name: "task:ticket-482".to_string(),
+            task_type: "research".to_string(),
+            payload: Value::Null,
+            deadline_ms: None,
+        });
+        let from_token = sm
+            .apply(Command::TaskClaim {
+                name: "task:ticket-482".to_string(),
+                worker: "research-agent".to_string(),
+                ttl_ms: 60_000,
+            })
+            .output["fencing_token"]
+            .as_u64()
+            .unwrap();
+
+        let offer = sm.apply(Command::HandoffOffer {
+            name: "ticket-482/handoff".to_string(),
+            resource: "task:ticket-482".to_string(),
+            from: "research-agent".to_string(),
+            to: "legal-agent".to_string(),
+            from_token,
+            context: json!({ "summary": "needs legal review" }),
+            ttl_ms: 30_000,
+        });
+        assert_eq!(offer.output["ok"], true);
+        // While offered, ownership has not moved.
+        assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Offered);
+
+        // Only the offered recipient may accept.
+        let wrong = sm.apply(Command::HandoffAccept {
+            name: "ticket-482/handoff".to_string(),
+            to: "random-agent".to_string(),
+        });
+        assert_eq!(wrong.output["reason"], "not_recipient");
+
+        // The recipient accepts and receives a strictly higher fencing token.
+        let accept = sm.apply(Command::HandoffAccept {
+            name: "ticket-482/handoff".to_string(),
+            to: "legal-agent".to_string(),
+        });
+        assert_eq!(accept.output["ok"], true);
+        let to_token = accept.output["to_token"].as_u64().unwrap();
+        assert!(to_token > from_token, "new owner's token must exceed the old owner's");
+        assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Accepted);
+
+        // A second accept on the resolved handoff is rejected.
+        let again = sm.apply(Command::HandoffAccept {
+            name: "ticket-482/handoff".to_string(),
+            to: "legal-agent".to_string(),
+        });
+        assert_eq!(again.output["reason"], "not_offered");
     }
 
     #[test]

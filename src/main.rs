@@ -15,6 +15,7 @@ mod cron;
 mod discovery;
 mod effects;
 mod election;
+mod handoffs;
 mod idempotency;
 mod indexed_queue;
 mod internal_auth;
@@ -78,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/barriers", barriers::router())
         .nest("/tasks", tasks::router())
         .nest("/effects", effects::router())
+        .nest("/handoffs", handoffs::router())
         .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())
