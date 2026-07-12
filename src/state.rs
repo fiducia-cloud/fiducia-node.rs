@@ -1439,6 +1439,24 @@ impl StateMachine {
             ),
             Command::HandoffAccept { name, to } => store.apply_handoff_accept(now, name, to),
             Command::HandoffReject { name, to } => store.apply_handoff_reject(now, name, to),
+            Command::DecisionPropose {
+                name,
+                question,
+                options,
+                policy,
+                deadline_ms,
+            } => store.apply_decision_propose(now, name, question, options, policy, deadline_ms),
+            Command::DecisionVote {
+                name,
+                voter,
+                option,
+                confidence,
+                weight,
+                veto,
+                evidence,
+            } => store.apply_decision_vote(
+                now, name, voter, option, confidence, weight, veto, evidence,
+            ),
             Command::LockAcquire {
                 keys,
                 holder,
