@@ -1144,6 +1144,13 @@ pub enum DecisionStatus {
     TimedOut,
 }
 
+/// A per-option weight tally.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionTally {
+    pub option: String,
+    pub weight: u64,
+}
+
 /// One agent's vote in a decision.
 #[derive(Debug, Clone, Serialize)]
 pub struct DecisionVoteView {
