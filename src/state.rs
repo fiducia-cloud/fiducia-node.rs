@@ -1308,6 +1308,11 @@ impl StateMachine {
         self.store.lock().unwrap().tasks.get(name).map(|record| record.view(name))
     }
 
+    /// Read an approval-escrow effect's current state.
+    pub fn effect_get(&self, name: &str) -> Option<EffectState> {
+        self.store.lock().unwrap().effects.get(name).map(|record| record.view(name))
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
