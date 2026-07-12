@@ -2030,6 +2030,11 @@ impl StateMachine {
         self.store.lock().unwrap().budgets.get(name).map(|record| record.view(name))
     }
 
+    /// Read a claim's current state.
+    pub fn claim_get(&self, name: &str) -> Option<ClaimState> {
+        self.store.lock().unwrap().claims.get(name).map(|record| record.view(name))
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
