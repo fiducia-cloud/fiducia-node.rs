@@ -1173,7 +1173,7 @@ pub struct DecisionState {
     pub status: DecisionStatus,
     pub winner: Option<String>,
     /// Per-option summed weight, sorted by option for determinism.
-    pub tallies: Vec<(String, u64)>,
+    pub tallies: Vec<DecisionTally>,
     pub votes: Vec<DecisionVoteView>,
     pub deadline_ms: Option<u64>,
     pub generation: u64,
@@ -1284,9 +1284,155 @@ impl DecisionRecord {
             policy: self.policy.clone(),
             status,
             winner,
-            tallies: self.tallies(),
+            tallies: self
+                .tallies()
+                .into_iter()
+                .map(|(option, weight)| DecisionTally { option, weight })
+                .collect(),
             votes,
             deadline_ms: self.deadline_ms,
+            generation: self.generation,
+        }
+    }
+}
+
+/// The status of a single budget reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservationStatus {
+    Held,
+    Committed,
+    Released,
+}
+
+/// A three-dimensional budget limit. `None` means unlimited on that axis.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BudgetAmount {
+    #[serde(default)]
+    pub usd_micros: Option<u64>,
+    #[serde(default)]
+    pub tokens: Option<u64>,
+    #[serde(default)]
+    pub tool_calls: Option<u64>,
+}
+
+impl BudgetAmount {
+    fn zero() -> Self {
+        BudgetAmount { usd_micros: Some(0), tokens: Some(0), tool_calls: Some(0) }
+    }
+}
+
+/// Read view of one reservation against a budget.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationView {
+    pub id: String,
+    pub holder: String,
+    pub reserved: BudgetAmount,
+    pub spent: BudgetAmount,
+    pub status: ReservationStatus,
+}
+
+/// Read view of a budget: its ceiling, what is reserved and spent, and the
+/// remaining headroom on each axis.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetState {
+    pub name: String,
+    pub limit: BudgetAmount,
+    pub reserved: BudgetAmount,
+    pub spent: BudgetAmount,
+    pub available: BudgetAmount,
+    pub reservations: Vec<ReservationView>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReservationRecord {
+    holder: String,
+    reserved: BudgetAmount,
+    spent: BudgetAmount,
+    status: ReservationStatus,
+}
+
+#[derive(Debug, Clone)]
+struct BudgetRecord {
+    limit: BudgetAmount,
+    reservations: std::collections::BTreeMap<String, ReservationRecord>,
+    generation: u64,
+}
+
+/// Sum an axis across active (held or committed) reservations.
+fn axis_sum(
+    reservations: &std::collections::BTreeMap<String, ReservationRecord>,
+    pick: impl Fn(&ReservationRecord) -> Option<u64>,
+) -> u64 {
+    reservations
+        .values()
+        .filter(|r| r.status != ReservationStatus::Released)
+        .filter_map(|r| pick(r))
+        .sum()
+}
+
+impl BudgetRecord {
+    fn committed_or_held_reserved(&self) -> BudgetAmount {
+        BudgetAmount {
+            usd_micros: Some(axis_sum(&self.reservations, |r| r.reserved.usd_micros)),
+            tokens: Some(axis_sum(&self.reservations, |r| r.reserved.tokens)),
+            tool_calls: Some(axis_sum(&self.reservations, |r| r.reserved.tool_calls)),
+        }
+    }
+
+    fn total_spent(&self) -> BudgetAmount {
+        BudgetAmount {
+            usd_micros: Some(axis_sum(&self.reservations, |r| r.spent.usd_micros)),
+            tokens: Some(axis_sum(&self.reservations, |r| r.spent.tokens)),
+            tool_calls: Some(axis_sum(&self.reservations, |r| r.spent.tool_calls)),
+        }
+    }
+
+    /// Would reserving `amount` keep every limited axis within the ceiling?
+    fn fits(&self, amount: &BudgetAmount) -> bool {
+        let reserved = self.committed_or_held_reserved();
+        let axis_ok = |limit: Option<u64>, current: Option<u64>, add: Option<u64>| match limit {
+            None => true, // unlimited axis
+            Some(cap) => current.unwrap_or(0) + add.unwrap_or(0) <= cap,
+        };
+        axis_ok(self.limit.usd_micros, reserved.usd_micros, amount.usd_micros)
+            && axis_ok(self.limit.tokens, reserved.tokens, amount.tokens)
+            && axis_ok(self.limit.tool_calls, reserved.tool_calls, amount.tool_calls)
+    }
+
+    fn available(&self) -> BudgetAmount {
+        let reserved = self.committed_or_held_reserved();
+        let axis = |limit: Option<u64>, used: Option<u64>| {
+            limit.map(|cap| cap.saturating_sub(used.unwrap_or(0)))
+        };
+        BudgetAmount {
+            usd_micros: axis(self.limit.usd_micros, reserved.usd_micros),
+            tokens: axis(self.limit.tokens, reserved.tokens),
+            tool_calls: axis(self.limit.tool_calls, reserved.tool_calls),
+        }
+    }
+
+    fn view(&self, name: &str) -> BudgetState {
+        let mut reservations: Vec<ReservationView> = self
+            .reservations
+            .iter()
+            .map(|(id, r)| ReservationView {
+                id: id.clone(),
+                holder: r.holder.clone(),
+                reserved: r.reserved,
+                spent: r.spent,
+                status: r.status,
+            })
+            .collect();
+        reservations.sort_by(|a, b| a.id.cmp(&b.id));
+        BudgetState {
+            name: name.to_string(),
+            limit: self.limit,
+            reserved: self.committed_or_held_reserved(),
+            spent: self.total_spent(),
+            available: self.available(),
+            reservations,
             generation: self.generation,
         }
     }
@@ -1303,6 +1449,7 @@ struct Store {
     effects: HashMap<String, EffectRecord>,
     handoffs: HashMap<String, HandoffRecord>,
     decisions: HashMap<String, DecisionRecord>,
+    budgets: HashMap<String, BudgetRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
