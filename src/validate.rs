@@ -195,6 +195,18 @@ pub fn handoff(name: &str, from: Option<&str>, to: Option<&str>) -> Result<(), R
     Ok(())
 }
 
+/// Validate a budget name plus a reservation id / holder when named.
+pub fn budget(name: &str, reservation_id: Option<&str>, holder: Option<&str>) -> Result<(), Rejection> {
+    check_str("budget name", name, MAX_NAME_BYTES, false)?;
+    if let Some(id) = reservation_id {
+        check_str("reservation_id", id, MAX_NAME_BYTES, false)?;
+    }
+    if let Some(holder) = holder {
+        check_str("holder", holder, MAX_HOLDER_BYTES, false)?;
+    }
+    Ok(())
+}
+
 /// Validate a decision name, and a voter id when the operation names one.
 pub fn decision(name: &str, voter: Option<&str>) -> Result<(), Rejection> {
     check_str("decision name", name, MAX_NAME_BYTES, false)?;

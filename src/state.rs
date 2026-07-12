@@ -187,6 +187,35 @@ pub enum Command {
         evidence: Vec<String>,
     },
 
+    // --- Hierarchical budgets -------------------------------------------
+    /// Create or re-cap a budget with a per-axis ceiling (usd_micros, tokens,
+    /// tool_calls); a `None` axis is unlimited.
+    BudgetSet {
+        name: String,
+        limit: BudgetAmount,
+    },
+    /// Reserve `amount` against a budget under `reservation_id`. Rejected if it
+    /// would exceed any limited axis, so concurrent holders cannot each spend the
+    /// same remaining dollar.
+    BudgetReserve {
+        name: String,
+        reservation_id: String,
+        holder: String,
+        amount: BudgetAmount,
+    },
+    /// Commit a reservation with the `actual` spend (≤ reserved). Frees the
+    /// difference between reserved and actual.
+    BudgetCommit {
+        name: String,
+        reservation_id: String,
+        actual: BudgetAmount,
+    },
+    /// Release a still-held reservation, returning its full headroom.
+    BudgetRelease {
+        name: String,
+        reservation_id: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -418,6 +447,10 @@ impl Command {
             | Command::HandoffAccept { name, .. }
             | Command::HandoffReject { name, .. } => name,
             Command::DecisionPropose { name, .. } | Command::DecisionVote { name, .. } => name,
+            Command::BudgetSet { name, .. }
+            | Command::BudgetReserve { name, .. }
+            | Command::BudgetCommit { name, .. }
+            | Command::BudgetRelease { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -456,6 +489,10 @@ impl Command {
             Command::HandoffReject { .. } => "handoff.reject",
             Command::DecisionPropose { .. } => "decision.propose",
             Command::DecisionVote { .. } => "decision.vote",
+            Command::BudgetSet { .. } => "budget.set",
+            Command::BudgetReserve { .. } => "budget.reserve",
+            Command::BudgetCommit { .. } => "budget.commit",
+            Command::BudgetRelease { .. } => "budget.release",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -1296,6 +1333,161 @@ impl DecisionRecord {
     }
 }
 
+/// The status of a single budget reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservationStatus {
+    Held,
+    Committed,
+    Released,
+}
+
+/// A three-dimensional budget limit. `None` means unlimited on that axis.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BudgetAmount {
+    #[serde(default)]
+    pub usd_micros: Option<u64>,
+    #[serde(default)]
+    pub tokens: Option<u64>,
+    #[serde(default)]
+    pub tool_calls: Option<u64>,
+}
+
+impl BudgetAmount {
+    fn zero() -> Self {
+        BudgetAmount { usd_micros: Some(0), tokens: Some(0), tool_calls: Some(0) }
+    }
+}
+
+/// Read view of one reservation against a budget.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationView {
+    pub id: String,
+    pub holder: String,
+    pub reserved: BudgetAmount,
+    pub spent: BudgetAmount,
+    pub status: ReservationStatus,
+}
+
+/// Read view of a budget: its ceiling, what is reserved and spent, and the
+/// remaining headroom on each axis.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetState {
+    pub name: String,
+    pub limit: BudgetAmount,
+    pub reserved: BudgetAmount,
+    pub spent: BudgetAmount,
+    pub available: BudgetAmount,
+    pub reservations: Vec<ReservationView>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReservationRecord {
+    holder: String,
+    reserved: BudgetAmount,
+    spent: BudgetAmount,
+    status: ReservationStatus,
+}
+
+#[derive(Debug, Clone)]
+struct BudgetRecord {
+    limit: BudgetAmount,
+    reservations: std::collections::BTreeMap<String, ReservationRecord>,
+    generation: u64,
+}
+
+impl ReservationRecord {
+    /// What this reservation currently consumes on `axis`: the full reservation
+    /// while `Held`, the actual spend once `Committed`, and nothing when released.
+    fn consumed_on(&self, axis: impl Fn(&BudgetAmount) -> Option<u64>) -> u64 {
+        match self.status {
+            ReservationStatus::Held => axis(&self.reserved).unwrap_or(0),
+            ReservationStatus::Committed => axis(&self.spent).unwrap_or(0),
+            ReservationStatus::Released => 0,
+        }
+    }
+}
+
+impl BudgetRecord {
+    /// Budget consumed right now: held reservations block their full amount;
+    /// committed ones consume only what was actually spent; released free it.
+    fn consumed(&self) -> BudgetAmount {
+        let sum = |axis: fn(&BudgetAmount) -> Option<u64>| -> u64 {
+            self.reservations.values().map(|r| r.consumed_on(axis)).sum()
+        };
+        BudgetAmount {
+            usd_micros: Some(sum(|b| b.usd_micros)),
+            tokens: Some(sum(|b| b.tokens)),
+            tool_calls: Some(sum(|b| b.tool_calls)),
+        }
+    }
+
+    /// Actual committed spend (excludes still-held reservations).
+    fn spent(&self) -> BudgetAmount {
+        let sum = |axis: fn(&BudgetAmount) -> Option<u64>| -> u64 {
+            self.reservations
+                .values()
+                .filter(|r| r.status == ReservationStatus::Committed)
+                .map(|r| axis(&r.spent).unwrap_or(0))
+                .sum()
+        };
+        BudgetAmount {
+            usd_micros: Some(sum(|b| b.usd_micros)),
+            tokens: Some(sum(|b| b.tokens)),
+            tool_calls: Some(sum(|b| b.tool_calls)),
+        }
+    }
+
+    /// Would reserving `amount` keep every limited axis within the ceiling?
+    fn fits(&self, amount: &BudgetAmount) -> bool {
+        let consumed = self.consumed();
+        let axis_ok = |limit: Option<u64>, current: Option<u64>, add: Option<u64>| match limit {
+            None => true, // unlimited axis
+            Some(cap) => current.unwrap_or(0).saturating_add(add.unwrap_or(0)) <= cap,
+        };
+        axis_ok(self.limit.usd_micros, consumed.usd_micros, amount.usd_micros)
+            && axis_ok(self.limit.tokens, consumed.tokens, amount.tokens)
+            && axis_ok(self.limit.tool_calls, consumed.tool_calls, amount.tool_calls)
+    }
+
+    fn available(&self) -> BudgetAmount {
+        let consumed = self.consumed();
+        let axis = |limit: Option<u64>, used: Option<u64>| {
+            limit.map(|cap| cap.saturating_sub(used.unwrap_or(0)))
+        };
+        BudgetAmount {
+            usd_micros: axis(self.limit.usd_micros, consumed.usd_micros),
+            tokens: axis(self.limit.tokens, consumed.tokens),
+            tool_calls: axis(self.limit.tool_calls, consumed.tool_calls),
+        }
+    }
+
+    fn view(&self, name: &str) -> BudgetState {
+        let mut reservations: Vec<ReservationView> = self
+            .reservations
+            .iter()
+            .map(|(id, r)| ReservationView {
+                id: id.clone(),
+                holder: r.holder.clone(),
+                reserved: r.reserved,
+                spent: r.spent,
+                status: r.status,
+            })
+            .collect();
+        reservations.sort_by(|a, b| a.id.cmp(&b.id));
+        BudgetState {
+            name: name.to_string(),
+            limit: self.limit,
+            reserved: self.consumed(),
+            spent: self.spent(),
+            available: self.available(),
+            reservations,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1307,6 +1499,7 @@ struct Store {
     effects: HashMap<String, EffectRecord>,
     handoffs: HashMap<String, HandoffRecord>,
     decisions: HashMap<String, DecisionRecord>,
+    budgets: HashMap<String, BudgetRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -1468,6 +1661,22 @@ impl StateMachine {
             } => store.apply_decision_vote(
                 now, name, voter, option, confidence, weight, veto, evidence,
             ),
+            Command::BudgetSet { name, limit } => store.apply_budget_set(name, limit),
+            Command::BudgetReserve {
+                name,
+                reservation_id,
+                holder,
+                amount,
+            } => store.apply_budget_reserve(name, reservation_id, holder, amount),
+            Command::BudgetCommit {
+                name,
+                reservation_id,
+                actual,
+            } => store.apply_budget_commit(name, reservation_id, actual),
+            Command::BudgetRelease {
+                name,
+                reservation_id,
+            } => store.apply_budget_release(name, reservation_id),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1657,6 +1866,11 @@ impl StateMachine {
     pub fn decision_get(&self, name: &str) -> Option<DecisionState> {
         let store = self.store.lock().unwrap();
         store.decisions.get(name).map(|record| record.view(name, now_ms()))
+    }
+
+    /// Read a budget's ceiling, consumption, and reservations.
+    pub fn budget_get(&self, name: &str) -> Option<BudgetState> {
+        self.store.lock().unwrap().budgets.get(name).map(|record| record.view(name))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -2408,6 +2622,100 @@ impl Store {
         );
         record.generation += 1;
         json!({ "ok": true, "decision": record.view(&name, now) })
+    }
+
+    fn apply_budget_set(&mut self, name: String, limit: BudgetAmount) -> Value {
+        let record = self.budgets.entry(name.clone()).or_insert_with(|| BudgetRecord {
+            limit,
+            reservations: std::collections::BTreeMap::new(),
+            generation: 0,
+        });
+        record.limit = limit;
+        record.generation += 1;
+        json!({ "ok": true, "budget": record.view(&name) })
+    }
+
+    fn apply_budget_reserve(
+        &mut self,
+        name: String,
+        reservation_id: String,
+        holder: String,
+        amount: BudgetAmount,
+    ) -> Value {
+        let Some(record) = self.budgets.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        // Reserving the same id twice is idempotent (returns the existing hold).
+        if record.reservations.contains_key(&reservation_id) {
+            return json!({ "ok": true, "reserved": false, "budget": record.view(&name) });
+        }
+        if !record.fits(&amount) {
+            return json!({ "ok": false, "reason": "insufficient_budget", "available": record.available(), "budget": record.view(&name) });
+        }
+        record.reservations.insert(
+            reservation_id,
+            ReservationRecord {
+                holder,
+                reserved: amount,
+                spent: BudgetAmount::zero(),
+                status: ReservationStatus::Held,
+            },
+        );
+        record.generation += 1;
+        json!({ "ok": true, "reserved": true, "budget": record.view(&name) })
+    }
+
+    fn apply_budget_commit(
+        &mut self,
+        name: String,
+        reservation_id: String,
+        actual: BudgetAmount,
+    ) -> Value {
+        let Some(record) = self.budgets.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        let Some(reservation) = record.reservations.get_mut(&reservation_id) else {
+            return json!({ "ok": false, "reason": "reservation_not_found" });
+        };
+        match reservation.status {
+            ReservationStatus::Committed => {
+                json!({ "ok": true, "committed": false, "budget": record.view(&name) })
+            }
+            ReservationStatus::Released => {
+                json!({ "ok": false, "reason": "released" })
+            }
+            ReservationStatus::Held => {
+                // Actual spend is capped at what was reserved on each axis.
+                let cap = |actual: Option<u64>, reserved: Option<u64>| match (actual, reserved) {
+                    (Some(a), Some(r)) => Some(a.min(r)),
+                    (Some(a), None) => Some(a),
+                    (None, _) => Some(0),
+                };
+                reservation.spent = BudgetAmount {
+                    usd_micros: cap(actual.usd_micros, reservation.reserved.usd_micros),
+                    tokens: cap(actual.tokens, reservation.reserved.tokens),
+                    tool_calls: cap(actual.tool_calls, reservation.reserved.tool_calls),
+                };
+                reservation.status = ReservationStatus::Committed;
+                record.generation += 1;
+                json!({ "ok": true, "committed": true, "budget": record.view(&name) })
+            }
+        }
+    }
+
+    fn apply_budget_release(&mut self, name: String, reservation_id: String) -> Value {
+        let Some(record) = self.budgets.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        let Some(reservation) = record.reservations.get_mut(&reservation_id) else {
+            return json!({ "ok": false, "reason": "reservation_not_found" });
+        };
+        if reservation.status == ReservationStatus::Committed {
+            return json!({ "ok": false, "reason": "already_committed", "budget": record.view(&name) });
+        }
+        reservation.status = ReservationStatus::Released;
+        record.generation += 1;
+        json!({ "ok": true, "budget": record.view(&name) })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -4725,6 +5033,54 @@ mod tests {
         propose("release/gate");
         vote("release/gate", "compliance", None, 1, true);
         assert_eq!(sm.decision_get("release/gate").unwrap().status, DecisionStatus::Vetoed);
+    }
+
+    #[test]
+    fn budget_reservations_cannot_oversubscribe_and_commit_frees_the_difference() {
+        let sm = StateMachine::new();
+        // A $1.00 (1_000_000 micros) workflow budget, unlimited tokens/tool_calls.
+        sm.apply(Command::BudgetSet {
+            name: "org/acme/wf/42".to_string(),
+            limit: BudgetAmount {
+                usd_micros: Some(1_000_000),
+                tokens: None,
+                tool_calls: None,
+            },
+        });
+        let reserve = |id: &str, usd: u64| {
+            sm.apply(Command::BudgetReserve {
+                name: "org/acme/wf/42".to_string(),
+                reservation_id: id.to_string(),
+                holder: format!("agent-{id}"),
+                amount: BudgetAmount { usd_micros: Some(usd), tokens: None, tool_calls: None },
+            })
+        };
+
+        // Two agents each reserve $0.60 — the second cannot oversubscribe the $1.00.
+        assert_eq!(reserve("a", 600_000).output["reserved"], true);
+        let denied = reserve("b", 600_000);
+        assert_eq!(denied.output["ok"], false);
+        assert_eq!(denied.output["reason"], "insufficient_budget");
+
+        // Agent A actually spends only $0.20; committing frees the other $0.40.
+        sm.apply(Command::BudgetCommit {
+            name: "org/acme/wf/42".to_string(),
+            reservation_id: "a".to_string(),
+            actual: BudgetAmount { usd_micros: Some(200_000), tokens: None, tool_calls: None },
+        });
+        let budget = sm.budget_get("org/acme/wf/42").unwrap();
+        assert_eq!(budget.spent.usd_micros, Some(200_000));
+        assert_eq!(budget.available.usd_micros, Some(800_000));
+
+        // Now agent B's $0.60 reservation fits.
+        assert_eq!(reserve("b", 600_000).output["reserved"], true);
+
+        // Releasing an uncommitted reservation returns its headroom.
+        sm.apply(Command::BudgetRelease {
+            name: "org/acme/wf/42".to_string(),
+            reservation_id: "b".to_string(),
+        });
+        assert_eq!(sm.budget_get("org/acme/wf/42").unwrap().available.usd_micros, Some(800_000));
     }
 
     #[test]
