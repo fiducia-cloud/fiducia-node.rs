@@ -1,3 +1,4 @@
+# Pins the Rust toolchain channel and components so every build/CI uses the same rustc.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
