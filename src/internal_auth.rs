@@ -74,11 +74,18 @@ fn allow_insecure() -> bool {
 pub fn init_and_log() {
     if configured().is_some() {
         tracing::info!("internal-auth: enforcing FIDUCIA_INTERNAL_SECRET on /v1 and /raft");
+    } else if allow_insecure() {
+        tracing::warn!(
+            "internal-auth: FIDUCIA_INTERNAL_SECRET is unset and FIDUCIA_ALLOW_INSECURE_INTERNAL \
+             is set — the trust boundary is DISABLED: /v1 and /raft accept traffic from ANY \
+             caller. This is for local single-node dev ONLY; NEVER set it in production."
+        );
     } else {
         tracing::warn!(
-            "internal-auth: FIDUCIA_INTERNAL_SECRET is unset — /v1 and /raft accept traffic from \
-             ANY caller. Set it (shared with the load balancer and peer nodes) so only trusted \
-             hops are accepted, or ensure the node port is unreachable from outside the cluster."
+            "internal-auth: FIDUCIA_INTERNAL_SECRET is unset — failing CLOSED: /v1 and /raft \
+             will REJECT every request. Set FIDUCIA_INTERNAL_SECRET (shared with the load \
+             balancer and peer nodes) to enforce the trust boundary, or set \
+             FIDUCIA_ALLOW_INSECURE_INTERNAL=1 for local single-node dev."
         );
     }
 }
