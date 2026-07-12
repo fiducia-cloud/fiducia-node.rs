@@ -324,6 +324,15 @@ pub struct KvEntry {
     pub expires_at_ms: Option<u64>,
 }
 
+/// A distributed counter: a signed 64-bit value with a monotonic revision, used
+/// for success/failure thresholds, quotas, and fan-in tallies. Every mutation
+/// stamps `mod_revision`, so callers can compare-and-set against a known value.
+#[derive(Debug, Clone, Serialize)]
+pub struct CounterEntry {
+    pub value: i64,
+    pub mod_revision: u64,
+}
+
 /// Read view of one lock **member key**: who holds it, the whole set held with it
 /// (the acquired union), and who is queued behind it.
 #[derive(Debug, Clone, Serialize)]
@@ -1073,6 +1082,26 @@ impl Store {
             return json!({ "acquired": false, "reason": "no_keys", "revision": revision });
         }
 
+        // Idempotent re-acquire: if this exact holder already holds a grant for
+        // exactly these keys, return it unchanged. A lost-response retry must
+        // recover its existing fencing token, never mint a new one or report
+        // acquired:false for a lock the caller already owns.
+        if let Some(&tok) = self.locks.held.get(&keys[0]) {
+            if let Some(grant) = self.locks.grants.get(&tok) {
+                if grant.holder == holder && grant.keys == keys {
+                    return json!({
+                        "acquired": true,
+                        "queued": false,
+                        "keys": keys,
+                        "holder": holder,
+                        "fencing_token": tok,
+                        "lease_expires_ms": grant.lease_expires_ms,
+                        "revision": revision,
+                    });
+                }
+            }
+        }
+
         // Grantable now iff no member key is held AND none is reserved by a
         // request already in the queue (FIFO fairness — we'd join the tail).
         let blocked_by_held = keys.iter().any(|k| self.locks.held.contains_key(k));
@@ -1251,6 +1280,27 @@ impl Store {
         // Let callers re-tune the cap; shrinking just stops new grants until it
         // drains back under the new limit.
         sem.limit = limit.max(1);
+
+        // Idempotent re-acquire: holder is the permit identity (the queue already
+        // dedups on it), so if this holder already holds a permit, return that one
+        // rather than consuming a second. A lost-response retry must not leak a
+        // permit / double-count the holder.
+        if let Some(slot) = sem.holders.iter().find(|s| s.holder == holder) {
+            let token = slot.fencing_token;
+            let lease_expires_ms = slot.lease_expires_ms;
+            let available = sem.limit.saturating_sub(sem.holders.len() as u32);
+            return json!({
+                "acquired": true,
+                "queued": false,
+                "key": key,
+                "holder": holder,
+                "fencing_token": token,
+                "lease_expires_ms": lease_expires_ms,
+                "available": available,
+                "limit": sem.limit,
+                "revision": revision,
+            });
+        }
 
         let has_capacity = (sem.holders.len() as u32) < sem.limit;
         let queue_empty = sem.queue.is_empty();
@@ -1733,8 +1783,13 @@ impl Store {
         ttl_ms: u64,
         metadata: HashMap<String, String>,
     ) -> Value {
-        if self.elections.contains_key(&name) {
-            return json!({ "won": false, "name": name, "leader": self.elections.get(&name) });
+        if let Some(existing) = self.elections.get(&name) {
+            // Idempotent re-campaign: the current leader retrying (lost response)
+            // gets its existing win back, not won:false. Others still lose.
+            if existing.leader == candidate {
+                return json!({ "won": true, "name": name, "leadership": existing, "revision": revision });
+            }
+            return json!({ "won": false, "name": name, "leader": existing });
         }
         let token = self.next_token();
         let leadership = Leadership {
@@ -2000,6 +2055,83 @@ mod tests {
             wait,
         })
         .output
+    }
+
+    // Proves whether a lost-response RETRY of an acquire is safe server-side —
+    // i.e. whether the client's Idempotency-Key work (fiducia-clients #8) has any
+    // server semantics to lean on, or is cosmetic. A retried acquire by the SAME
+    // holder must not consume a second permit / grant a second token.
+    #[test]
+    fn semaphore_reacquire_by_same_holder_is_idempotent() {
+        let sm = StateMachine::new();
+        let first = semaphore_acquire(&sm, "pool", "holder-a", 3, false);
+        assert_eq!(first["acquired"], true);
+        let token1 = first["fencing_token"].clone();
+
+        // Simulate the client retrying because the first response was lost.
+        let retry = semaphore_acquire(&sm, "pool", "holder-a", 3, false);
+
+        let held_by_a = sm
+            .semaphore_get("pool")
+            .holders
+            .iter()
+            .filter(|h| h.holder == "holder-a")
+            .count();
+        assert_eq!(
+            held_by_a, 1,
+            "a holder's retried acquire must not consume a second permit"
+        );
+        assert_eq!(
+            retry["fencing_token"], token1,
+            "retry should return the original fencing token"
+        );
+    }
+
+    #[test]
+    fn lock_reacquire_by_same_holder_returns_the_same_grant() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["orders/42"], "worker-a", false);
+        assert_eq!(first["acquired"], true);
+        let token1 = first["fencing_token"].clone();
+
+        // Lost-response retry by the same holder that already holds the lock.
+        let retry = acquire(&sm, &["orders/42"], "worker-a", false);
+        assert_eq!(
+            retry["acquired"], true,
+            "re-acquiring a lock you already hold should succeed idempotently"
+        );
+        assert_eq!(
+            retry["fencing_token"], token1,
+            "retry should return the original fencing token"
+        );
+    }
+
+    #[test]
+    fn election_recampaign_by_current_leader_is_idempotent() {
+        let sm = StateMachine::new();
+        let campaign = |candidate: &str| {
+            sm.apply(Command::ElectionCampaign {
+                name: "primary".to_string(),
+                candidate: candidate.to_string(),
+                ttl_ms: 30_000,
+                metadata: HashMap::new(),
+            })
+            .output
+        };
+        let first = campaign("node-a");
+        assert_eq!(first["won"], true);
+        let token1 = first["leadership"]["fencing_token"].clone();
+
+        // Lost-response retry by the current leader.
+        let retry = campaign("node-a");
+        assert_eq!(
+            retry["won"], true,
+            "current leader re-campaigning should win idempotently"
+        );
+        assert_eq!(retry["leadership"]["fencing_token"], token1);
+
+        // A different candidate still loses.
+        assert_eq!(campaign("node-b")["won"], false);
     }
 
     #[test]
