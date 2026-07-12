@@ -1661,6 +1661,22 @@ impl StateMachine {
             } => store.apply_decision_vote(
                 now, name, voter, option, confidence, weight, veto, evidence,
             ),
+            Command::BudgetSet { name, limit } => store.apply_budget_set(name, limit),
+            Command::BudgetReserve {
+                name,
+                reservation_id,
+                holder,
+                amount,
+            } => store.apply_budget_reserve(name, reservation_id, holder, amount),
+            Command::BudgetCommit {
+                name,
+                reservation_id,
+                actual,
+            } => store.apply_budget_commit(name, reservation_id, actual),
+            Command::BudgetRelease {
+                name,
+                reservation_id,
+            } => store.apply_budget_release(name, reservation_id),
             Command::LockAcquire {
                 keys,
                 holder,
