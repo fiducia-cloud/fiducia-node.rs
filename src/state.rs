@@ -283,6 +283,7 @@ impl Command {
             | Command::IdempotencyComplete { key, .. }
             | Command::IdempotencyRenew { key, .. }
             | Command::IdempotencyAbandon { key, .. } => key,
+            Command::BarrierCreate { name, .. } | Command::BarrierArrive { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
