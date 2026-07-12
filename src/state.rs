@@ -141,6 +141,31 @@ pub enum Command {
         name: String,
     },
 
+    // --- Atomic ownership handoffs --------------------------------------
+    /// Offer to transfer ownership of `resource` from `from` (presenting its
+    /// current `from_token`) to `to`, with a context manifest and an accept
+    /// deadline. The original owner keeps authority until the offer is accepted.
+    HandoffOffer {
+        name: String,
+        resource: String,
+        from: String,
+        to: String,
+        from_token: u64,
+        context: Value,
+        ttl_ms: u64,
+    },
+    /// Accept an offered handoff, minting a strictly higher fencing token for the
+    /// new owner. Only the offered recipient may accept.
+    HandoffAccept {
+        name: String,
+        to: String,
+    },
+    /// Reject an offered handoff; ownership stays with the original owner.
+    HandoffReject {
+        name: String,
+        to: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
