@@ -750,6 +750,94 @@ pub struct ServiceInstance {
     pub metadata: HashMap<String, String>,
 }
 
+/// The lifecycle of a durable task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    Claimed,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+    }
+}
+
+/// Read view of a durable task: a claimable unit of work whose exclusive owner
+/// holds a fencing token. Progress/complete/fail must present that token, so a
+/// stale worker that lost the claim cannot commit newer state.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskState {
+    pub name: String,
+    pub task_type: String,
+    pub payload: Value,
+    pub status: TaskStatus,
+    pub owner: Option<String>,
+    pub fencing_token: u64,
+    pub progress: u32,
+    pub checkpoint: Value,
+    pub result: Option<Value>,
+    pub lease_expires_ms: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TaskRecord {
+    task_type: String,
+    payload: Value,
+    status: TaskStatus,
+    owner: Option<String>,
+    fencing_token: u64,
+    lease_ttl_ms: u64,
+    lease_expires_ms: Option<u64>,
+    progress: u32,
+    checkpoint: Value,
+    result: Option<Value>,
+    deadline_ms: Option<u64>,
+    generation: u64,
+}
+
+impl TaskRecord {
+    /// A task is claimable when it is not terminal and either unowned/pending or
+    /// its owner's lease has expired (so abandoned work is reassigned).
+    fn claimable(&self, now: u64) -> bool {
+        !self.status.is_terminal()
+            && (self.status == TaskStatus::Pending
+                || self.lease_expires_ms.is_none_or(|expires| expires <= now))
+    }
+
+    /// True when `worker` holds the current, unexpired claim under `token`.
+    fn owned_now(&self, now: u64, worker: &str, token: u64) -> bool {
+        !self.status.is_terminal()
+            && self.owner.as_deref() == Some(worker)
+            && self.fencing_token == token
+            && self.lease_expires_ms.is_some_and(|expires| expires > now)
+    }
+
+    fn view(&self, name: &str) -> TaskState {
+        TaskState {
+            name: name.to_string(),
+            task_type: self.task_type.clone(),
+            payload: self.payload.clone(),
+            status: self.status,
+            owner: self.owner.clone(),
+            fencing_token: self.fencing_token,
+            progress: self.progress,
+            checkpoint: self.checkpoint.clone(),
+            result: self.result.clone(),
+            lease_expires_ms: self.lease_expires_ms,
+            deadline_ms: self.deadline_ms,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -757,6 +845,7 @@ struct Store {
     kv: HashMap<String, KvEntry>,
     counters: HashMap<String, CounterEntry>,
     barriers: HashMap<String, BarrierRecord>,
+    tasks: HashMap<String, TaskRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
