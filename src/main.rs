@@ -9,6 +9,7 @@
 //! TTL expiry are implemented in the respective modules.
 
 mod barriers;
+mod budgets;
 mod consensus;
 mod counters;
 mod cron;
@@ -82,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/effects", effects::router())
         .nest("/handoffs", handoffs::router())
         .nest("/decisions", decisions::router())
+        .nest("/budgets", budgets::router())
         .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())
