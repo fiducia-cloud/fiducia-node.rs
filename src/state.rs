@@ -1360,56 +1360,69 @@ struct BudgetRecord {
     generation: u64,
 }
 
-/// Sum an axis across active (held or committed) reservations.
-fn axis_sum(
-    reservations: &std::collections::BTreeMap<String, ReservationRecord>,
-    pick: impl Fn(&ReservationRecord) -> Option<u64>,
-) -> u64 {
-    reservations
-        .values()
-        .filter(|r| r.status != ReservationStatus::Released)
-        .filter_map(|r| pick(r))
-        .sum()
+impl ReservationRecord {
+    /// What this reservation currently consumes on `axis`: the full reservation
+    /// while `Held`, the actual spend once `Committed`, and nothing when released.
+    fn consumed_on(&self, axis: impl Fn(&BudgetAmount) -> Option<u64>) -> u64 {
+        match self.status {
+            ReservationStatus::Held => axis(&self.reserved).unwrap_or(0),
+            ReservationStatus::Committed => axis(&self.spent).unwrap_or(0),
+            ReservationStatus::Released => 0,
+        }
+    }
 }
 
 impl BudgetRecord {
-    fn committed_or_held_reserved(&self) -> BudgetAmount {
+    /// Budget consumed right now: held reservations block their full amount;
+    /// committed ones consume only what was actually spent; released free it.
+    fn consumed(&self) -> BudgetAmount {
+        let sum = |axis: fn(&BudgetAmount) -> Option<u64>| -> u64 {
+            self.reservations.values().map(|r| r.consumed_on(axis)).sum()
+        };
         BudgetAmount {
-            usd_micros: Some(axis_sum(&self.reservations, |r| r.reserved.usd_micros)),
-            tokens: Some(axis_sum(&self.reservations, |r| r.reserved.tokens)),
-            tool_calls: Some(axis_sum(&self.reservations, |r| r.reserved.tool_calls)),
+            usd_micros: Some(sum(|b| b.usd_micros)),
+            tokens: Some(sum(|b| b.tokens)),
+            tool_calls: Some(sum(|b| b.tool_calls)),
         }
     }
 
-    fn total_spent(&self) -> BudgetAmount {
+    /// Actual committed spend (excludes still-held reservations).
+    fn spent(&self) -> BudgetAmount {
+        let sum = |axis: fn(&BudgetAmount) -> Option<u64>| -> u64 {
+            self.reservations
+                .values()
+                .filter(|r| r.status == ReservationStatus::Committed)
+                .map(|r| axis(&r.spent).unwrap_or(0))
+                .sum()
+        };
         BudgetAmount {
-            usd_micros: Some(axis_sum(&self.reservations, |r| r.spent.usd_micros)),
-            tokens: Some(axis_sum(&self.reservations, |r| r.spent.tokens)),
-            tool_calls: Some(axis_sum(&self.reservations, |r| r.spent.tool_calls)),
+            usd_micros: Some(sum(|b| b.usd_micros)),
+            tokens: Some(sum(|b| b.tokens)),
+            tool_calls: Some(sum(|b| b.tool_calls)),
         }
     }
 
     /// Would reserving `amount` keep every limited axis within the ceiling?
     fn fits(&self, amount: &BudgetAmount) -> bool {
-        let reserved = self.committed_or_held_reserved();
+        let consumed = self.consumed();
         let axis_ok = |limit: Option<u64>, current: Option<u64>, add: Option<u64>| match limit {
             None => true, // unlimited axis
-            Some(cap) => current.unwrap_or(0) + add.unwrap_or(0) <= cap,
+            Some(cap) => current.unwrap_or(0).saturating_add(add.unwrap_or(0)) <= cap,
         };
-        axis_ok(self.limit.usd_micros, reserved.usd_micros, amount.usd_micros)
-            && axis_ok(self.limit.tokens, reserved.tokens, amount.tokens)
-            && axis_ok(self.limit.tool_calls, reserved.tool_calls, amount.tool_calls)
+        axis_ok(self.limit.usd_micros, consumed.usd_micros, amount.usd_micros)
+            && axis_ok(self.limit.tokens, consumed.tokens, amount.tokens)
+            && axis_ok(self.limit.tool_calls, consumed.tool_calls, amount.tool_calls)
     }
 
     fn available(&self) -> BudgetAmount {
-        let reserved = self.committed_or_held_reserved();
+        let consumed = self.consumed();
         let axis = |limit: Option<u64>, used: Option<u64>| {
             limit.map(|cap| cap.saturating_sub(used.unwrap_or(0)))
         };
         BudgetAmount {
-            usd_micros: axis(self.limit.usd_micros, reserved.usd_micros),
-            tokens: axis(self.limit.tokens, reserved.tokens),
-            tool_calls: axis(self.limit.tool_calls, reserved.tool_calls),
+            usd_micros: axis(self.limit.usd_micros, consumed.usd_micros),
+            tokens: axis(self.limit.tokens, consumed.tokens),
+            tool_calls: axis(self.limit.tool_calls, consumed.tool_calls),
         }
     }
 
