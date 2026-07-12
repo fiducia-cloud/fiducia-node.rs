@@ -41,6 +41,9 @@ async fn check(
     Path((tenant, key)): Path<(String, String)>,
     Json(body): Json<CheckBody>,
 ) -> Response {
+    if let Err(rejection) = crate::validate::rate_limit(&tenant, &key) {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::RateLimitCheck {
             key,
