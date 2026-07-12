@@ -305,6 +305,8 @@ impl Command {
             Command::KvDelete { .. } => "kv.delete",
             Command::CounterAdd { .. } => "counter.add",
             Command::CounterSet { .. } => "counter.set",
+            Command::BarrierCreate { .. } => "barrier.create",
+            Command::BarrierArrive { .. } => "barrier.arrive",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
