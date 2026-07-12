@@ -354,6 +354,126 @@ pub struct CounterEntry {
     pub mod_revision: u64,
 }
 
+/// How a barrier decides it has resolved from its participants' arrivals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BarrierPolicy {
+    /// Every one of `expected` participants must arrive.
+    All,
+    /// Any `required` distinct participants suffice.
+    Quorum { required: u32 },
+    /// The first successful (non-veto) arrival resolves it.
+    FirstSuccess,
+    /// Every `expected` participant must arrive, but any veto aborts it.
+    AnyVeto,
+    /// Resolves at the deadline using whoever arrived (needs `deadline_ms`).
+    BestByDeadline,
+    /// Arrivals carry weights; resolves when their sum reaches `required_weight`.
+    WeightedQuorum { required_weight: u64 },
+}
+
+/// The lifecycle state of a barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarrierStatus {
+    Pending,
+    Satisfied,
+    Vetoed,
+    TimedOut,
+}
+
+impl BarrierStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, BarrierStatus::Pending)
+    }
+}
+
+/// One participant's arrival at a barrier.
+#[derive(Debug, Clone, Serialize)]
+pub struct BarrierArrival {
+    pub participant: String,
+    pub weight: u64,
+    pub veto: bool,
+    pub arrived_ms: u64,
+}
+
+/// Read view of a barrier: its policy, who has arrived, and whether it resolved.
+#[derive(Debug, Clone, Serialize)]
+pub struct BarrierState {
+    pub name: String,
+    pub policy: BarrierPolicy,
+    pub expected: u32,
+    pub deadline_ms: Option<u64>,
+    pub status: BarrierStatus,
+    pub arrivals: Vec<BarrierArrival>,
+    /// Distinct non-veto arrivals and their summed weight (the satisfaction tally).
+    pub arrived_count: u32,
+    pub arrived_weight: u64,
+}
+
+/// Internal barrier record: the durable facts (arrivals); status is derived.
+#[derive(Debug, Clone)]
+struct BarrierRecord {
+    policy: BarrierPolicy,
+    expected: u32,
+    deadline_ms: Option<u64>,
+    /// participant → arrival (a repeat arrival updates in place, so it is idempotent).
+    arrivals: HashMap<String, BarrierArrival>,
+}
+
+impl BarrierRecord {
+    /// Derive the barrier's status at time `now` from its arrivals. Monotonic:
+    /// once satisfied it stays satisfied as more participants arrive; a veto
+    /// under `AnyVeto` aborts; a passed deadline times out an unmet barrier.
+    fn status(&self, now: u64) -> BarrierStatus {
+        if matches!(self.policy, BarrierPolicy::AnyVeto)
+            && self.arrivals.values().any(|arrival| arrival.veto)
+        {
+            return BarrierStatus::Vetoed;
+        }
+        let count = self.arrivals.values().filter(|a| !a.veto).count() as u64;
+        let weight: u64 = self
+            .arrivals
+            .values()
+            .filter(|a| !a.veto)
+            .map(|a| a.weight)
+            .sum();
+        let deadline_passed = self.deadline_ms.is_some_and(|deadline| now >= deadline);
+
+        let met = match &self.policy {
+            BarrierPolicy::All | BarrierPolicy::AnyVeto => count >= self.expected as u64,
+            BarrierPolicy::Quorum { required } => count >= *required as u64,
+            BarrierPolicy::FirstSuccess => count >= 1,
+            BarrierPolicy::WeightedQuorum { required_weight } => weight >= *required_weight,
+            BarrierPolicy::BestByDeadline => deadline_passed && count >= 1,
+        };
+        if met {
+            BarrierStatus::Satisfied
+        } else if deadline_passed {
+            BarrierStatus::TimedOut
+        } else {
+            BarrierStatus::Pending
+        }
+    }
+
+    fn view(&self, name: &str, now: u64) -> BarrierState {
+        let mut arrivals: Vec<BarrierArrival> = self.arrivals.values().cloned().collect();
+        arrivals.sort_by(|a, b| a.arrived_ms.cmp(&b.arrived_ms).then(a.participant.cmp(&b.participant)));
+        let arrived_count = arrivals.iter().filter(|a| !a.veto).count() as u32;
+        let arrived_weight = arrivals.iter().filter(|a| !a.veto).map(|a| a.weight).sum();
+        BarrierState {
+            name: name.to_string(),
+            policy: self.policy.clone(),
+            expected: self.expected,
+            deadline_ms: self.deadline_ms,
+            status: self.status(now),
+            arrivals,
+            arrived_count,
+            arrived_weight,
+        }
+    }
+}
+
 /// Read view of one lock **member key**: who holds it, the whole set held with it
 /// (the acquired union), and who is queued behind it.
 #[derive(Debug, Clone, Serialize)]
