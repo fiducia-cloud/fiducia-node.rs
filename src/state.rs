@@ -112,6 +112,35 @@ pub enum Command {
         name: String,
     },
 
+    // --- Approval-escrow effects ----------------------------------------
+    /// Prepare a side effect for later authorization. Idempotent: a repeat
+    /// prepare returns the existing effect. `required_approvals` of 0 is
+    /// pre-approved and may be committed immediately.
+    EffectPrepare {
+        name: String,
+        effect_type: String,
+        payload: Value,
+        risk: String,
+        idempotency_key: String,
+        required_approvals: u32,
+    },
+    /// Record one principal's approval. Duplicate approvals by the same principal
+    /// count once; reaching `required_approvals` moves the effect to Approved.
+    EffectApprove {
+        name: String,
+        principal: String,
+    },
+    /// Commit an approved effect exactly once, recording the durable result.
+    /// A repeat commit replays without re-executing.
+    EffectCommit {
+        name: String,
+        result: Value,
+    },
+    /// Abort a prepared/approved effect (terminal); it can never be committed.
+    EffectAbort {
+        name: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -335,6 +364,10 @@ impl Command {
             | Command::TaskComplete { name, .. }
             | Command::TaskFail { name, .. }
             | Command::TaskCancel { name } => name,
+            Command::EffectPrepare { name, .. }
+            | Command::EffectApprove { name, .. }
+            | Command::EffectCommit { name, .. }
+            | Command::EffectAbort { name } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -364,6 +397,10 @@ impl Command {
             Command::TaskComplete { .. } => "task.complete",
             Command::TaskFail { .. } => "task.fail",
             Command::TaskCancel { .. } => "task.cancel",
+            Command::EffectPrepare { .. } => "effect.prepare",
+            Command::EffectApprove { .. } => "effect.approve",
+            Command::EffectCommit { .. } => "effect.commit",
+            Command::EffectAbort { .. } => "effect.abort",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -895,6 +932,69 @@ impl TaskRecord {
     }
 }
 
+/// The lifecycle of an approval-escrow effect. Preparing, authorizing, and
+/// executing a dangerous action are separated so a risky side effect cannot be
+/// performed until it is approved, and is committed at most once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectStatus {
+    Prepared,
+    Approved,
+    Committed,
+    Aborted,
+}
+
+impl EffectStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, EffectStatus::Committed | EffectStatus::Aborted)
+    }
+}
+
+/// Read view of a prepared effect.
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectState {
+    pub name: String,
+    pub effect_type: String,
+    pub payload: Value,
+    pub risk: String,
+    pub idempotency_key: String,
+    pub status: EffectStatus,
+    pub required_approvals: u32,
+    pub approvals: Vec<String>,
+    pub result: Option<Value>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct EffectRecord {
+    effect_type: String,
+    payload: Value,
+    risk: String,
+    idempotency_key: String,
+    status: EffectStatus,
+    required_approvals: u32,
+    approvals: std::collections::BTreeSet<String>,
+    result: Option<Value>,
+    generation: u64,
+}
+
+impl EffectRecord {
+    fn view(&self, name: &str) -> EffectState {
+        EffectState {
+            name: name.to_string(),
+            effect_type: self.effect_type.clone(),
+            payload: self.payload.clone(),
+            risk: self.risk.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            status: self.status,
+            required_approvals: self.required_approvals,
+            approvals: self.approvals.iter().cloned().collect(),
+            result: self.result.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -903,6 +1003,7 @@ struct Store {
     counters: HashMap<String, CounterEntry>,
     barriers: HashMap<String, BarrierRecord>,
     tasks: HashMap<String, TaskRecord>,
+    effects: HashMap<String, EffectRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -1013,6 +1114,26 @@ impl StateMachine {
                 retryable,
             } => store.apply_task_fail(now, name, worker, fencing_token, retryable),
             Command::TaskCancel { name } => store.apply_task_cancel(name),
+            Command::EffectPrepare {
+                name,
+                effect_type,
+                payload,
+                risk,
+                idempotency_key,
+                required_approvals,
+            } => store.apply_effect_prepare(
+                name,
+                effect_type,
+                payload,
+                risk,
+                idempotency_key,
+                required_approvals,
+            ),
+            Command::EffectApprove { name, principal } => {
+                store.apply_effect_approve(name, principal)
+            }
+            Command::EffectCommit { name, result } => store.apply_effect_commit(name, result),
+            Command::EffectAbort { name } => store.apply_effect_abort(name),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1185,6 +1306,11 @@ impl StateMachine {
     /// Read a durable task's current state.
     pub fn task_get(&self, name: &str) -> Option<TaskState> {
         self.store.lock().unwrap().tasks.get(name).map(|record| record.view(name))
+    }
+
+    /// Read an approval-escrow effect's current state.
+    pub fn effect_get(&self, name: &str) -> Option<EffectState> {
+        self.store.lock().unwrap().effects.get(name).map(|record| record.view(name))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -1714,6 +1840,94 @@ impl Store {
         record.lease_expires_ms = None;
         record.generation += 1;
         json!({ "ok": true, "task": record.view(&name) })
+    }
+
+    fn apply_effect_prepare(
+        &mut self,
+        name: String,
+        effect_type: String,
+        payload: Value,
+        risk: String,
+        idempotency_key: String,
+        required_approvals: u32,
+    ) -> Value {
+        if let Some(existing) = self.effects.get(&name) {
+            return json!({ "ok": true, "created": false, "effect": existing.view(&name) });
+        }
+        let status = if required_approvals == 0 {
+            EffectStatus::Approved
+        } else {
+            EffectStatus::Prepared
+        };
+        let record = EffectRecord {
+            effect_type,
+            payload,
+            risk,
+            idempotency_key,
+            status,
+            required_approvals,
+            approvals: std::collections::BTreeSet::new(),
+            result: None,
+            generation: 1,
+        };
+        let view = record.view(&name);
+        self.effects.insert(name, record);
+        json!({ "ok": true, "created": true, "effect": view })
+    }
+
+    fn apply_effect_approve(&mut self, name: String, principal: String) -> Value {
+        let Some(record) = self.effects.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "effect": record.view(&name) });
+        }
+        record.approvals.insert(principal);
+        if record.approvals.len() as u32 >= record.required_approvals {
+            record.status = EffectStatus::Approved;
+        }
+        record.generation += 1;
+        json!({ "ok": true, "effect": record.view(&name) })
+    }
+
+    fn apply_effect_commit(&mut self, name: String, result: Value) -> Value {
+        let Some(record) = self.effects.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        match record.status {
+            // Idempotent replay: already committed, do not re-execute.
+            EffectStatus::Committed => {
+                json!({ "ok": true, "committed": false, "effect": record.view(&name) })
+            }
+            EffectStatus::Aborted => {
+                json!({ "ok": false, "reason": "aborted", "effect": record.view(&name) })
+            }
+            EffectStatus::Prepared => json!({
+                "ok": false,
+                "reason": "not_approved",
+                "approvals": record.approvals.len(),
+                "required_approvals": record.required_approvals,
+                "effect": record.view(&name),
+            }),
+            EffectStatus::Approved => {
+                record.status = EffectStatus::Committed;
+                record.result = Some(result);
+                record.generation += 1;
+                json!({ "ok": true, "committed": true, "effect": record.view(&name) })
+            }
+        }
+    }
+
+    fn apply_effect_abort(&mut self, name: String) -> Value {
+        let Some(record) = self.effects.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "effect": record.view(&name) });
+        }
+        record.status = EffectStatus::Aborted;
+        record.generation += 1;
+        json!({ "ok": true, "effect": record.view(&name) })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -3869,6 +4083,64 @@ mod tests {
         });
         assert_eq!(reclaim.output["ok"], true);
         assert!(reclaim.output["fencing_token"].as_u64().unwrap() > token);
+    }
+
+    #[test]
+    fn effect_requires_approval_then_commits_exactly_once() {
+        let sm = StateMachine::new();
+        let name = "invoice-882/payment".to_string();
+        sm.apply(Command::EffectPrepare {
+            name: name.clone(),
+            effect_type: "send_payment".to_string(),
+            payload: json!({ "amount_usd": 500 }),
+            risk: "high".to_string(),
+            idempotency_key: "invoice-882:payment".to_string(),
+            required_approvals: 2,
+        });
+
+        // Cannot commit before it is approved.
+        let early = sm.apply(Command::EffectCommit {
+            name: name.clone(),
+            result: json!({}),
+        });
+        assert_eq!(early.output["ok"], false);
+        assert_eq!(early.output["reason"], "not_approved");
+
+        // One approval is not enough (requires 2), and a duplicate counts once.
+        sm.apply(Command::EffectApprove {
+            name: name.clone(),
+            principal: "finance-a".to_string(),
+        });
+        sm.apply(Command::EffectApprove {
+            name: name.clone(),
+            principal: "finance-a".to_string(),
+        });
+        assert_eq!(sm.effect_get(&name).unwrap().status, EffectStatus::Prepared);
+
+        // A second distinct approval moves it to Approved.
+        sm.apply(Command::EffectApprove {
+            name: name.clone(),
+            principal: "finance-b".to_string(),
+        });
+        assert_eq!(sm.effect_get(&name).unwrap().status, EffectStatus::Approved);
+
+        // First commit executes; a duplicate commit replays without re-executing.
+        let first = sm.apply(Command::EffectCommit {
+            name: name.clone(),
+            result: json!({ "confirmation": "pay_123" }),
+        });
+        assert_eq!(first.output["committed"], true);
+        let replay = sm.apply(Command::EffectCommit {
+            name: name.clone(),
+            result: json!({ "confirmation": "pay_999" }),
+        });
+        assert_eq!(replay.output["ok"], true);
+        assert_eq!(replay.output["committed"], false);
+        // The originally recorded result is preserved, not overwritten.
+        assert_eq!(
+            sm.effect_get(&name).unwrap().result.unwrap()["confirmation"],
+            "pay_123"
+        );
     }
 
     #[test]
