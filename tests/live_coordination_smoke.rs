@@ -1,3 +1,5 @@
+// End-to-end smoke test: drives a running node's HTTP coordination API
+// (locks, KV, etc.) to verify the live wire contract, not just unit behavior.
 use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

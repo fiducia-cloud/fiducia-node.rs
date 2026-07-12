@@ -1,3 +1,4 @@
+# Build and push the fiducia-node container image on merges to main.
 name: docker
 on:
   push:

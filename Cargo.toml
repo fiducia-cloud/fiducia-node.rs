@@ -1,3 +1,4 @@
+# Crate manifest for fiducia-node: dependencies, build config, and binary metadata.
 [package]
 name = "fiducia-node"
 version = "0.1.0"
