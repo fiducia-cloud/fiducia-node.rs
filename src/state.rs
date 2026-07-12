@@ -1324,6 +1324,71 @@ impl Store {
         json!({ "ok": true, "key": key, "value": value, "mod_revision": revision })
     }
 
+    fn apply_barrier_create(
+        &mut self,
+        now: u64,
+        name: String,
+        policy: BarrierPolicy,
+        expected: u32,
+        deadline_ms: Option<u64>,
+    ) -> Value {
+        // Reconfigure only while still pending; a resolved barrier is immutable.
+        if self
+            .barriers
+            .get(&name)
+            .is_some_and(|record| record.status(now).is_terminal())
+        {
+            let view = self.barriers.get(&name).unwrap().view(&name, now);
+            return json!({ "ok": false, "reason": "already_resolved", "barrier": view });
+        }
+        let arrivals = self
+            .barriers
+            .remove(&name)
+            .map(|record| record.arrivals)
+            .unwrap_or_default();
+        let record = BarrierRecord {
+            policy,
+            expected,
+            deadline_ms,
+            arrivals,
+        };
+        let view = record.view(&name, now);
+        self.barriers.insert(name, record);
+        json!({ "ok": true, "barrier": view })
+    }
+
+    fn apply_barrier_arrive(
+        &mut self,
+        now: u64,
+        name: String,
+        participant: String,
+        weight: u64,
+        veto: bool,
+    ) -> Value {
+        // Auto-create a single-participant `all` barrier if none exists, so a
+        // plain fan-in needs no explicit create.
+        let record = self
+            .barriers
+            .entry(name.clone())
+            .or_insert_with(|| BarrierRecord {
+                policy: BarrierPolicy::All,
+                expected: 1,
+                deadline_ms: None,
+                arrivals: HashMap::new(),
+            });
+        record.arrivals.insert(
+            participant.clone(),
+            BarrierArrival {
+                participant,
+                weight,
+                veto,
+                arrived_ms: now,
+            },
+        );
+        let view = record.view(&name, now);
+        json!({ "ok": true, "resolved": view.status.is_terminal(), "barrier": view })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
