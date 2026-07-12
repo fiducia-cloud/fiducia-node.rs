@@ -183,6 +183,18 @@ pub fn task(name: &str, worker: Option<&str>) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// Validate a handoff name plus the counterparties named by the operation.
+pub fn handoff(name: &str, from: Option<&str>, to: Option<&str>) -> Result<(), Rejection> {
+    check_str("handoff name", name, MAX_NAME_BYTES, false)?;
+    if let Some(from) = from {
+        check_str("from", from, MAX_HOLDER_BYTES, false)?;
+    }
+    if let Some(to) = to {
+        check_str("to", to, MAX_HOLDER_BYTES, false)?;
+    }
+    Ok(())
+}
+
 /// Validate an effect name, and a principal id when the operation names one.
 pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
     check_str("effect name", name, MAX_NAME_BYTES, false)?;

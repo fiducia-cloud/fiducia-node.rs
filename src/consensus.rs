@@ -52,7 +52,7 @@ use crate::persist::{Recovered, ShardStore};
 use crate::state::{
     BarrierState, Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem,
     Leadership, LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
-    ServiceInstance, TaskState, EffectState,
+    ServiceInstance, TaskState, EffectState, HandoffState,
     ServiceSummary, StateMachine,
 };
 use crate::transport::{
@@ -362,6 +362,7 @@ pub enum ReadRequest {
     Barrier { name: String },
     Task { name: String },
     Effect { name: String },
+    Handoff { name: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
@@ -397,7 +398,7 @@ impl ReadRequest {
         match self {
             ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
             ReadRequest::Counter { key } => key,
-            ReadRequest::Barrier { name } | ReadRequest::Task { name } | ReadRequest::Effect { name } => name,
+            ReadRequest::Barrier { name } | ReadRequest::Task { name } | ReadRequest::Effect { name } | ReadRequest::Handoff { name } => name,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
@@ -421,6 +422,7 @@ pub enum ReadResponse {
     Barrier(Option<BarrierState>),
     Task(Option<TaskState>),
     Effect(Option<EffectState>),
+    Handoff(Option<HandoffState>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
@@ -1522,6 +1524,7 @@ impl ShardActor {
             }
             ReadRequest::Task { name } => Ok(ReadResponse::Task(self.state.task_get(&name))),
             ReadRequest::Effect { name } => Ok(ReadResponse::Effect(self.state.effect_get(&name))),
+            ReadRequest::Handoff { name } => Ok(ReadResponse::Handoff(self.state.handoff_get(&name))),
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
@@ -1585,6 +1588,7 @@ impl ShardActor {
             ReadRequest::Barrier { name } => ReadResponse::Barrier(self.state.barrier_get(&name)),
             ReadRequest::Task { name } => ReadResponse::Task(self.state.task_get(&name)),
             ReadRequest::Effect { name } => ReadResponse::Effect(self.state.effect_get(&name)),
+            ReadRequest::Handoff { name } => ReadResponse::Handoff(self.state.handoff_get(&name)),
             ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
             ReadRequest::Semaphore { key } => {
                 ReadResponse::Semaphore(self.state.semaphore_get(&key))
