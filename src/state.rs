@@ -1431,6 +1431,12 @@ impl StateMachine {
         self.store.lock().unwrap().effects.get(name).map(|record| record.view(name))
     }
 
+    /// Read an ownership handoff's current state.
+    pub fn handoff_get(&self, name: &str) -> Option<HandoffState> {
+        let store = self.store.lock().unwrap();
+        store.handoffs.get(name).map(|record| record.view(name, now_ms()))
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
