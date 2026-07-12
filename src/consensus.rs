@@ -1507,6 +1507,9 @@ impl ShardActor {
             ReadRequest::KvPrefix { prefix } => {
                 Ok(ReadResponse::KvPrefix(self.state.kv_prefix(&prefix)))
             }
+            ReadRequest::Counter { key } => {
+                Ok(ReadResponse::Counter(self.state.counter_get(&key)))
+            }
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
