@@ -1099,6 +1099,168 @@ impl HandoffRecord {
     }
 }
 
+/// How a decision resolves from its weighted votes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionPolicy {
+    /// Once `min_votes` are cast, the option with the most total weight wins.
+    Plurality { min_votes: u32 },
+    /// The first option whose summed weight reaches `required_weight` wins.
+    Threshold { required_weight: u64 },
+    /// Once `min_votes` are cast, resolves only if all voters chose one option.
+    Unanimous { min_votes: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionStatus {
+    Open,
+    Resolved,
+    Vetoed,
+    TimedOut,
+}
+
+/// One agent's vote in a decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionVoteView {
+    pub voter: String,
+    /// The chosen option, or `None` to abstain.
+    pub option: Option<String>,
+    pub confidence: f32,
+    pub weight: u64,
+    pub veto: bool,
+    pub evidence: Vec<String>,
+}
+
+/// Read view of a decision, with its outcome derived at read time.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionState {
+    pub name: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub policy: DecisionPolicy,
+    pub status: DecisionStatus,
+    pub winner: Option<String>,
+    /// Per-option summed weight, sorted by option for determinism.
+    pub tallies: Vec<(String, u64)>,
+    pub votes: Vec<DecisionVoteView>,
+    pub deadline_ms: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionVoteRecord {
+    option: Option<String>,
+    confidence: f32,
+    weight: u64,
+    veto: bool,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionRecord {
+    question: String,
+    options: Vec<String>,
+    policy: DecisionPolicy,
+    votes: std::collections::BTreeMap<String, DecisionVoteRecord>,
+    deadline_ms: Option<u64>,
+    generation: u64,
+}
+
+impl DecisionRecord {
+    /// Per-option weight from non-veto, non-abstain votes (sorted by option).
+    fn tallies(&self) -> Vec<(String, u64)> {
+        let mut sums: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for vote in self.votes.values() {
+            if vote.veto {
+                continue;
+            }
+            if let Some(option) = &vote.option {
+                *sums.entry(option.clone()).or_default() += vote.weight;
+            }
+        }
+        sums.into_iter().collect()
+    }
+
+    /// Resolve to `(status, winner)`. A veto aborts; otherwise the policy decides,
+    /// with ties broken by the lexicographically smallest option. A passed
+    /// deadline forces a plurality outcome (or `TimedOut` with no usable votes).
+    fn resolve(&self, now: u64) -> (DecisionStatus, Option<String>) {
+        if self.votes.values().any(|vote| vote.veto) {
+            return (DecisionStatus::Vetoed, None);
+        }
+        let tallies = self.tallies();
+        let cast = self.votes.values().filter(|v| !v.veto && v.option.is_some()).count() as u32;
+        let deadline_passed = self.deadline_ms.is_some_and(|deadline| now >= deadline);
+        // Highest-weight option, ties → smallest option name (tallies are sorted).
+        let top = tallies.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).cloned();
+
+        match &self.policy {
+            DecisionPolicy::Plurality { min_votes } => {
+                if cast >= *min_votes || (deadline_passed && cast > 0) {
+                    match top {
+                        Some((option, _)) => (DecisionStatus::Resolved, Some(option)),
+                        None => (DecisionStatus::Open, None),
+                    }
+                } else if deadline_passed {
+                    (DecisionStatus::TimedOut, None)
+                } else {
+                    (DecisionStatus::Open, None)
+                }
+            }
+            DecisionPolicy::Threshold { required_weight } => {
+                let met = tallies.iter().find(|(_, weight)| *weight >= *required_weight);
+                if let Some((option, _)) = met {
+                    (DecisionStatus::Resolved, Some(option.clone()))
+                } else if deadline_passed {
+                    (DecisionStatus::TimedOut, None)
+                } else {
+                    (DecisionStatus::Open, None)
+                }
+            }
+            DecisionPolicy::Unanimous { min_votes } => {
+                let unanimous = tallies.len() == 1;
+                if cast >= *min_votes && unanimous {
+                    (DecisionStatus::Resolved, top.map(|(option, _)| option))
+                } else if deadline_passed {
+                    (DecisionStatus::TimedOut, None)
+                } else {
+                    (DecisionStatus::Open, None)
+                }
+            }
+        }
+    }
+
+    fn view(&self, name: &str, now: u64) -> DecisionState {
+        let (status, winner) = self.resolve(now);
+        let mut votes: Vec<DecisionVoteView> = self
+            .votes
+            .iter()
+            .map(|(voter, vote)| DecisionVoteView {
+                voter: voter.clone(),
+                option: vote.option.clone(),
+                confidence: vote.confidence,
+                weight: vote.weight,
+                veto: vote.veto,
+                evidence: vote.evidence.clone(),
+            })
+            .collect();
+        votes.sort_by(|a, b| a.voter.cmp(&b.voter));
+        DecisionState {
+            name: name.to_string(),
+            question: self.question.clone(),
+            options: self.options.clone(),
+            policy: self.policy.clone(),
+            status,
+            winner,
+            tallies: self.tallies(),
+            votes,
+            deadline_ms: self.deadline_ms,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1109,6 +1271,7 @@ struct Store {
     tasks: HashMap<String, TaskRecord>,
     effects: HashMap<String, EffectRecord>,
     handoffs: HashMap<String, HandoffRecord>,
+    decisions: HashMap<String, DecisionRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
