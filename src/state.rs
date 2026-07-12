@@ -31,6 +31,23 @@ pub enum Command {
         key: String,
     },
 
+    // --- Distributed counters -------------------------------------------
+    /// Atomically add `delta` (which may be negative) to counter `key`, creating
+    /// it at 0 first. When `prev_revision` is set, the add is a compare-and-set:
+    /// it applies only if the counter's current `mod_revision` matches.
+    CounterAdd {
+        key: String,
+        delta: i64,
+        prev_revision: Option<u64>,
+    },
+    /// Set counter `key` to an absolute `value` (e.g. reset to 0). `prev_revision`
+    /// makes it a compare-and-set.
+    CounterSet {
+        key: String,
+        value: i64,
+        prev_revision: Option<u64>,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
