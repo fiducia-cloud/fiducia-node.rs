@@ -1513,6 +1513,9 @@ impl ShardActor {
             ReadRequest::Counter { key } => {
                 Ok(ReadResponse::Counter(self.state.counter_get(&key)))
             }
+            ReadRequest::Barrier { name } => {
+                Ok(ReadResponse::Barrier(self.state.barrier_get(&name)))
+            }
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
