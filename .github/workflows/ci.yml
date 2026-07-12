@@ -1,3 +1,4 @@
+# CI: build, format, clippy, and test the crate on push and pull request.
 name: ci
 
 on:
