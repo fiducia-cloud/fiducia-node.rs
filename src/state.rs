@@ -4387,7 +4387,7 @@ mod tests {
         });
         assert_eq!(accept.output["ok"], true);
         let to_token = accept.output["to_token"].as_u64().unwrap();
-        assert!(to_token > 7, "new owner's token must exceed the old owner's");
+        assert!(to_token > from_token, "new owner's token must exceed the old owner's");
         assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Accepted);
 
         // A second accept on the resolved handoff is rejected.
