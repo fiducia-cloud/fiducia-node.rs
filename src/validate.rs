@@ -163,6 +163,17 @@ pub fn counter(key: &str) -> Result<(), Rejection> {
     check_str("counter key", key, MAX_KEY_BYTES, false)
 }
 
+/// Validate a barrier name.
+pub fn barrier(name: &str) -> Result<(), Rejection> {
+    check_str("barrier name", name, MAX_NAME_BYTES, false)
+}
+
+/// Validate a barrier arrival: name plus the arriving participant id.
+pub fn barrier_arrive(name: &str, participant: &str) -> Result<(), Rejection> {
+    check_str("barrier name", name, MAX_NAME_BYTES, false)?;
+    check_str("participant", participant, MAX_HOLDER_BYTES, false)
+}
+
 /// Validate a service registration: name, instance id, address, TTL, metadata.
 pub fn service_register(
     service: &str,
