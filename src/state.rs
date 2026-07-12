@@ -1099,6 +1099,71 @@ impl Store {
         json!({ "ok": true, "key": key, "revision": revision, "expires_at_ms": expires_at_ms })
     }
 
+    fn apply_counter_add(
+        &mut self,
+        revision: u64,
+        key: String,
+        delta: i64,
+        prev_revision: Option<u64>,
+    ) -> Value {
+        let current = self.counters.get(&key);
+        let current_revision = current.map(|entry| entry.mod_revision).unwrap_or(0);
+        if let Some(expected) = prev_revision {
+            if current_revision != expected {
+                return json!({
+                    "ok": false,
+                    "reason": "cas_mismatch",
+                    "current_revision": current_revision,
+                    "revision": revision,
+                });
+            }
+        }
+        let value = current
+            .map(|entry| entry.value)
+            .unwrap_or(0)
+            .saturating_add(delta);
+        self.counters.insert(
+            key.clone(),
+            CounterEntry {
+                value,
+                mod_revision: revision,
+            },
+        );
+        json!({ "ok": true, "key": key, "value": value, "mod_revision": revision })
+    }
+
+    fn apply_counter_set(
+        &mut self,
+        revision: u64,
+        key: String,
+        value: i64,
+        prev_revision: Option<u64>,
+    ) -> Value {
+        let current_revision = self
+            .counters
+            .get(&key)
+            .map(|entry| entry.mod_revision)
+            .unwrap_or(0);
+        if let Some(expected) = prev_revision {
+            if current_revision != expected {
+                return json!({
+                    "ok": false,
+                    "reason": "cas_mismatch",
+                    "current_revision": current_revision,
+                    "revision": revision,
+                });
+            }
+        }
+        self.counters.insert(
+            key.clone(),
+            CounterEntry {
+                value,
+                mod_revision: revision,
+            },
+        );
+        json!({ "ok": true, "key": key, "value": value, "mod_revision": revision })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
