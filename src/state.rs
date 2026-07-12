@@ -895,6 +895,69 @@ impl TaskRecord {
     }
 }
 
+/// The lifecycle of an approval-escrow effect. Preparing, authorizing, and
+/// executing a dangerous action are separated so a risky side effect cannot be
+/// performed until it is approved, and is committed at most once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectStatus {
+    Prepared,
+    Approved,
+    Committed,
+    Aborted,
+}
+
+impl EffectStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, EffectStatus::Committed | EffectStatus::Aborted)
+    }
+}
+
+/// Read view of a prepared effect.
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectState {
+    pub name: String,
+    pub effect_type: String,
+    pub payload: Value,
+    pub risk: String,
+    pub idempotency_key: String,
+    pub status: EffectStatus,
+    pub required_approvals: u32,
+    pub approvals: Vec<String>,
+    pub result: Option<Value>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct EffectRecord {
+    effect_type: String,
+    payload: Value,
+    risk: String,
+    idempotency_key: String,
+    status: EffectStatus,
+    required_approvals: u32,
+    approvals: std::collections::BTreeSet<String>,
+    result: Option<Value>,
+    generation: u64,
+}
+
+impl EffectRecord {
+    fn view(&self, name: &str) -> EffectState {
+        EffectState {
+            name: name.to_string(),
+            effect_type: self.effect_type.clone(),
+            payload: self.payload.clone(),
+            risk: self.risk.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            status: self.status,
+            required_approvals: self.required_approvals,
+            approvals: self.approvals.iter().cloned().collect(),
+            result: self.result.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -903,6 +966,7 @@ struct Store {
     counters: HashMap<String, CounterEntry>,
     barriers: HashMap<String, BarrierRecord>,
     tasks: HashMap<String, TaskRecord>,
+    effects: HashMap<String, EffectRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
