@@ -112,6 +112,35 @@ pub enum Command {
         name: String,
     },
 
+    // --- Approval-escrow effects ----------------------------------------
+    /// Prepare a side effect for later authorization. Idempotent: a repeat
+    /// prepare returns the existing effect. `required_approvals` of 0 is
+    /// pre-approved and may be committed immediately.
+    EffectPrepare {
+        name: String,
+        effect_type: String,
+        payload: Value,
+        risk: String,
+        idempotency_key: String,
+        required_approvals: u32,
+    },
+    /// Record one principal's approval. Duplicate approvals by the same principal
+    /// count once; reaching `required_approvals` moves the effect to Approved.
+    EffectApprove {
+        name: String,
+        principal: String,
+    },
+    /// Commit an approved effect exactly once, recording the durable result.
+    /// A repeat commit replays without re-executing.
+    EffectCommit {
+        name: String,
+        result: Value,
+    },
+    /// Abort a prepared/approved effect (terminal); it can never be committed.
+    EffectAbort {
+        name: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
