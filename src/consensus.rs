@@ -1569,6 +1569,7 @@ impl ShardActor {
             // A single-key read arriving on the local path: serve it off applied
             // state too rather than erroring.
             ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
+            ReadRequest::Counter { key } => ReadResponse::Counter(self.state.counter_get(&key)),
             ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
             ReadRequest::Semaphore { key } => {
                 ReadResponse::Semaphore(self.state.semaphore_get(&key))
