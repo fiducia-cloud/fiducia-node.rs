@@ -9,6 +9,7 @@
 //! TTL expiry are implemented in the respective modules.
 
 mod consensus;
+mod counters;
 mod cron;
 mod discovery;
 mod election;
