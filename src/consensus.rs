@@ -413,6 +413,7 @@ impl ReadRequest {
 pub enum ReadResponse {
     Kv(Option<KvEntry>),
     KvPrefix(Vec<(String, KvEntry)>),
+    Counter(Option<CounterEntry>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
