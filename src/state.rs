@@ -1488,6 +1488,96 @@ impl BudgetRecord {
     }
 }
 
+/// The lifecycle of a claim in the contestable ledger. Semantic similarity may
+/// surface a claim, but only an authorized resolution moves it to `Accepted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStatus {
+    Asserted,
+    Contested,
+    Accepted,
+    Rejected,
+    Superseded,
+}
+
+impl ClaimStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ClaimStatus::Accepted | ClaimStatus::Rejected | ClaimStatus::Superseded)
+    }
+}
+
+/// One agent's contest of a claim.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimContest {
+    pub agent: String,
+    pub reason: String,
+}
+
+/// Read view of a versioned, contestable claim.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimState {
+    pub name: String,
+    pub subject: String,
+    pub predicate: String,
+    pub value: Value,
+    pub confidence: f32,
+    pub author: String,
+    pub status: ClaimStatus,
+    pub supporters: Vec<String>,
+    pub contests: Vec<ClaimContest>,
+    pub evidence: Vec<String>,
+    pub valid_until_ms: Option<u64>,
+    pub superseded_by: Option<String>,
+    /// Bumped every time the asserted value changes.
+    pub version: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ClaimRecord {
+    subject: String,
+    predicate: String,
+    value: Value,
+    confidence: f32,
+    author: String,
+    status: ClaimStatus,
+    supporters: std::collections::BTreeSet<String>,
+    contests: std::collections::BTreeMap<String, String>,
+    evidence: Vec<String>,
+    valid_until_ms: Option<u64>,
+    superseded_by: Option<String>,
+    version: u64,
+    generation: u64,
+}
+
+impl ClaimRecord {
+    fn view(&self, name: &str) -> ClaimState {
+        ClaimState {
+            name: name.to_string(),
+            subject: self.subject.clone(),
+            predicate: self.predicate.clone(),
+            value: self.value.clone(),
+            confidence: self.confidence,
+            author: self.author.clone(),
+            status: self.status,
+            supporters: self.supporters.iter().cloned().collect(),
+            contests: self
+                .contests
+                .iter()
+                .map(|(agent, reason)| ClaimContest {
+                    agent: agent.clone(),
+                    reason: reason.clone(),
+                })
+                .collect(),
+            evidence: self.evidence.clone(),
+            valid_until_ms: self.valid_until_ms,
+            superseded_by: self.superseded_by.clone(),
+            version: self.version,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1500,6 +1590,7 @@ struct Store {
     handoffs: HashMap<String, HandoffRecord>,
     decisions: HashMap<String, DecisionRecord>,
     budgets: HashMap<String, BudgetRecord>,
+    claims: HashMap<String, ClaimRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
