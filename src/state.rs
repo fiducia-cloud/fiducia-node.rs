@@ -48,6 +48,25 @@ pub enum Command {
         prev_revision: Option<u64>,
     },
 
+    // --- Barriers (fan-in) ----------------------------------------------
+    /// Create (or reconfigure, if unmet) a named barrier with a resolution
+    /// policy. `expected` is the participant count for `all`/`any_veto`.
+    BarrierCreate {
+        name: String,
+        policy: BarrierPolicy,
+        expected: u32,
+        deadline_ms: Option<u64>,
+    },
+    /// Record a participant's arrival (or veto). Repeat arrivals by the same
+    /// participant are idempotent. Auto-creates an `all`-policy barrier if none
+    /// exists yet, so simple fan-ins need no explicit create.
+    BarrierArrive {
+        name: String,
+        participant: String,
+        weight: u64,
+        veto: bool,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
