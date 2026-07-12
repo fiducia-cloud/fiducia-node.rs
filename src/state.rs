@@ -1239,6 +1239,19 @@ impl StateMachine {
             }
             Command::EffectCommit { name, result } => store.apply_effect_commit(name, result),
             Command::EffectAbort { name } => store.apply_effect_abort(name),
+            Command::HandoffOffer {
+                name,
+                resource,
+                from,
+                to,
+                from_token,
+                context,
+                ttl_ms,
+            } => store.apply_handoff_offer(
+                now, name, resource, from, to, from_token, context, ttl_ms,
+            ),
+            Command::HandoffAccept { name, to } => store.apply_handoff_accept(now, name, to),
+            Command::HandoffReject { name, to } => store.apply_handoff_reject(now, name, to),
             Command::LockAcquire {
                 keys,
                 holder,
