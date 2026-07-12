@@ -4672,6 +4672,51 @@ mod tests {
     }
 
     #[test]
+    fn decision_resolves_by_weight_and_vetoes_abort() {
+        let sm = StateMachine::new();
+        let propose = |name: &str| {
+            sm.apply(Command::DecisionPropose {
+                name: name.to_string(),
+                question: "Is this deploy safe?".to_string(),
+                options: vec!["approve".to_string(), "reject".to_string()],
+                policy: DecisionPolicy::Plurality { min_votes: 3 },
+                deadline_ms: None,
+            });
+        };
+        let vote = |name: &str, voter: &str, option: Option<&str>, weight: u64, veto: bool| {
+            sm.apply(Command::DecisionVote {
+                name: name.to_string(),
+                voter: voter.to_string(),
+                option: option.map(str::to_string),
+                confidence: 0.9,
+                weight,
+                veto,
+                evidence: vec![],
+            })
+        };
+
+        propose("deploy/safe");
+        vote("deploy/safe", "a", Some("approve"), 1, false);
+        vote("deploy/safe", "b", Some("reject"), 1, false);
+        // Not enough votes yet (min_votes = 3).
+        assert_eq!(sm.decision_get("deploy/safe").unwrap().status, DecisionStatus::Open);
+        // A heavier third vote for approve resolves it to approve.
+        vote("deploy/safe", "c", Some("approve"), 5, false);
+        let resolved = sm.decision_get("deploy/safe").unwrap();
+        assert_eq!(resolved.status, DecisionStatus::Resolved);
+        assert_eq!(resolved.winner.as_deref(), Some("approve"));
+
+        // A vote for an option outside the declared set is rejected.
+        let bad = vote("deploy/safe", "d", Some("maybe"), 1, false);
+        assert_eq!(bad.output["reason"], "unknown_option");
+
+        // Any veto aborts a separate decision.
+        propose("release/gate");
+        vote("release/gate", "compliance", None, 1, true);
+        assert_eq!(sm.decision_get("release/gate").unwrap().status, DecisionStatus::Vetoed);
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
