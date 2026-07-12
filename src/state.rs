@@ -999,6 +999,12 @@ impl StateMachine {
         self.store.lock().unwrap().counters.get(key).cloned()
     }
 
+    /// Read a barrier's current state, with its status derived at `now`.
+    pub fn barrier_get(&self, name: &str) -> Option<BarrierState> {
+        let store = self.store.lock().unwrap();
+        store.barriers.get(name).map(|record| record.view(name, now_ms()))
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
