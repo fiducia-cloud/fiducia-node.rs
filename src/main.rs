@@ -71,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v1 = Router::new()
         .route("/status", get(status))
         .nest("/kv", kv::router())
+        .nest("/counters", counters::router())
         .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())
