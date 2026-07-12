@@ -1868,6 +1868,11 @@ impl StateMachine {
         store.decisions.get(name).map(|record| record.view(name, now_ms()))
     }
 
+    /// Read a budget's ceiling, consumption, and reservations.
+    pub fn budget_get(&self, name: &str) -> Option<BudgetState> {
+        self.store.lock().unwrap().budgets.get(name).map(|record| record.view(name))
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
