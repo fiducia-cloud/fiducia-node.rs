@@ -1442,8 +1442,8 @@ impl BudgetRecord {
         BudgetState {
             name: name.to_string(),
             limit: self.limit,
-            reserved: self.committed_or_held_reserved(),
-            spent: self.total_spent(),
+            reserved: self.consumed(),
+            spent: self.spent(),
             available: self.available(),
             reservations,
             generation: self.generation,
