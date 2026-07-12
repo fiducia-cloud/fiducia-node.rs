@@ -671,6 +671,16 @@ impl StateMachine {
                 let existed = store.kv.remove(&key).is_some();
                 json!({ "ok": true, "deleted": existed, "revision": revision })
             }
+            Command::CounterAdd {
+                key,
+                delta,
+                prev_revision,
+            } => store.apply_counter_add(revision, key, delta, prev_revision),
+            Command::CounterSet {
+                key,
+                value,
+                prev_revision,
+            } => store.apply_counter_set(revision, key, value, prev_revision),
             Command::LockAcquire {
                 keys,
                 holder,
