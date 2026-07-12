@@ -1114,6 +1114,26 @@ impl StateMachine {
                 retryable,
             } => store.apply_task_fail(now, name, worker, fencing_token, retryable),
             Command::TaskCancel { name } => store.apply_task_cancel(name),
+            Command::EffectPrepare {
+                name,
+                effect_type,
+                payload,
+                risk,
+                idempotency_key,
+                required_approvals,
+            } => store.apply_effect_prepare(
+                name,
+                effect_type,
+                payload,
+                risk,
+                idempotency_key,
+                required_approvals,
+            ),
+            Command::EffectApprove { name, principal } => {
+                store.apply_effect_approve(name, principal)
+            }
+            Command::EffectCommit { name, result } => store.apply_effect_commit(name, result),
+            Command::EffectAbort { name } => store.apply_effect_abort(name),
             Command::LockAcquire {
                 keys,
                 holder,
