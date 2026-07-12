@@ -982,6 +982,37 @@ impl StateMachine {
                 weight,
                 veto,
             } => store.apply_barrier_arrive(now, name, participant, weight, veto),
+            Command::TaskCreate {
+                name,
+                task_type,
+                payload,
+                deadline_ms,
+            } => store.apply_task_create(name, task_type, payload, deadline_ms),
+            Command::TaskClaim {
+                name,
+                worker,
+                ttl_ms,
+            } => store.apply_task_claim(now, name, worker, ttl_ms),
+            Command::TaskProgress {
+                name,
+                worker,
+                fencing_token,
+                percent,
+                checkpoint,
+            } => store.apply_task_progress(now, name, worker, fencing_token, percent, checkpoint),
+            Command::TaskComplete {
+                name,
+                worker,
+                fencing_token,
+                result,
+            } => store.apply_task_complete(now, name, worker, fencing_token, result),
+            Command::TaskFail {
+                name,
+                worker,
+                fencing_token,
+                retryable,
+            } => store.apply_task_fail(now, name, worker, fencing_token, retryable),
+            Command::TaskCancel { name } => store.apply_task_cancel(name),
             Command::LockAcquire {
                 keys,
                 holder,
