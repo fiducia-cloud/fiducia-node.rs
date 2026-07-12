@@ -418,6 +418,7 @@ pub enum ReadResponse {
     KvPrefix(Vec<(String, KvEntry)>),
     Counter(Option<CounterEntry>),
     Barrier(Option<BarrierState>),
+    Task(Option<TaskState>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
