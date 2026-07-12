@@ -158,6 +158,11 @@ pub fn semaphore_acquire(
     Ok(())
 }
 
+/// Validate a counter mutation: a slash-safe key within the key size bound.
+pub fn counter(key: &str) -> Result<(), Rejection> {
+    check_str("counter key", key, MAX_KEY_BYTES, false)
+}
+
 /// Validate a service registration: name, instance id, address, TTL, metadata.
 pub fn service_register(
     service: &str,

@@ -50,8 +50,9 @@ use tokio::time::{Duration, Instant};
 
 use crate::persist::{Recovered, ShardStore};
 use crate::state::{
-    Command, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
-    LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState, ServiceInstance,
+    Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem, Leadership,
+    LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
+    ServiceInstance,
     ServiceSummary, StateMachine,
 };
 use crate::transport::{
@@ -357,6 +358,7 @@ pub enum ShardMsg {
 pub enum ReadRequest {
     Kv { key: String },
     KvPrefix { prefix: String },
+    Counter { key: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
@@ -391,6 +393,7 @@ impl ReadRequest {
     pub fn routing_key(&self) -> &str {
         match self {
             ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
+            ReadRequest::Counter { key } => key,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
@@ -410,6 +413,7 @@ impl ReadRequest {
 pub enum ReadResponse {
     Kv(Option<KvEntry>),
     KvPrefix(Vec<(String, KvEntry)>),
+    Counter(Option<CounterEntry>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
@@ -1503,6 +1507,9 @@ impl ShardActor {
             ReadRequest::KvPrefix { prefix } => {
                 Ok(ReadResponse::KvPrefix(self.state.kv_prefix(&prefix)))
             }
+            ReadRequest::Counter { key } => {
+                Ok(ReadResponse::Counter(self.state.counter_get(&key)))
+            }
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
@@ -1562,6 +1569,7 @@ impl ShardActor {
             // A single-key read arriving on the local path: serve it off applied
             // state too rather than erroring.
             ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
+            ReadRequest::Counter { key } => ReadResponse::Counter(self.state.counter_get(&key)),
             ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
             ReadRequest::Semaphore { key } => {
                 ReadResponse::Semaphore(self.state.semaphore_get(&key))

@@ -31,6 +31,23 @@ pub enum Command {
         key: String,
     },
 
+    // --- Distributed counters -------------------------------------------
+    /// Atomically add `delta` (which may be negative) to counter `key`, creating
+    /// it at 0 first. When `prev_revision` is set, the add is a compare-and-set:
+    /// it applies only if the counter's current `mod_revision` matches.
+    CounterAdd {
+        key: String,
+        delta: i64,
+        prev_revision: Option<u64>,
+    },
+    /// Set counter `key` to an absolute `value` (e.g. reset to 0). `prev_revision`
+    /// makes it a compare-and-set.
+    CounterSet {
+        key: String,
+        value: i64,
+        prev_revision: Option<u64>,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -240,6 +257,8 @@ impl Command {
             | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
+            | Command::CounterAdd { key, .. }
+            | Command::CounterSet { key, .. }
             | Command::RateLimitCheck { key, .. }
             | Command::IdempotencyClaim { key, .. }
             | Command::IdempotencyComplete { key, .. }
@@ -264,6 +283,8 @@ impl Command {
         match self {
             Command::KvPut { .. } => "kv.put",
             Command::KvDelete { .. } => "kv.delete",
+            Command::CounterAdd { .. } => "counter.add",
+            Command::CounterSet { .. } => "counter.set",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -322,6 +343,15 @@ pub struct KvEntry {
     pub value: String,
     pub mod_revision: u64,
     pub expires_at_ms: Option<u64>,
+}
+
+/// A distributed counter: a signed 64-bit value with a monotonic revision, used
+/// for success/failure thresholds, quotas, and fan-in tallies. Every mutation
+/// stamps `mod_revision`, so callers can compare-and-set against a known value.
+#[derive(Debug, Clone, Serialize)]
+pub struct CounterEntry {
+    pub value: i64,
+    pub mod_revision: u64,
 }
 
 /// Read view of one lock **member key**: who holds it, the whole set held with it
@@ -583,6 +613,7 @@ struct Store {
     revision: u64,
     next_fencing_token: u64,
     kv: HashMap<String, KvEntry>,
+    counters: HashMap<String, CounterEntry>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -640,6 +671,16 @@ impl StateMachine {
                 let existed = store.kv.remove(&key).is_some();
                 json!({ "ok": true, "deleted": existed, "revision": revision })
             }
+            Command::CounterAdd {
+                key,
+                delta,
+                prev_revision,
+            } => store.apply_counter_add(revision, key, delta, prev_revision),
+            Command::CounterSet {
+                key,
+                value,
+                prev_revision,
+            } => store.apply_counter_set(revision, key, value, prev_revision),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -796,6 +837,11 @@ impl StateMachine {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
         store.kv.get(key).cloned()
+    }
+
+    /// Read a counter's current value and revision. Counters do not expire.
+    pub fn counter_get(&self, key: &str) -> Option<CounterEntry> {
+        self.store.lock().unwrap().counters.get(key).cloned()
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -1056,6 +1102,71 @@ impl Store {
             },
         );
         json!({ "ok": true, "key": key, "revision": revision, "expires_at_ms": expires_at_ms })
+    }
+
+    fn apply_counter_add(
+        &mut self,
+        revision: u64,
+        key: String,
+        delta: i64,
+        prev_revision: Option<u64>,
+    ) -> Value {
+        let current = self.counters.get(&key);
+        let current_revision = current.map(|entry| entry.mod_revision).unwrap_or(0);
+        if let Some(expected) = prev_revision {
+            if current_revision != expected {
+                return json!({
+                    "ok": false,
+                    "reason": "cas_mismatch",
+                    "current_revision": current_revision,
+                    "revision": revision,
+                });
+            }
+        }
+        let value = current
+            .map(|entry| entry.value)
+            .unwrap_or(0)
+            .saturating_add(delta);
+        self.counters.insert(
+            key.clone(),
+            CounterEntry {
+                value,
+                mod_revision: revision,
+            },
+        );
+        json!({ "ok": true, "key": key, "value": value, "mod_revision": revision })
+    }
+
+    fn apply_counter_set(
+        &mut self,
+        revision: u64,
+        key: String,
+        value: i64,
+        prev_revision: Option<u64>,
+    ) -> Value {
+        let current_revision = self
+            .counters
+            .get(&key)
+            .map(|entry| entry.mod_revision)
+            .unwrap_or(0);
+        if let Some(expected) = prev_revision {
+            if current_revision != expected {
+                return json!({
+                    "ok": false,
+                    "reason": "cas_mismatch",
+                    "current_revision": current_revision,
+                    "revision": revision,
+                });
+            }
+        }
+        self.counters.insert(
+            key.clone(),
+            CounterEntry {
+                value,
+                mod_revision: revision,
+            },
+        );
+        json!({ "ok": true, "key": key, "value": value, "mod_revision": revision })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -2975,6 +3086,50 @@ mod tests {
         assert_eq!(stale.output["reason"], "cas_mismatch");
         assert_eq!(updated.output["ok"], true);
         assert_eq!(sm.kv_get("flags/new-checkout").unwrap().value, "off");
+    }
+
+    #[test]
+    fn counter_add_creates_accumulates_and_compare_and_sets() {
+        let sm = StateMachine::new();
+        // Absent counter is read as None (callers treat that as 0).
+        assert!(sm.counter_get("rollout/v2/failures").is_none());
+
+        // First add creates it at 0 then applies the delta.
+        let first = sm.apply(Command::CounterAdd {
+            key: "rollout/v2/failures".to_string(),
+            delta: 1,
+            prev_revision: None,
+        });
+        assert_eq!(first.output["ok"], true);
+        assert_eq!(first.output["value"], 1);
+
+        // A negative delta accumulates.
+        let second = sm.apply(Command::CounterAdd {
+            key: "rollout/v2/failures".to_string(),
+            delta: 4,
+            prev_revision: None,
+        });
+        assert_eq!(second.output["value"], 5);
+        let revision = second.output["mod_revision"].as_u64().unwrap();
+
+        // A compare-and-set add against a stale revision is rejected.
+        let stale = sm.apply(Command::CounterAdd {
+            key: "rollout/v2/failures".to_string(),
+            delta: 100,
+            prev_revision: Some(0),
+        });
+        assert_eq!(stale.output["ok"], false);
+        assert_eq!(stale.output["reason"], "cas_mismatch");
+        assert_eq!(sm.counter_get("rollout/v2/failures").unwrap().value, 5);
+
+        // Set with the correct revision resets it to 0.
+        let reset = sm.apply(Command::CounterSet {
+            key: "rollout/v2/failures".to_string(),
+            value: 0,
+            prev_revision: Some(revision),
+        });
+        assert_eq!(reset.output["ok"], true);
+        assert_eq!(sm.counter_get("rollout/v2/failures").unwrap().value, 0);
     }
 
     #[test]
