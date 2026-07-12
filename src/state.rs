@@ -839,6 +839,11 @@ impl StateMachine {
         store.kv.get(key).cloned()
     }
 
+    /// Read a counter's current value and revision. Counters do not expire.
+    pub fn counter_get(&self, key: &str) -> Option<CounterEntry> {
+        self.store.lock().unwrap().counters.get(key).cloned()
+    }
+
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let mut store = self.store.lock().unwrap();
         store.expire_due(now_ms());
