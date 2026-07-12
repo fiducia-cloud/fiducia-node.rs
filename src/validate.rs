@@ -238,6 +238,27 @@ pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// Validate a rate-limit `{tenant}` / `{key}` pair taken straight from the request
+/// path. Both come from untrusted URL segments and become long-lived limiter
+/// bucket keys, so reject empty, over-long, or control/whitespace-bearing values
+/// before they can grow the map unboundedly or forge cross-tenant bucket names.
+pub fn rate_limit(tenant: &str, key: &str) -> Result<(), Rejection> {
+    check_path_segment("tenant", tenant)?;
+    check_path_segment("key", key)?;
+    Ok(())
+}
+
+fn check_path_segment(label: &str, value: &str) -> Result<(), Rejection> {
+    check_str(label, value, MAX_RATE_LIMIT_SEGMENT_BYTES, false)?;
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(Rejection::new(
+            "invalid_field",
+            format!("{label} must not contain control or whitespace characters"),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a service registration: name, instance id, address, TTL, metadata.
 pub fn service_register(
     service: &str,
