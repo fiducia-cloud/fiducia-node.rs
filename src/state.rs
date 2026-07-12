@@ -283,6 +283,8 @@ impl Command {
         match self {
             Command::KvPut { .. } => "kv.put",
             Command::KvDelete { .. } => "kv.delete",
+            Command::CounterAdd { .. } => "counter.add",
+            Command::CounterSet { .. } => "counter.set",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
