@@ -207,6 +207,15 @@ pub fn budget(name: &str, reservation_id: Option<&str>, holder: Option<&str>) ->
     Ok(())
 }
 
+/// Validate a claim name plus an actor id (author/agent) when named.
+pub fn claim(name: &str, actor: Option<&str>) -> Result<(), Rejection> {
+    check_str("claim name", name, MAX_NAME_BYTES, false)?;
+    if let Some(actor) = actor {
+        check_str("actor", actor, MAX_HOLDER_BYTES, false)?;
+    }
+    Ok(())
+}
+
 /// Validate a decision name, and a voter id when the operation names one.
 pub fn decision(name: &str, voter: Option<&str>) -> Result<(), Rejection> {
     check_str("decision name", name, MAX_NAME_BYTES, false)?;

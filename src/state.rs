@@ -216,6 +216,42 @@ pub enum Command {
         reservation_id: String,
     },
 
+    // --- Claims (contestable ledger) ------------------------------------
+    /// Assert (or re-assert) a claim: a versioned subject/predicate/value with
+    /// confidence and evidence. Re-asserting bumps the version and resets it to
+    /// Asserted.
+    ClaimAssert {
+        name: String,
+        subject: String,
+        predicate: String,
+        value: Value,
+        confidence: f32,
+        author: String,
+        evidence: Vec<String>,
+        valid_until_ms: Option<u64>,
+    },
+    /// Record an agent's support for a claim.
+    ClaimSupport {
+        name: String,
+        agent: String,
+    },
+    /// Record an agent's contest of a claim, moving it to Contested.
+    ClaimContest {
+        name: String,
+        agent: String,
+        reason: String,
+    },
+    /// An authorized process accepts or rejects a claim (terminal).
+    ClaimResolve {
+        name: String,
+        accepted: bool,
+    },
+    /// Supersede a claim with a newer one (terminal), pointing to its successor.
+    ClaimSupersede {
+        name: String,
+        superseded_by: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -451,6 +487,11 @@ impl Command {
             | Command::BudgetReserve { name, .. }
             | Command::BudgetCommit { name, .. }
             | Command::BudgetRelease { name, .. } => name,
+            Command::ClaimAssert { name, .. }
+            | Command::ClaimSupport { name, .. }
+            | Command::ClaimContest { name, .. }
+            | Command::ClaimResolve { name, .. }
+            | Command::ClaimSupersede { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -493,6 +534,11 @@ impl Command {
             Command::BudgetReserve { .. } => "budget.reserve",
             Command::BudgetCommit { .. } => "budget.commit",
             Command::BudgetRelease { .. } => "budget.release",
+            Command::ClaimAssert { .. } => "claim.assert",
+            Command::ClaimSupport { .. } => "claim.support",
+            Command::ClaimContest { .. } => "claim.contest",
+            Command::ClaimResolve { .. } => "claim.resolve",
+            Command::ClaimSupersede { .. } => "claim.supersede",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -1488,6 +1534,96 @@ impl BudgetRecord {
     }
 }
 
+/// The lifecycle of a claim in the contestable ledger. Semantic similarity may
+/// surface a claim, but only an authorized resolution moves it to `Accepted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStatus {
+    Asserted,
+    Contested,
+    Accepted,
+    Rejected,
+    Superseded,
+}
+
+impl ClaimStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ClaimStatus::Accepted | ClaimStatus::Rejected | ClaimStatus::Superseded)
+    }
+}
+
+/// One agent's contest of a claim.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimContest {
+    pub agent: String,
+    pub reason: String,
+}
+
+/// Read view of a versioned, contestable claim.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimState {
+    pub name: String,
+    pub subject: String,
+    pub predicate: String,
+    pub value: Value,
+    pub confidence: f32,
+    pub author: String,
+    pub status: ClaimStatus,
+    pub supporters: Vec<String>,
+    pub contests: Vec<ClaimContest>,
+    pub evidence: Vec<String>,
+    pub valid_until_ms: Option<u64>,
+    pub superseded_by: Option<String>,
+    /// Bumped every time the asserted value changes.
+    pub version: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ClaimRecord {
+    subject: String,
+    predicate: String,
+    value: Value,
+    confidence: f32,
+    author: String,
+    status: ClaimStatus,
+    supporters: std::collections::BTreeSet<String>,
+    contests: std::collections::BTreeMap<String, String>,
+    evidence: Vec<String>,
+    valid_until_ms: Option<u64>,
+    superseded_by: Option<String>,
+    version: u64,
+    generation: u64,
+}
+
+impl ClaimRecord {
+    fn view(&self, name: &str) -> ClaimState {
+        ClaimState {
+            name: name.to_string(),
+            subject: self.subject.clone(),
+            predicate: self.predicate.clone(),
+            value: self.value.clone(),
+            confidence: self.confidence,
+            author: self.author.clone(),
+            status: self.status,
+            supporters: self.supporters.iter().cloned().collect(),
+            contests: self
+                .contests
+                .iter()
+                .map(|(agent, reason)| ClaimContest {
+                    agent: agent.clone(),
+                    reason: reason.clone(),
+                })
+                .collect(),
+            evidence: self.evidence.clone(),
+            valid_until_ms: self.valid_until_ms,
+            superseded_by: self.superseded_by.clone(),
+            version: self.version,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -1500,6 +1636,7 @@ struct Store {
     handoffs: HashMap<String, HandoffRecord>,
     decisions: HashMap<String, DecisionRecord>,
     budgets: HashMap<String, BudgetRecord>,
+    claims: HashMap<String, ClaimRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -1677,6 +1814,26 @@ impl StateMachine {
                 name,
                 reservation_id,
             } => store.apply_budget_release(name, reservation_id),
+            Command::ClaimAssert {
+                name,
+                subject,
+                predicate,
+                value,
+                confidence,
+                author,
+                evidence,
+                valid_until_ms,
+            } => store.apply_claim_assert(
+                name, subject, predicate, value, confidence, author, evidence, valid_until_ms,
+            ),
+            Command::ClaimSupport { name, agent } => store.apply_claim_support(name, agent),
+            Command::ClaimContest { name, agent, reason } => {
+                store.apply_claim_contest(name, agent, reason)
+            }
+            Command::ClaimResolve { name, accepted } => store.apply_claim_resolve(name, accepted),
+            Command::ClaimSupersede { name, superseded_by } => {
+                store.apply_claim_supersede(name, superseded_by)
+            }
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1871,6 +2028,11 @@ impl StateMachine {
     /// Read a budget's ceiling, consumption, and reservations.
     pub fn budget_get(&self, name: &str) -> Option<BudgetState> {
         self.store.lock().unwrap().budgets.get(name).map(|record| record.view(name))
+    }
+
+    /// Read a claim's current state.
+    pub fn claim_get(&self, name: &str) -> Option<ClaimState> {
+        self.store.lock().unwrap().claims.get(name).map(|record| record.view(name))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -2716,6 +2878,116 @@ impl Store {
         reservation.status = ReservationStatus::Released;
         record.generation += 1;
         json!({ "ok": true, "budget": record.view(&name) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_claim_assert(
+        &mut self,
+        name: String,
+        subject: String,
+        predicate: String,
+        value: Value,
+        confidence: f32,
+        author: String,
+        evidence: Vec<String>,
+        valid_until_ms: Option<u64>,
+    ) -> Value {
+        match self.claims.get_mut(&name) {
+            Some(record) if !record.status.is_terminal() => {
+                // Re-assertion by anyone updates the value and bumps the version,
+                // resetting support/contests for the new assertion.
+                record.subject = subject;
+                record.predicate = predicate;
+                record.value = value;
+                record.confidence = confidence;
+                record.author = author;
+                record.evidence = evidence;
+                record.valid_until_ms = valid_until_ms;
+                record.status = ClaimStatus::Asserted;
+                record.supporters.clear();
+                record.contests.clear();
+                record.version += 1;
+                record.generation += 1;
+                json!({ "ok": true, "created": false, "claim": record.view(&name) })
+            }
+            Some(record) => {
+                json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) })
+            }
+            None => {
+                let record = ClaimRecord {
+                    subject,
+                    predicate,
+                    value,
+                    confidence,
+                    author,
+                    status: ClaimStatus::Asserted,
+                    supporters: std::collections::BTreeSet::new(),
+                    contests: std::collections::BTreeMap::new(),
+                    evidence,
+                    valid_until_ms,
+                    superseded_by: None,
+                    version: 1,
+                    generation: 1,
+                };
+                let view = record.view(&name);
+                self.claims.insert(name, record);
+                json!({ "ok": true, "created": true, "claim": view })
+            }
+        }
+    }
+
+    fn apply_claim_support(&mut self, name: String, agent: String) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) });
+        }
+        record.supporters.insert(agent);
+        record.generation += 1;
+        json!({ "ok": true, "claim": record.view(&name) })
+    }
+
+    fn apply_claim_contest(&mut self, name: String, agent: String, reason: String) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) });
+        }
+        record.contests.insert(agent, reason);
+        record.status = ClaimStatus::Contested;
+        record.generation += 1;
+        json!({ "ok": true, "claim": record.view(&name) })
+    }
+
+    fn apply_claim_resolve(&mut self, name: String, accepted: bool) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) });
+        }
+        record.status = if accepted {
+            ClaimStatus::Accepted
+        } else {
+            ClaimStatus::Rejected
+        };
+        record.generation += 1;
+        json!({ "ok": true, "claim": record.view(&name) })
+    }
+
+    fn apply_claim_supersede(&mut self, name: String, superseded_by: String) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status == ClaimStatus::Superseded {
+            return json!({ "ok": true, "superseded": false, "claim": record.view(&name) });
+        }
+        record.status = ClaimStatus::Superseded;
+        record.superseded_by = Some(superseded_by);
+        record.generation += 1;
+        json!({ "ok": true, "superseded": true, "claim": record.view(&name) })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -5081,6 +5353,57 @@ mod tests {
             reservation_id: "b".to_string(),
         });
         assert_eq!(sm.budget_get("org/acme/wf/42").unwrap().available.usd_micros, Some(800_000));
+    }
+
+    #[test]
+    fn claim_is_contestable_versioned_and_authoritatively_resolved() {
+        let sm = StateMachine::new();
+        let name = "customer/219/refund_eligible".to_string();
+        let created = sm.apply(Command::ClaimAssert {
+            name: name.clone(),
+            subject: "customer:219".to_string(),
+            predicate: "eligible_for_refund".to_string(),
+            value: json!(true),
+            confidence: 0.91,
+            author: "billing-agent".to_string(),
+            evidence: vec!["ticket:88".to_string()],
+            valid_until_ms: None,
+        });
+        assert_eq!(created.output["created"], true);
+        assert_eq!(sm.claim_get(&name).unwrap().status, ClaimStatus::Asserted);
+
+        // Another agent supports, then a third contests it.
+        sm.apply(Command::ClaimSupport { name: name.clone(), agent: "audit-agent".to_string() });
+        sm.apply(Command::ClaimContest {
+            name: name.clone(),
+            agent: "fraud-agent".to_string(),
+            reason: "chargeback on file".to_string(),
+        });
+        let contested = sm.claim_get(&name).unwrap();
+        assert_eq!(contested.status, ClaimStatus::Contested);
+        assert_eq!(contested.supporters, vec!["audit-agent".to_string()]);
+        assert_eq!(contested.contests.len(), 1);
+
+        // Re-asserting a new value bumps the version and clears prior support.
+        let reasserted = sm.apply(Command::ClaimAssert {
+            name: name.clone(),
+            subject: "customer:219".to_string(),
+            predicate: "eligible_for_refund".to_string(),
+            value: json!(false),
+            confidence: 0.7,
+            author: "fraud-agent".to_string(),
+            evidence: vec!["chargeback:12".to_string()],
+            valid_until_ms: None,
+        });
+        assert_eq!(reasserted.output["claim"]["version"], 2);
+        assert_eq!(sm.claim_get(&name).unwrap().supporters.len(), 0);
+
+        // An authorized process resolves it (accepted, terminal). Further
+        // mutations are rejected.
+        sm.apply(Command::ClaimResolve { name: name.clone(), accepted: true });
+        assert_eq!(sm.claim_get(&name).unwrap().status, ClaimStatus::Accepted);
+        let late = sm.apply(Command::ClaimSupport { name: name.clone(), agent: "x".to_string() });
+        assert_eq!(late.output["reason"], "terminal");
     }
 
     #[test]

@@ -52,7 +52,7 @@ use crate::persist::{Recovered, ShardStore};
 use crate::state::{
     BarrierState, Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem,
     Leadership, LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
-    ServiceInstance, TaskState, EffectState, HandoffState, DecisionState, BudgetState,
+    ServiceInstance, TaskState, EffectState, HandoffState, DecisionState, BudgetState, ClaimState,
     ServiceSummary, StateMachine,
 };
 use crate::transport::{
@@ -365,6 +365,7 @@ pub enum ReadRequest {
     Handoff { name: String },
     Decision { name: String },
     Budget { name: String },
+    Claim { name: String },
     Lock { key: String },
     Semaphore { key: String },
     RateLimit { tenant: String, key: String },
@@ -400,7 +401,7 @@ impl ReadRequest {
         match self {
             ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
             ReadRequest::Counter { key } => key,
-            ReadRequest::Barrier { name } | ReadRequest::Task { name } | ReadRequest::Effect { name } | ReadRequest::Handoff { name } | ReadRequest::Decision { name } | ReadRequest::Budget { name } => name,
+            ReadRequest::Barrier { name } | ReadRequest::Task { name } | ReadRequest::Effect { name } | ReadRequest::Handoff { name } | ReadRequest::Decision { name } | ReadRequest::Budget { name } | ReadRequest::Claim { name } => name,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
@@ -427,6 +428,7 @@ pub enum ReadResponse {
     Handoff(Option<HandoffState>),
     Decision(Option<DecisionState>),
     Budget(Option<BudgetState>),
+    Claim(Option<ClaimState>),
     Lock(LockState),
     Semaphore(SemaphoreState),
     RateLimit(Option<RateLimitSnapshot>),
@@ -1531,6 +1533,7 @@ impl ShardActor {
             ReadRequest::Handoff { name } => Ok(ReadResponse::Handoff(self.state.handoff_get(&name))),
             ReadRequest::Decision { name } => Ok(ReadResponse::Decision(self.state.decision_get(&name))),
             ReadRequest::Budget { name } => Ok(ReadResponse::Budget(self.state.budget_get(&name))),
+            ReadRequest::Claim { name } => Ok(ReadResponse::Claim(self.state.claim_get(&name))),
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
             ReadRequest::Semaphore { key } => {
                 Ok(ReadResponse::Semaphore(self.state.semaphore_get(&key)))
@@ -1597,6 +1600,7 @@ impl ShardActor {
             ReadRequest::Handoff { name } => ReadResponse::Handoff(self.state.handoff_get(&name)),
             ReadRequest::Decision { name } => ReadResponse::Decision(self.state.decision_get(&name)),
             ReadRequest::Budget { name } => ReadResponse::Budget(self.state.budget_get(&name)),
+            ReadRequest::Claim { name } => ReadResponse::Claim(self.state.claim_get(&name)),
             ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
             ReadRequest::Semaphore { key } => {
                 ReadResponse::Semaphore(self.state.semaphore_get(&key))
