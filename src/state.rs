@@ -2619,6 +2619,100 @@ impl Store {
         json!({ "ok": true, "decision": record.view(&name, now) })
     }
 
+    fn apply_budget_set(&mut self, name: String, limit: BudgetAmount) -> Value {
+        let record = self.budgets.entry(name.clone()).or_insert_with(|| BudgetRecord {
+            limit,
+            reservations: std::collections::BTreeMap::new(),
+            generation: 0,
+        });
+        record.limit = limit;
+        record.generation += 1;
+        json!({ "ok": true, "budget": record.view(&name) })
+    }
+
+    fn apply_budget_reserve(
+        &mut self,
+        name: String,
+        reservation_id: String,
+        holder: String,
+        amount: BudgetAmount,
+    ) -> Value {
+        let Some(record) = self.budgets.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        // Reserving the same id twice is idempotent (returns the existing hold).
+        if record.reservations.contains_key(&reservation_id) {
+            return json!({ "ok": true, "reserved": false, "budget": record.view(&name) });
+        }
+        if !record.fits(&amount) {
+            return json!({ "ok": false, "reason": "insufficient_budget", "available": record.available(), "budget": record.view(&name) });
+        }
+        record.reservations.insert(
+            reservation_id,
+            ReservationRecord {
+                holder,
+                reserved: amount,
+                spent: BudgetAmount::zero(),
+                status: ReservationStatus::Held,
+            },
+        );
+        record.generation += 1;
+        json!({ "ok": true, "reserved": true, "budget": record.view(&name) })
+    }
+
+    fn apply_budget_commit(
+        &mut self,
+        name: String,
+        reservation_id: String,
+        actual: BudgetAmount,
+    ) -> Value {
+        let Some(record) = self.budgets.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        let Some(reservation) = record.reservations.get_mut(&reservation_id) else {
+            return json!({ "ok": false, "reason": "reservation_not_found" });
+        };
+        match reservation.status {
+            ReservationStatus::Committed => {
+                json!({ "ok": true, "committed": false, "budget": record.view(&name) })
+            }
+            ReservationStatus::Released => {
+                json!({ "ok": false, "reason": "released" })
+            }
+            ReservationStatus::Held => {
+                // Actual spend is capped at what was reserved on each axis.
+                let cap = |actual: Option<u64>, reserved: Option<u64>| match (actual, reserved) {
+                    (Some(a), Some(r)) => Some(a.min(r)),
+                    (Some(a), None) => Some(a),
+                    (None, _) => Some(0),
+                };
+                reservation.spent = BudgetAmount {
+                    usd_micros: cap(actual.usd_micros, reservation.reserved.usd_micros),
+                    tokens: cap(actual.tokens, reservation.reserved.tokens),
+                    tool_calls: cap(actual.tool_calls, reservation.reserved.tool_calls),
+                };
+                reservation.status = ReservationStatus::Committed;
+                record.generation += 1;
+                json!({ "ok": true, "committed": true, "budget": record.view(&name) })
+            }
+        }
+    }
+
+    fn apply_budget_release(&mut self, name: String, reservation_id: String) -> Value {
+        let Some(record) = self.budgets.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        let Some(reservation) = record.reservations.get_mut(&reservation_id) else {
+            return json!({ "ok": false, "reason": "reservation_not_found" });
+        };
+        if reservation.status == ReservationStatus::Committed {
+            return json!({ "ok": false, "reason": "already_committed", "budget": record.view(&name) });
+        }
+        reservation.status = ReservationStatus::Released;
+        record.generation += 1;
+        json!({ "ok": true, "budget": record.view(&name) })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
