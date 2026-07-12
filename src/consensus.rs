@@ -1576,6 +1576,7 @@ impl ShardActor {
             // state too rather than erroring.
             ReadRequest::Kv { key } => ReadResponse::Kv(self.state.kv_get(&key)),
             ReadRequest::Counter { key } => ReadResponse::Counter(self.state.counter_get(&key)),
+            ReadRequest::Barrier { name } => ReadResponse::Barrier(self.state.barrier_get(&name)),
             ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
             ReadRequest::Semaphore { key } => {
                 ReadResponse::Semaphore(self.state.semaphore_get(&key))
