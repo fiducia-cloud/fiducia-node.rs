@@ -112,11 +112,12 @@ pub async fn guard(request: Request, next: Next) -> Response {
 /// Pure authorization decision (kept separate from the HTTP middleware so it can
 /// be unit-tested without env/process state).
 ///
-/// * `expected = None`  → guard disabled, always allowed.
+/// * `expected = None`  → no secret configured: fail **closed** (reject) unless
+///   `allow_insecure` is set, which is the explicit local-dev opt-out.
 /// * `expected = Some`  → `provided` must be present and constant-time-equal.
-pub fn authorized(expected: Option<&str>, provided: Option<&str>) -> bool {
+pub fn authorized(expected: Option<&str>, provided: Option<&str>, allow_insecure: bool) -> bool {
     match expected {
-        None => true,
+        None => allow_insecure,
         Some(secret) => provided
             .map(|p| constant_time_eq(p.as_bytes(), secret.as_bytes()))
             .unwrap_or(false),
