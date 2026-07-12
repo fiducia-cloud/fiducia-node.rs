@@ -4086,6 +4086,64 @@ mod tests {
     }
 
     #[test]
+    fn effect_requires_approval_then_commits_exactly_once() {
+        let sm = StateMachine::new();
+        let name = "invoice-882/payment".to_string();
+        sm.apply(Command::EffectPrepare {
+            name: name.clone(),
+            effect_type: "send_payment".to_string(),
+            payload: json!({ "amount_usd": 500 }),
+            risk: "high".to_string(),
+            idempotency_key: "invoice-882:payment".to_string(),
+            required_approvals: 2,
+        });
+
+        // Cannot commit before it is approved.
+        let early = sm.apply(Command::EffectCommit {
+            name: name.clone(),
+            result: json!({}),
+        });
+        assert_eq!(early.output["ok"], false);
+        assert_eq!(early.output["reason"], "not_approved");
+
+        // One approval is not enough (requires 2), and a duplicate counts once.
+        sm.apply(Command::EffectApprove {
+            name: name.clone(),
+            principal: "finance-a".to_string(),
+        });
+        sm.apply(Command::EffectApprove {
+            name: name.clone(),
+            principal: "finance-a".to_string(),
+        });
+        assert_eq!(sm.effect_get(&name).unwrap().status, EffectStatus::Prepared);
+
+        // A second distinct approval moves it to Approved.
+        sm.apply(Command::EffectApprove {
+            name: name.clone(),
+            principal: "finance-b".to_string(),
+        });
+        assert_eq!(sm.effect_get(&name).unwrap().status, EffectStatus::Approved);
+
+        // First commit executes; a duplicate commit replays without re-executing.
+        let first = sm.apply(Command::EffectCommit {
+            name: name.clone(),
+            result: json!({ "confirmation": "pay_123" }),
+        });
+        assert_eq!(first.output["committed"], true);
+        let replay = sm.apply(Command::EffectCommit {
+            name: name.clone(),
+            result: json!({ "confirmation": "pay_999" }),
+        });
+        assert_eq!(replay.output["ok"], true);
+        assert_eq!(replay.output["committed"], false);
+        // The originally recorded result is preserved, not overwritten.
+        assert_eq!(
+            sm.effect_get(&name).unwrap().result.unwrap()["confirmation"],
+            "pay_123"
+        );
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
