@@ -2875,6 +2875,116 @@ impl Store {
         json!({ "ok": true, "budget": record.view(&name) })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_claim_assert(
+        &mut self,
+        name: String,
+        subject: String,
+        predicate: String,
+        value: Value,
+        confidence: f32,
+        author: String,
+        evidence: Vec<String>,
+        valid_until_ms: Option<u64>,
+    ) -> Value {
+        match self.claims.get_mut(&name) {
+            Some(record) if !record.status.is_terminal() => {
+                // Re-assertion by anyone updates the value and bumps the version,
+                // resetting support/contests for the new assertion.
+                record.subject = subject;
+                record.predicate = predicate;
+                record.value = value;
+                record.confidence = confidence;
+                record.author = author;
+                record.evidence = evidence;
+                record.valid_until_ms = valid_until_ms;
+                record.status = ClaimStatus::Asserted;
+                record.supporters.clear();
+                record.contests.clear();
+                record.version += 1;
+                record.generation += 1;
+                json!({ "ok": true, "created": false, "claim": record.view(&name) })
+            }
+            Some(record) => {
+                json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) })
+            }
+            None => {
+                let record = ClaimRecord {
+                    subject,
+                    predicate,
+                    value,
+                    confidence,
+                    author,
+                    status: ClaimStatus::Asserted,
+                    supporters: std::collections::BTreeSet::new(),
+                    contests: std::collections::BTreeMap::new(),
+                    evidence,
+                    valid_until_ms,
+                    superseded_by: None,
+                    version: 1,
+                    generation: 1,
+                };
+                let view = record.view(&name);
+                self.claims.insert(name, record);
+                json!({ "ok": true, "created": true, "claim": view })
+            }
+        }
+    }
+
+    fn apply_claim_support(&mut self, name: String, agent: String) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) });
+        }
+        record.supporters.insert(agent);
+        record.generation += 1;
+        json!({ "ok": true, "claim": record.view(&name) })
+    }
+
+    fn apply_claim_contest(&mut self, name: String, agent: String, reason: String) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) });
+        }
+        record.contests.insert(agent, reason);
+        record.status = ClaimStatus::Contested;
+        record.generation += 1;
+        json!({ "ok": true, "claim": record.view(&name) })
+    }
+
+    fn apply_claim_resolve(&mut self, name: String, accepted: bool) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "claim": record.view(&name) });
+        }
+        record.status = if accepted {
+            ClaimStatus::Accepted
+        } else {
+            ClaimStatus::Rejected
+        };
+        record.generation += 1;
+        json!({ "ok": true, "claim": record.view(&name) })
+    }
+
+    fn apply_claim_supersede(&mut self, name: String, superseded_by: String) -> Value {
+        let Some(record) = self.claims.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status == ClaimStatus::Superseded {
+            return json!({ "ok": true, "superseded": false, "claim": record.view(&name) });
+        }
+        record.status = ClaimStatus::Superseded;
+        record.superseded_by = Some(superseded_by);
+        record.generation += 1;
+        json!({ "ok": true, "superseded": true, "claim": record.view(&name) })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
