@@ -2048,6 +2048,72 @@ impl Store {
         json!({ "ok": true, "effect": record.view(&name) })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_handoff_offer(
+        &mut self,
+        now: u64,
+        name: String,
+        resource: String,
+        from: String,
+        to: String,
+        from_token: u64,
+        context: Value,
+        ttl_ms: u64,
+    ) -> Value {
+        // A pending offer for this name cannot be replaced; resolve it first.
+        if let Some(existing) = self.handoffs.get(&name) {
+            if existing.effective_status(now) == HandoffStatus::Offered {
+                return json!({ "ok": false, "reason": "already_offered", "handoff": existing.view(&name, now) });
+            }
+        }
+        let record = HandoffRecord {
+            resource,
+            from,
+            to,
+            from_token,
+            to_token: None,
+            status: HandoffStatus::Offered,
+            context,
+            expires_ms: Some(now.saturating_add(ttl_ms)),
+            generation: 1,
+        };
+        let view = record.view(&name, now);
+        self.handoffs.insert(name, record);
+        json!({ "ok": true, "handoff": view })
+    }
+
+    fn apply_handoff_accept(&mut self, now: u64, name: String, to: String) -> Value {
+        let token = self.next_token();
+        let Some(record) = self.handoffs.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.effective_status(now) != HandoffStatus::Offered {
+            return json!({ "ok": false, "reason": "not_offered", "handoff": record.view(&name, now) });
+        }
+        if record.to != to {
+            return json!({ "ok": false, "reason": "not_recipient", "handoff": record.view(&name, now) });
+        }
+        record.status = HandoffStatus::Accepted;
+        record.to_token = Some(token);
+        record.generation += 1;
+        json!({ "ok": true, "to_token": token, "handoff": record.view(&name, now) })
+    }
+
+    fn apply_handoff_reject(&mut self, now: u64, name: String, to: String) -> Value {
+        let Some(record) = self.handoffs.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.effective_status(now) != HandoffStatus::Offered {
+            return json!({ "ok": false, "reason": "not_offered", "handoff": record.view(&name, now) });
+        }
+        if record.to != to {
+            return json!({ "ok": false, "reason": "not_recipient", "handoff": record.view(&name, now) });
+        }
+        record.status = HandoffStatus::Rejected;
+        record.generation += 1;
+        json!({ "ok": true, "handoff": record.view(&name, now) })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
