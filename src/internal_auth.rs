@@ -52,6 +52,23 @@ pub fn secret() -> Option<&'static str> {
     configured().as_deref()
 }
 
+/// Whether the operator has explicitly opted out of the trust boundary for local
+/// dev via `FIDUCIA_ALLOW_INSECURE_INTERNAL` (`1`/`true`). Read once. This is the
+/// *only* way an unset secret is allowed to serve internal traffic; without it,
+/// an unset secret fails closed.
+static ALLOW_INSECURE: OnceLock<bool> = OnceLock::new();
+
+fn allow_insecure() -> bool {
+    *ALLOW_INSECURE.get_or_init(|| {
+        std::env::var("FIDUCIA_ALLOW_INSECURE_INTERNAL")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Force-initialize the secret and log the resulting posture once at startup, so
 /// an operator can see whether the node is enforcing the trust boundary.
 pub fn init_and_log() {
