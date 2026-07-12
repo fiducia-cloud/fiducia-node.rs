@@ -824,6 +824,18 @@ impl StateMachine {
                 value,
                 prev_revision,
             } => store.apply_counter_set(revision, key, value, prev_revision),
+            Command::BarrierCreate {
+                name,
+                policy,
+                expected,
+                deadline_ms,
+            } => store.apply_barrier_create(now, name, policy, expected, deadline_ms),
+            Command::BarrierArrive {
+                name,
+                participant,
+                weight,
+                veto,
+            } => store.apply_barrier_arrive(now, name, participant, weight, veto),
             Command::LockAcquire {
                 keys,
                 holder,
