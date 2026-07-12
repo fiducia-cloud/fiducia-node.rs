@@ -8,6 +8,7 @@
 //! The routing, consensus, state-machine primitives, replication, watches, and
 //! TTL expiry are implemented in the respective modules.
 
+mod barriers;
 mod consensus;
 mod counters;
 mod cron;
@@ -72,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/status", get(status))
         .nest("/kv", kv::router())
         .nest("/counters", counters::router())
+        .nest("/barriers", barriers::router())
         .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())

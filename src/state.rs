@@ -48,6 +48,25 @@ pub enum Command {
         prev_revision: Option<u64>,
     },
 
+    // --- Barriers (fan-in) ----------------------------------------------
+    /// Create (or reconfigure, if unmet) a named barrier with a resolution
+    /// policy. `expected` is the participant count for `all`/`any_veto`.
+    BarrierCreate {
+        name: String,
+        policy: BarrierPolicy,
+        expected: u32,
+        deadline_ms: Option<u64>,
+    },
+    /// Record a participant's arrival (or veto). Repeat arrivals by the same
+    /// participant are idempotent. Auto-creates an `all`-policy barrier if none
+    /// exists yet, so simple fan-ins need no explicit create.
+    BarrierArrive {
+        name: String,
+        participant: String,
+        weight: u64,
+        veto: bool,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -264,6 +283,7 @@ impl Command {
             | Command::IdempotencyComplete { key, .. }
             | Command::IdempotencyRenew { key, .. }
             | Command::IdempotencyAbandon { key, .. } => key,
+            Command::BarrierCreate { name, .. } | Command::BarrierArrive { name, .. } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -285,6 +305,8 @@ impl Command {
             Command::KvDelete { .. } => "kv.delete",
             Command::CounterAdd { .. } => "counter.add",
             Command::CounterSet { .. } => "counter.set",
+            Command::BarrierCreate { .. } => "barrier.create",
+            Command::BarrierArrive { .. } => "barrier.arrive",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -352,6 +374,126 @@ pub struct KvEntry {
 pub struct CounterEntry {
     pub value: i64,
     pub mod_revision: u64,
+}
+
+/// How a barrier decides it has resolved from its participants' arrivals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BarrierPolicy {
+    /// Every one of `expected` participants must arrive.
+    All,
+    /// Any `required` distinct participants suffice.
+    Quorum { required: u32 },
+    /// The first successful (non-veto) arrival resolves it.
+    FirstSuccess,
+    /// Every `expected` participant must arrive, but any veto aborts it.
+    AnyVeto,
+    /// Resolves at the deadline using whoever arrived (needs `deadline_ms`).
+    BestByDeadline,
+    /// Arrivals carry weights; resolves when their sum reaches `required_weight`.
+    WeightedQuorum { required_weight: u64 },
+}
+
+/// The lifecycle state of a barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarrierStatus {
+    Pending,
+    Satisfied,
+    Vetoed,
+    TimedOut,
+}
+
+impl BarrierStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, BarrierStatus::Pending)
+    }
+}
+
+/// One participant's arrival at a barrier.
+#[derive(Debug, Clone, Serialize)]
+pub struct BarrierArrival {
+    pub participant: String,
+    pub weight: u64,
+    pub veto: bool,
+    pub arrived_ms: u64,
+}
+
+/// Read view of a barrier: its policy, who has arrived, and whether it resolved.
+#[derive(Debug, Clone, Serialize)]
+pub struct BarrierState {
+    pub name: String,
+    pub policy: BarrierPolicy,
+    pub expected: u32,
+    pub deadline_ms: Option<u64>,
+    pub status: BarrierStatus,
+    pub arrivals: Vec<BarrierArrival>,
+    /// Distinct non-veto arrivals and their summed weight (the satisfaction tally).
+    pub arrived_count: u32,
+    pub arrived_weight: u64,
+}
+
+/// Internal barrier record: the durable facts (arrivals); status is derived.
+#[derive(Debug, Clone)]
+struct BarrierRecord {
+    policy: BarrierPolicy,
+    expected: u32,
+    deadline_ms: Option<u64>,
+    /// participant → arrival (a repeat arrival updates in place, so it is idempotent).
+    arrivals: HashMap<String, BarrierArrival>,
+}
+
+impl BarrierRecord {
+    /// Derive the barrier's status at time `now` from its arrivals. Monotonic:
+    /// once satisfied it stays satisfied as more participants arrive; a veto
+    /// under `AnyVeto` aborts; a passed deadline times out an unmet barrier.
+    fn status(&self, now: u64) -> BarrierStatus {
+        if matches!(self.policy, BarrierPolicy::AnyVeto)
+            && self.arrivals.values().any(|arrival| arrival.veto)
+        {
+            return BarrierStatus::Vetoed;
+        }
+        let count = self.arrivals.values().filter(|a| !a.veto).count() as u64;
+        let weight: u64 = self
+            .arrivals
+            .values()
+            .filter(|a| !a.veto)
+            .map(|a| a.weight)
+            .sum();
+        let deadline_passed = self.deadline_ms.is_some_and(|deadline| now >= deadline);
+
+        let met = match &self.policy {
+            BarrierPolicy::All | BarrierPolicy::AnyVeto => count >= self.expected as u64,
+            BarrierPolicy::Quorum { required } => count >= *required as u64,
+            BarrierPolicy::FirstSuccess => count >= 1,
+            BarrierPolicy::WeightedQuorum { required_weight } => weight >= *required_weight,
+            BarrierPolicy::BestByDeadline => deadline_passed && count >= 1,
+        };
+        if met {
+            BarrierStatus::Satisfied
+        } else if deadline_passed {
+            BarrierStatus::TimedOut
+        } else {
+            BarrierStatus::Pending
+        }
+    }
+
+    fn view(&self, name: &str, now: u64) -> BarrierState {
+        let mut arrivals: Vec<BarrierArrival> = self.arrivals.values().cloned().collect();
+        arrivals.sort_by(|a, b| a.arrived_ms.cmp(&b.arrived_ms).then(a.participant.cmp(&b.participant)));
+        let arrived_count = arrivals.iter().filter(|a| !a.veto).count() as u32;
+        let arrived_weight = arrivals.iter().filter(|a| !a.veto).map(|a| a.weight).sum();
+        BarrierState {
+            name: name.to_string(),
+            policy: self.policy.clone(),
+            expected: self.expected,
+            deadline_ms: self.deadline_ms,
+            status: self.status(now),
+            arrivals,
+            arrived_count,
+            arrived_weight,
+        }
+    }
 }
 
 /// Read view of one lock **member key**: who holds it, the whole set held with it
@@ -614,6 +756,7 @@ struct Store {
     next_fencing_token: u64,
     kv: HashMap<String, KvEntry>,
     counters: HashMap<String, CounterEntry>,
+    barriers: HashMap<String, BarrierRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -681,6 +824,18 @@ impl StateMachine {
                 value,
                 prev_revision,
             } => store.apply_counter_set(revision, key, value, prev_revision),
+            Command::BarrierCreate {
+                name,
+                policy,
+                expected,
+                deadline_ms,
+            } => store.apply_barrier_create(now, name, policy, expected, deadline_ms),
+            Command::BarrierArrive {
+                name,
+                participant,
+                weight,
+                veto,
+            } => store.apply_barrier_arrive(now, name, participant, weight, veto),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -842,6 +997,12 @@ impl StateMachine {
     /// Read a counter's current value and revision. Counters do not expire.
     pub fn counter_get(&self, key: &str) -> Option<CounterEntry> {
         self.store.lock().unwrap().counters.get(key).cloned()
+    }
+
+    /// Read a barrier's current state, with its status derived at `now`.
+    pub fn barrier_get(&self, name: &str) -> Option<BarrierState> {
+        let store = self.store.lock().unwrap();
+        store.barriers.get(name).map(|record| record.view(name, now_ms()))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -1167,6 +1328,71 @@ impl Store {
             },
         );
         json!({ "ok": true, "key": key, "value": value, "mod_revision": revision })
+    }
+
+    fn apply_barrier_create(
+        &mut self,
+        now: u64,
+        name: String,
+        policy: BarrierPolicy,
+        expected: u32,
+        deadline_ms: Option<u64>,
+    ) -> Value {
+        // Reconfigure only while still pending; a resolved barrier is immutable.
+        if self
+            .barriers
+            .get(&name)
+            .is_some_and(|record| record.status(now).is_terminal())
+        {
+            let view = self.barriers.get(&name).unwrap().view(&name, now);
+            return json!({ "ok": false, "reason": "already_resolved", "barrier": view });
+        }
+        let arrivals = self
+            .barriers
+            .remove(&name)
+            .map(|record| record.arrivals)
+            .unwrap_or_default();
+        let record = BarrierRecord {
+            policy,
+            expected,
+            deadline_ms,
+            arrivals,
+        };
+        let view = record.view(&name, now);
+        self.barriers.insert(name, record);
+        json!({ "ok": true, "barrier": view })
+    }
+
+    fn apply_barrier_arrive(
+        &mut self,
+        now: u64,
+        name: String,
+        participant: String,
+        weight: u64,
+        veto: bool,
+    ) -> Value {
+        // Auto-create a single-participant `all` barrier if none exists, so a
+        // plain fan-in needs no explicit create.
+        let record = self
+            .barriers
+            .entry(name.clone())
+            .or_insert_with(|| BarrierRecord {
+                policy: BarrierPolicy::All,
+                expected: 1,
+                deadline_ms: None,
+                arrivals: HashMap::new(),
+            });
+        record.arrivals.insert(
+            participant.clone(),
+            BarrierArrival {
+                participant,
+                weight,
+                veto,
+                arrived_ms: now,
+            },
+        );
+        let view = record.view(&name, now);
+        json!({ "ok": true, "resolved": view.status.is_terminal(), "barrier": view })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -3130,6 +3356,97 @@ mod tests {
         });
         assert_eq!(reset.output["ok"], true);
         assert_eq!(sm.counter_get("rollout/v2/failures").unwrap().value, 0);
+    }
+
+    #[test]
+    fn barrier_quorum_resolves_on_second_distinct_arrival() {
+        let sm = StateMachine::new();
+        sm.apply(Command::BarrierCreate {
+            name: "release/reviewers".to_string(),
+            policy: BarrierPolicy::Quorum { required: 2 },
+            expected: 3,
+            deadline_ms: None,
+        });
+        let first = sm.apply(Command::BarrierArrive {
+            name: "release/reviewers".to_string(),
+            participant: "reviewer-a".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        assert_eq!(first.output["resolved"], false);
+        // A repeat arrival by the same participant is idempotent (still 1 distinct).
+        let repeat = sm.apply(Command::BarrierArrive {
+            name: "release/reviewers".to_string(),
+            participant: "reviewer-a".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        assert_eq!(repeat.output["resolved"], false);
+        let second = sm.apply(Command::BarrierArrive {
+            name: "release/reviewers".to_string(),
+            participant: "reviewer-b".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        assert_eq!(second.output["resolved"], true);
+        assert_eq!(second.output["barrier"]["status"], "satisfied");
+        assert_eq!(second.output["barrier"]["arrived_count"], 2);
+    }
+
+    #[test]
+    fn barrier_any_veto_aborts() {
+        let sm = StateMachine::new();
+        sm.apply(Command::BarrierCreate {
+            name: "deploy/safety".to_string(),
+            policy: BarrierPolicy::AnyVeto,
+            expected: 2,
+            deadline_ms: None,
+        });
+        sm.apply(Command::BarrierArrive {
+            name: "deploy/safety".to_string(),
+            participant: "compliance".to_string(),
+            weight: 1,
+            veto: true,
+        });
+        assert_eq!(sm.barrier_get("deploy/safety").unwrap().status, BarrierStatus::Vetoed);
+    }
+
+    #[test]
+    fn barrier_weighted_quorum_sums_weights() {
+        let sm = StateMachine::new();
+        sm.apply(Command::BarrierCreate {
+            name: "vote".to_string(),
+            policy: BarrierPolicy::WeightedQuorum { required_weight: 5 },
+            expected: 0,
+            deadline_ms: None,
+        });
+        sm.apply(Command::BarrierArrive {
+            name: "vote".to_string(),
+            participant: "specialist".to_string(),
+            weight: 3,
+            veto: false,
+        });
+        assert_eq!(sm.barrier_get("vote").unwrap().status, BarrierStatus::Pending);
+        sm.apply(Command::BarrierArrive {
+            name: "vote".to_string(),
+            participant: "generalist".to_string(),
+            weight: 2,
+            veto: false,
+        });
+        assert_eq!(sm.barrier_get("vote").unwrap().status, BarrierStatus::Satisfied);
+    }
+
+    #[test]
+    fn barrier_arrive_auto_creates_single_participant_all() {
+        let sm = StateMachine::new();
+        let out = sm.apply(Command::BarrierArrive {
+            name: "adhoc".to_string(),
+            participant: "solo".to_string(),
+            weight: 1,
+            veto: false,
+        });
+        // Auto-created `all` with expected=1 → one arrival satisfies it.
+        assert_eq!(out.output["resolved"], true);
     }
 
     #[test]
