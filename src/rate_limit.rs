@@ -64,6 +64,9 @@ async fn get_limit(
     uri: Uri,
     Path((tenant, key)): Path<(String, String)>,
 ) -> Response {
+    if let Err(rejection) = crate::validate::rate_limit(&tenant, &key) {
+        return rejection.into_response();
+    }
     match node
         .query(ReadRequest::RateLimit {
             tenant: tenant.clone(),
