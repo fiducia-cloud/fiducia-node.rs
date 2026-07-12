@@ -329,6 +329,12 @@ impl Command {
             | Command::IdempotencyRenew { key, .. }
             | Command::IdempotencyAbandon { key, .. } => key,
             Command::BarrierCreate { name, .. } | Command::BarrierArrive { name, .. } => name,
+            Command::TaskCreate { name, .. }
+            | Command::TaskClaim { name, .. }
+            | Command::TaskProgress { name, .. }
+            | Command::TaskComplete { name, .. }
+            | Command::TaskFail { name, .. }
+            | Command::TaskCancel { name } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
