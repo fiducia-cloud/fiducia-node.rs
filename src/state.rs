@@ -2089,16 +2089,22 @@ impl Store {
     }
 
     fn apply_handoff_accept(&mut self, now: u64, name: String, to: String) -> Value {
+        // Validate against an immutable borrow first, so a rejected accept does
+        // not consume a fencing token.
+        match self.handoffs.get(&name) {
+            None => return json!({ "ok": false, "reason": "not_found" }),
+            Some(record) if record.effective_status(now) != HandoffStatus::Offered => {
+                return json!({ "ok": false, "reason": "not_offered", "handoff": record.view(&name, now) })
+            }
+            Some(record) if record.to != to => {
+                return json!({ "ok": false, "reason": "not_recipient", "handoff": record.view(&name, now) })
+            }
+            _ => {}
+        }
+        // A single monotonic counter mints every fencing token, and `from` holds
+        // one minted earlier, so this is strictly higher than `from_token`.
         let token = self.next_token();
-        let Some(record) = self.handoffs.get_mut(&name) else {
-            return json!({ "ok": false, "reason": "not_found" });
-        };
-        if record.effective_status(now) != HandoffStatus::Offered {
-            return json!({ "ok": false, "reason": "not_offered", "handoff": record.view(&name, now) });
-        }
-        if record.to != to {
-            return json!({ "ok": false, "reason": "not_recipient", "handoff": record.view(&name, now) });
-        }
+        let record = self.handoffs.get_mut(&name).expect("handoff present");
         record.status = HandoffStatus::Accepted;
         record.to_token = Some(token);
         record.generation += 1;
