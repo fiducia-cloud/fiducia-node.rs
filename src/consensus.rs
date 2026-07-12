@@ -393,6 +393,7 @@ impl ReadRequest {
     pub fn routing_key(&self) -> &str {
         match self {
             ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
+            ReadRequest::Counter { key } => key,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
