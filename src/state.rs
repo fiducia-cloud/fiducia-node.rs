@@ -5036,6 +5036,54 @@ mod tests {
     }
 
     #[test]
+    fn budget_reservations_cannot_oversubscribe_and_commit_frees_the_difference() {
+        let sm = StateMachine::new();
+        // A $1.00 (1_000_000 micros) workflow budget, unlimited tokens/tool_calls.
+        sm.apply(Command::BudgetSet {
+            name: "org/acme/wf/42".to_string(),
+            limit: BudgetAmount {
+                usd_micros: Some(1_000_000),
+                tokens: None,
+                tool_calls: None,
+            },
+        });
+        let reserve = |id: &str, usd: u64| {
+            sm.apply(Command::BudgetReserve {
+                name: "org/acme/wf/42".to_string(),
+                reservation_id: id.to_string(),
+                holder: format!("agent-{id}"),
+                amount: BudgetAmount { usd_micros: Some(usd), tokens: None, tool_calls: None },
+            })
+        };
+
+        // Two agents each reserve $0.60 — the second cannot oversubscribe the $1.00.
+        assert_eq!(reserve("a", 600_000).output["reserved"], true);
+        let denied = reserve("b", 600_000);
+        assert_eq!(denied.output["ok"], false);
+        assert_eq!(denied.output["reason"], "insufficient_budget");
+
+        // Agent A actually spends only $0.20; committing frees the other $0.40.
+        sm.apply(Command::BudgetCommit {
+            name: "org/acme/wf/42".to_string(),
+            reservation_id: "a".to_string(),
+            actual: BudgetAmount { usd_micros: Some(200_000), tokens: None, tool_calls: None },
+        });
+        let budget = sm.budget_get("org/acme/wf/42").unwrap();
+        assert_eq!(budget.spent.usd_micros, Some(200_000));
+        assert_eq!(budget.available.usd_micros, Some(800_000));
+
+        // Now agent B's $0.60 reservation fits.
+        assert_eq!(reserve("b", 600_000).output["reserved"], true);
+
+        // Releasing an uncommitted reservation returns its headroom.
+        sm.apply(Command::BudgetRelease {
+            name: "org/acme/wf/42".to_string(),
+            reservation_id: "b".to_string(),
+        });
+        assert_eq!(sm.budget_get("org/acme/wf/42").unwrap().available.usd_micros, Some(800_000));
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
