@@ -364,6 +364,10 @@ impl Command {
             | Command::TaskComplete { name, .. }
             | Command::TaskFail { name, .. }
             | Command::TaskCancel { name } => name,
+            Command::EffectPrepare { name, .. }
+            | Command::EffectApprove { name, .. }
+            | Command::EffectCommit { name, .. }
+            | Command::EffectAbort { name } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
