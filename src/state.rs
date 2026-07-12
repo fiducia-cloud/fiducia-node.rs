@@ -67,6 +67,51 @@ pub enum Command {
         veto: bool,
     },
 
+    // --- Durable tasks --------------------------------------------------
+    /// Create a durable task if it does not already exist. Idempotent: a repeat
+    /// create returns the existing task unchanged.
+    TaskCreate {
+        name: String,
+        task_type: String,
+        payload: Value,
+        deadline_ms: Option<u64>,
+    },
+    /// Claim a pending (or lease-expired) task, minting a fresh fencing token and
+    /// an ownership lease. An actively owned task is not re-granted.
+    TaskClaim {
+        name: String,
+        worker: String,
+        ttl_ms: u64,
+    },
+    /// Report progress and a checkpoint, renewing the lease. Rejected unless the
+    /// caller presents the current owner + fencing token.
+    TaskProgress {
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        percent: u32,
+        checkpoint: Value,
+    },
+    /// Complete a task with a durable result. Requires the current fencing token.
+    TaskComplete {
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        result: Value,
+    },
+    /// Fail a task. `retryable` returns it to Pending for reassignment; otherwise
+    /// it ends Failed. Requires the current fencing token.
+    TaskFail {
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        retryable: bool,
+    },
+    /// Cancel a task (terminal), regardless of owner.
+    TaskCancel {
+        name: String,
+    },
+
     // --- Mutual-exclusion locks (multi-key UNION) -------------------------
     /// Acquire a lock over the **union** of `keys` atomically (all-or-nothing):
     /// the grant conflicts with anyone holding *any* of those keys, and is queued
@@ -284,6 +329,12 @@ impl Command {
             | Command::IdempotencyRenew { key, .. }
             | Command::IdempotencyAbandon { key, .. } => key,
             Command::BarrierCreate { name, .. } | Command::BarrierArrive { name, .. } => name,
+            Command::TaskCreate { name, .. }
+            | Command::TaskClaim { name, .. }
+            | Command::TaskProgress { name, .. }
+            | Command::TaskComplete { name, .. }
+            | Command::TaskFail { name, .. }
+            | Command::TaskCancel { name } => name,
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
@@ -307,6 +358,12 @@ impl Command {
             Command::CounterSet { .. } => "counter.set",
             Command::BarrierCreate { .. } => "barrier.create",
             Command::BarrierArrive { .. } => "barrier.arrive",
+            Command::TaskCreate { .. } => "task.create",
+            Command::TaskClaim { .. } => "task.claim",
+            Command::TaskProgress { .. } => "task.progress",
+            Command::TaskComplete { .. } => "task.complete",
+            Command::TaskFail { .. } => "task.fail",
+            Command::TaskCancel { .. } => "task.cancel",
             Command::LockAcquire { .. } => "lock.acquire",
             Command::LockRelease { .. } => "lock.release",
             Command::SemaphoreAcquire { .. } => "semaphore.acquire",
@@ -750,6 +807,94 @@ pub struct ServiceInstance {
     pub metadata: HashMap<String, String>,
 }
 
+/// The lifecycle of a durable task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    Claimed,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+    }
+}
+
+/// Read view of a durable task: a claimable unit of work whose exclusive owner
+/// holds a fencing token. Progress/complete/fail must present that token, so a
+/// stale worker that lost the claim cannot commit newer state.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskState {
+    pub name: String,
+    pub task_type: String,
+    pub payload: Value,
+    pub status: TaskStatus,
+    pub owner: Option<String>,
+    pub fencing_token: u64,
+    pub progress: u32,
+    pub checkpoint: Value,
+    pub result: Option<Value>,
+    pub lease_expires_ms: Option<u64>,
+    pub deadline_ms: Option<u64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TaskRecord {
+    task_type: String,
+    payload: Value,
+    status: TaskStatus,
+    owner: Option<String>,
+    fencing_token: u64,
+    lease_ttl_ms: u64,
+    lease_expires_ms: Option<u64>,
+    progress: u32,
+    checkpoint: Value,
+    result: Option<Value>,
+    deadline_ms: Option<u64>,
+    generation: u64,
+}
+
+impl TaskRecord {
+    /// A task is claimable when it is not terminal and either unowned/pending or
+    /// its owner's lease has expired (so abandoned work is reassigned).
+    fn claimable(&self, now: u64) -> bool {
+        !self.status.is_terminal()
+            && (self.status == TaskStatus::Pending
+                || self.lease_expires_ms.is_none_or(|expires| expires <= now))
+    }
+
+    /// True when `worker` holds the current, unexpired claim under `token`.
+    fn owned_now(&self, now: u64, worker: &str, token: u64) -> bool {
+        !self.status.is_terminal()
+            && self.owner.as_deref() == Some(worker)
+            && self.fencing_token == token
+            && self.lease_expires_ms.is_some_and(|expires| expires > now)
+    }
+
+    fn view(&self, name: &str) -> TaskState {
+        TaskState {
+            name: name.to_string(),
+            task_type: self.task_type.clone(),
+            payload: self.payload.clone(),
+            status: self.status,
+            owner: self.owner.clone(),
+            fencing_token: self.fencing_token,
+            progress: self.progress,
+            checkpoint: self.checkpoint.clone(),
+            result: self.result.clone(),
+            lease_expires_ms: self.lease_expires_ms,
+            deadline_ms: self.deadline_ms,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     revision: u64,
@@ -757,6 +902,7 @@ struct Store {
     kv: HashMap<String, KvEntry>,
     counters: HashMap<String, CounterEntry>,
     barriers: HashMap<String, BarrierRecord>,
+    tasks: HashMap<String, TaskRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
     rate_limits: HashMap<String, RateLimitRecord>,
@@ -836,6 +982,37 @@ impl StateMachine {
                 weight,
                 veto,
             } => store.apply_barrier_arrive(now, name, participant, weight, veto),
+            Command::TaskCreate {
+                name,
+                task_type,
+                payload,
+                deadline_ms,
+            } => store.apply_task_create(name, task_type, payload, deadline_ms),
+            Command::TaskClaim {
+                name,
+                worker,
+                ttl_ms,
+            } => store.apply_task_claim(now, name, worker, ttl_ms),
+            Command::TaskProgress {
+                name,
+                worker,
+                fencing_token,
+                percent,
+                checkpoint,
+            } => store.apply_task_progress(now, name, worker, fencing_token, percent, checkpoint),
+            Command::TaskComplete {
+                name,
+                worker,
+                fencing_token,
+                result,
+            } => store.apply_task_complete(now, name, worker, fencing_token, result),
+            Command::TaskFail {
+                name,
+                worker,
+                fencing_token,
+                retryable,
+            } => store.apply_task_fail(now, name, worker, fencing_token, retryable),
+            Command::TaskCancel { name } => store.apply_task_cancel(name),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1003,6 +1180,11 @@ impl StateMachine {
     pub fn barrier_get(&self, name: &str) -> Option<BarrierState> {
         let store = self.store.lock().unwrap();
         store.barriers.get(name).map(|record| record.view(name, now_ms()))
+    }
+
+    /// Read a durable task's current state.
+    pub fn task_get(&self, name: &str) -> Option<TaskState> {
+        self.store.lock().unwrap().tasks.get(name).map(|record| record.view(name))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -1393,6 +1575,145 @@ impl Store {
         );
         let view = record.view(&name, now);
         json!({ "ok": true, "resolved": view.status.is_terminal(), "barrier": view })
+    }
+
+    fn apply_task_create(
+        &mut self,
+        name: String,
+        task_type: String,
+        payload: Value,
+        deadline_ms: Option<u64>,
+    ) -> Value {
+        if let Some(existing) = self.tasks.get(&name) {
+            return json!({ "ok": true, "created": false, "task": existing.view(&name) });
+        }
+        let record = TaskRecord {
+            task_type,
+            payload,
+            status: TaskStatus::Pending,
+            owner: None,
+            fencing_token: 0,
+            lease_ttl_ms: 0,
+            lease_expires_ms: None,
+            progress: 0,
+            checkpoint: Value::Null,
+            result: None,
+            deadline_ms,
+            generation: 1,
+        };
+        let view = record.view(&name);
+        self.tasks.insert(name, record);
+        json!({ "ok": true, "created": true, "task": view })
+    }
+
+    fn apply_task_claim(&mut self, now: u64, name: String, worker: String, ttl_ms: u64) -> Value {
+        let token = self.next_token();
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "task": record.view(&name) });
+        }
+        if !record.claimable(now) {
+            return json!({
+                "ok": false,
+                "reason": "already_claimed",
+                "owner": record.owner,
+                "task": record.view(&name),
+            });
+        }
+        record.owner = Some(worker);
+        record.fencing_token = token;
+        record.lease_ttl_ms = ttl_ms;
+        record.lease_expires_ms = Some(now.saturating_add(ttl_ms));
+        record.status = TaskStatus::Claimed;
+        record.generation += 1;
+        json!({ "ok": true, "fencing_token": token, "task": record.view(&name) })
+    }
+
+    fn apply_task_progress(
+        &mut self,
+        now: u64,
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        percent: u32,
+        checkpoint: Value,
+    ) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if !record.owned_now(now, &worker, fencing_token) {
+            return json!({ "ok": false, "reason": "fenced", "task": record.view(&name) });
+        }
+        record.status = TaskStatus::Running;
+        record.progress = percent.min(100);
+        record.checkpoint = checkpoint;
+        record.lease_expires_ms = Some(now.saturating_add(record.lease_ttl_ms));
+        record.generation += 1;
+        json!({ "ok": true, "task": record.view(&name) })
+    }
+
+    fn apply_task_complete(
+        &mut self,
+        now: u64,
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        result: Value,
+    ) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if !record.owned_now(now, &worker, fencing_token) {
+            return json!({ "ok": false, "reason": "fenced", "task": record.view(&name) });
+        }
+        record.status = TaskStatus::Completed;
+        record.progress = 100;
+        record.result = Some(result);
+        record.lease_expires_ms = None;
+        record.generation += 1;
+        json!({ "ok": true, "task": record.view(&name) })
+    }
+
+    fn apply_task_fail(
+        &mut self,
+        now: u64,
+        name: String,
+        worker: String,
+        fencing_token: u64,
+        retryable: bool,
+    ) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if !record.owned_now(now, &worker, fencing_token) {
+            return json!({ "ok": false, "reason": "fenced", "task": record.view(&name) });
+        }
+        if retryable {
+            // Return to the claimable pool for another worker.
+            record.status = TaskStatus::Pending;
+            record.owner = None;
+            record.lease_expires_ms = None;
+        } else {
+            record.status = TaskStatus::Failed;
+        }
+        record.generation += 1;
+        json!({ "ok": true, "retryable": retryable, "task": record.view(&name) })
+    }
+
+    fn apply_task_cancel(&mut self, name: String) -> Value {
+        let Some(record) = self.tasks.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        if record.status.is_terminal() {
+            return json!({ "ok": false, "reason": "terminal", "task": record.view(&name) });
+        }
+        record.status = TaskStatus::Cancelled;
+        record.owner = None;
+        record.lease_expires_ms = None;
+        record.generation += 1;
+        json!({ "ok": true, "task": record.view(&name) })
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
@@ -3447,6 +3768,107 @@ mod tests {
         });
         // Auto-created `all` with expected=1 → one arrival satisfies it.
         assert_eq!(out.output["resolved"], true);
+    }
+
+    #[test]
+    fn task_claim_is_exclusive_and_fences_stale_workers() {
+        let sm = StateMachine::new();
+        let task = "repo/acme/api/issue/482".to_string();
+        sm.apply(Command::TaskCreate {
+            name: task.clone(),
+            task_type: "implement".to_string(),
+            payload: json!({ "issue": 482 }),
+            deadline_ms: None,
+        });
+
+        // Worker A claims and receives a fencing token.
+        let claim = sm.apply(Command::TaskClaim {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            ttl_ms: 60_000,
+        });
+        assert_eq!(claim.output["ok"], true);
+        let token = claim.output["fencing_token"].as_u64().unwrap();
+
+        // Worker B cannot claim an actively-owned task.
+        let contended = sm.apply(Command::TaskClaim {
+            name: task.clone(),
+            worker: "agent-b".to_string(),
+            ttl_ms: 60_000,
+        });
+        assert_eq!(contended.output["ok"], false);
+        assert_eq!(contended.output["reason"], "already_claimed");
+
+        // A progress write with the wrong (stale) token is fenced.
+        let stale = sm.apply(Command::TaskProgress {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            fencing_token: token + 1,
+            percent: 50,
+            checkpoint: json!({}),
+        });
+        assert_eq!(stale.output["ok"], false);
+        assert_eq!(stale.output["reason"], "fenced");
+
+        // The current token holder makes progress, then completes.
+        sm.apply(Command::TaskProgress {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            fencing_token: token,
+            percent: 50,
+            checkpoint: json!({ "step": "coded" }),
+        });
+        let done = sm.apply(Command::TaskComplete {
+            name: task.clone(),
+            worker: "agent-a".to_string(),
+            fencing_token: token,
+            result: json!({ "pr": 991 }),
+        });
+        assert_eq!(done.output["ok"], true);
+        assert_eq!(sm.task_get(&task).unwrap().status, TaskStatus::Completed);
+
+        // A claim on a completed task is rejected as terminal.
+        let after = sm.apply(Command::TaskClaim {
+            name: task,
+            worker: "agent-c".to_string(),
+            ttl_ms: 1_000,
+        });
+        assert_eq!(after.output["reason"], "terminal");
+    }
+
+    #[test]
+    fn task_retryable_failure_returns_to_the_claimable_pool() {
+        let sm = StateMachine::new();
+        sm.apply(Command::TaskCreate {
+            name: "backfill".to_string(),
+            task_type: "job".to_string(),
+            payload: Value::Null,
+            deadline_ms: None,
+        });
+        let token = sm
+            .apply(Command::TaskClaim {
+                name: "backfill".to_string(),
+                worker: "w1".to_string(),
+                ttl_ms: 60_000,
+            })
+            .output["fencing_token"]
+            .as_u64()
+            .unwrap();
+        sm.apply(Command::TaskFail {
+            name: "backfill".to_string(),
+            worker: "w1".to_string(),
+            fencing_token: token,
+            retryable: true,
+        });
+        // Back to Pending, so another worker can claim it (with a higher token).
+        assert_eq!(sm.task_get("backfill").unwrap().status, TaskStatus::Pending);
+        let reclaim = sm.apply(Command::TaskClaim {
+            name: "backfill".to_string(),
+            worker: "w2".to_string(),
+            ttl_ms: 60_000,
+        });
+        assert_eq!(reclaim.output["ok"], true);
+        assert!(reclaim.output["fencing_token"].as_u64().unwrap() > token);
     }
 
     #[test]

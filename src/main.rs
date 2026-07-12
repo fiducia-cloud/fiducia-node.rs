@@ -28,6 +28,7 @@ mod schedule;
 mod schedule_runner;
 mod semaphore;
 mod state;
+mod tasks;
 mod transport;
 mod validate;
 
@@ -74,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/kv", kv::router())
         .nest("/counters", counters::router())
         .nest("/barriers", barriers::router())
+        .nest("/tasks", tasks::router())
         .nest("/idempotency", idempotency::router())
         .nest("/locks", locks::router())
         .nest("/semaphores", semaphore::router())

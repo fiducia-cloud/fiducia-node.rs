@@ -174,6 +174,15 @@ pub fn barrier_arrive(name: &str, participant: &str) -> Result<(), Rejection> {
     check_str("participant", participant, MAX_HOLDER_BYTES, false)
 }
 
+/// Validate a task name, and a worker id when the operation names one.
+pub fn task(name: &str, worker: Option<&str>) -> Result<(), Rejection> {
+    check_str("task name", name, MAX_NAME_BYTES, false)?;
+    if let Some(worker) = worker {
+        check_str("worker", worker, MAX_HOLDER_BYTES, false)?;
+    }
+    Ok(())
+}
+
 /// Validate a service registration: name, instance id, address, TTL, metadata.
 pub fn service_register(
     service: &str,
