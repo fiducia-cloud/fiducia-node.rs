@@ -5356,6 +5356,57 @@ mod tests {
     }
 
     #[test]
+    fn claim_is_contestable_versioned_and_authoritatively_resolved() {
+        let sm = StateMachine::new();
+        let name = "customer/219/refund_eligible".to_string();
+        let created = sm.apply(Command::ClaimAssert {
+            name: name.clone(),
+            subject: "customer:219".to_string(),
+            predicate: "eligible_for_refund".to_string(),
+            value: json!(true),
+            confidence: 0.91,
+            author: "billing-agent".to_string(),
+            evidence: vec!["ticket:88".to_string()],
+            valid_until_ms: None,
+        });
+        assert_eq!(created.output["created"], true);
+        assert_eq!(sm.claim_get(&name).unwrap().status, ClaimStatus::Asserted);
+
+        // Another agent supports, then a third contests it.
+        sm.apply(Command::ClaimSupport { name: name.clone(), agent: "audit-agent".to_string() });
+        sm.apply(Command::ClaimContest {
+            name: name.clone(),
+            agent: "fraud-agent".to_string(),
+            reason: "chargeback on file".to_string(),
+        });
+        let contested = sm.claim_get(&name).unwrap();
+        assert_eq!(contested.status, ClaimStatus::Contested);
+        assert_eq!(contested.supporters, vec!["audit-agent".to_string()]);
+        assert_eq!(contested.contests.len(), 1);
+
+        // Re-asserting a new value bumps the version and clears prior support.
+        let reasserted = sm.apply(Command::ClaimAssert {
+            name: name.clone(),
+            subject: "customer:219".to_string(),
+            predicate: "eligible_for_refund".to_string(),
+            value: json!(false),
+            confidence: 0.7,
+            author: "fraud-agent".to_string(),
+            evidence: vec!["chargeback:12".to_string()],
+            valid_until_ms: None,
+        });
+        assert_eq!(reasserted.output["claim"]["version"], 2);
+        assert_eq!(sm.claim_get(&name).unwrap().supporters.len(), 0);
+
+        // An authorized process resolves it (accepted, terminal). Further
+        // mutations are rejected.
+        sm.apply(Command::ClaimResolve { name: name.clone(), accepted: true });
+        assert_eq!(sm.claim_get(&name).unwrap().status, ClaimStatus::Accepted);
+        let late = sm.apply(Command::ClaimSupport { name: name.clone(), agent: "x".to_string() });
+        assert_eq!(late.output["reason"], "terminal");
+    }
+
+    #[test]
     fn kv_prefix_lists_matching_keys_in_order() {
         let sm = StateMachine::new();
         for (key, value) in [
