@@ -2331,6 +2331,68 @@ impl Store {
         json!({ "ok": true, "handoff": record.view(&name, now) })
     }
 
+    fn apply_decision_propose(
+        &mut self,
+        now: u64,
+        name: String,
+        question: String,
+        options: Vec<String>,
+        policy: DecisionPolicy,
+        deadline_ms: Option<u64>,
+    ) -> Value {
+        if let Some(existing) = self.decisions.get(&name) {
+            return json!({ "ok": true, "created": false, "decision": existing.view(&name, now) });
+        }
+        let record = DecisionRecord {
+            question,
+            options,
+            policy,
+            votes: std::collections::BTreeMap::new(),
+            deadline_ms,
+            generation: 1,
+        };
+        let view = record.view(&name, now);
+        self.decisions.insert(name, record);
+        json!({ "ok": true, "created": true, "decision": view })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_decision_vote(
+        &mut self,
+        now: u64,
+        name: String,
+        voter: String,
+        option: Option<String>,
+        confidence: f32,
+        weight: u64,
+        veto: bool,
+        evidence: Vec<String>,
+    ) -> Value {
+        let Some(record) = self.decisions.get_mut(&name) else {
+            return json!({ "ok": false, "reason": "not_found" });
+        };
+        // A vote for an option outside the declared set is rejected (abstain and
+        // veto need no option).
+        if let Some(choice) = &option {
+            if !record.options.contains(choice) {
+                return json!({ "ok": false, "reason": "unknown_option", "decision": record.view(&name, now) });
+            }
+        }
+        // Re-voting replaces the voter's prior vote (idempotent per voter).
+        record.votes.insert(
+            voter,
+            DecisionVoteRecord {
+                option,
+                confidence,
+                weight,
+                veto,
+                evidence,
+            },
+        );
+        record.generation += 1;
+        json!({ "ok": true, "decision": record.view(&name, now) })
+    }
+
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
     fn apply_lock_acquire(
         &mut self,
