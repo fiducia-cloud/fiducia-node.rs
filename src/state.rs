@@ -949,7 +949,7 @@ pub struct Schedule {
 }
 
 /// Lifecycle of one fire's delivery, recorded durably in the schedule's history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// Claimed and being delivered (or interrupted before the result was recorded).
