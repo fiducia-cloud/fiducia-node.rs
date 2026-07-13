@@ -244,6 +244,15 @@ pub struct LogEntry {
     pub term: u64,
     /// 1-based position in the shard's log.
     pub index: u64,
+    /// The proposing leader's wall clock (epoch ms) when it appended this entry,
+    /// kept monotonically non-decreasing along the log. This is the **only**
+    /// time the state machine sees: applying at the committed stamp instead of
+    /// the local clock keeps replicas identical and stops a restart replay from
+    /// refreshing (resurrecting) long-expired leases. `0` marks an entry written
+    /// before stamping existed; those replay with the local clock (the old
+    /// behaviour) until compaction folds them into a snapshot.
+    #[serde(default)]
+    pub ts_ms: u64,
     /// The state-machine command, or `None` for a leader-election no-op.
     pub command: Option<Command>,
 }
