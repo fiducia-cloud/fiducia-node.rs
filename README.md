@@ -468,7 +468,7 @@ The source build is intentionally closed over immutable inputs:
   builder; Cargo build, clippy, and test commands use the committed lockfile.
 - CI and Docker resolve `fiducia-interfaces` at
   `5f2c5279ee19941024455b2843256872485bac82` and `fiducia-routing.rs` at
-  `30b65cddec7227d038ee804682dba6d37e62f5f7`. The image build verifies each
+  `1615b208d3765df1f69f0b3ec26180b263ef7aad`. The image build verifies each
   fetched checkout before compiling instead of following either repository's
   moving `main` branch.
 - GitHub Actions use full commit SHAs. CI installs cargo-audit 0.21.2 from its
