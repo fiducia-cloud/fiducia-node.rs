@@ -122,7 +122,7 @@ const OPAQUE_FIELDS: &[&str] = &[
 fn unscope_value(org: &OrgScope, value: &mut Value, identity: bool) -> bool {
     match value {
         Value::String(text) if identity => {
-            if text.starts_with(DELIM) {
+            if text.starts_with(fiducia_routing::ORG_SCOPE_DELIM) {
                 let Some(caller_value) = org.unscope(text) else {
                     return false;
                 };
@@ -172,11 +172,19 @@ fn reject(code: &str, detail: &str) -> Response {
 }
 
 /// Paths under `/v1` that are node introspection, not tenant data, and so do not
-/// require an org. Matched against the full request path.
+/// require an org. The middleware is layered on the router that gets **nested**
+/// under `/v1`, so at match time the request path has the `/v1` prefix already
+/// stripped ("/status", not "/v1/status") — match both forms so the exemption
+/// can't silently die if the mounting ever changes.
 fn is_exempt(path: &str) -> bool {
     matches!(
         path,
-        "/v1/status" | "/v1/observe/shards" | "/v1/observe/metrics"
+        "/status"
+            | "/observe/shards"
+            | "/observe/metrics"
+            | "/v1/status"
+            | "/v1/observe/shards"
+            | "/v1/observe/metrics"
     )
 }
 
