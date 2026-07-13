@@ -960,7 +960,7 @@ pub enum RunStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleRun {
     pub fire_id: String,
     pub fired_at_ms: u64,
