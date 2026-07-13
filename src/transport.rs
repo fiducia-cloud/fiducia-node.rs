@@ -59,6 +59,34 @@ pub struct AppendEntriesResp {
     pub match_index: u64,
 }
 
+/// `InstallSnapshot` — the leader ships its whole applied state to a follower
+/// whose `next_index` fell behind the leader's compacted log base (the entries
+/// the follower needs no longer exist as log entries anywhere).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReq {
+    /// Leader's term.
+    pub term: u64,
+    /// Leader id (its addressable node id) so followers can redirect clients.
+    pub leader_id: String,
+    /// Log index the snapshot covers through (inclusive).
+    pub last_included_index: u64,
+    /// Term of the entry at `last_included_index`.
+    pub last_included_term: u64,
+    /// The serialized state machine at `last_included_index`
+    /// (see `StateMachine::snapshot`).
+    pub data: serde_json::Value,
+}
+
+/// Reply to [`InstallSnapshotReq`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResp {
+    /// Follower's `current_term` (lets a stale leader discover it must step down).
+    pub term: u64,
+    /// Whether the follower's state now covers `last_included_index` (installed,
+    /// or it was already at/past that point).
+    pub success: bool,
+}
+
 /// `RequestVote` — a candidate solicits a vote for one shard's Raft group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteReq {
