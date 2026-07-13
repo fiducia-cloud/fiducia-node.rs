@@ -797,6 +797,15 @@ impl ShardActor {
                 let out = self.handle_request_vote(req);
                 let _ = resp.send(out);
             }
+            ShardMsg::InstallSnapshot { req, resp } => {
+                let out = self.handle_install_snapshot(req);
+                let _ = resp.send(out);
+            }
+            ShardMsg::SnapshotReply {
+                from,
+                last_included,
+                resp,
+            } => self.handle_snapshot_reply(from, last_included, resp),
             ShardMsg::VoteReply {
                 from,
                 pre_vote,
