@@ -659,3 +659,116 @@ async fn live_coordination_primitives_smoke() -> TestResult {
 
     Ok(())
 }
+
+/// End-to-end coverage of the higher-level coordination primitives — counters,
+/// barriers, tasks, effects, handoffs, decisions, budgets, and claims — driving
+/// each guarantee through the live HTTP → Raft → apply → read path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set FIDUCIA_LIVE_BASE_URL to a deployed fiducia-load-balance or fiducia-node HTTP endpoint"]
+async fn live_higher_level_primitives_smoke() -> TestResult {
+    let Some(base) = live_base_url() else {
+        eprintln!("skipping live smoke: FIDUCIA_LIVE_BASE_URL is not set");
+        return Ok(());
+    };
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let p = unique_prefix();
+    let post = Method::POST;
+    let get = Method::GET;
+
+    // --- counters: accumulate + compare-and-set + read-after-write ---
+    let ckey = format!("{p}/failures");
+    let r = call(&client, &base, post.clone(), "/v1/counters/add", Some(json!({"key": ckey, "delta": 3}))).await?;
+    assert_eq!(r["value"], 3, "counter add");
+    let r = call(&client, &base, post.clone(), "/v1/counters/add", Some(json!({"key": ckey, "delta": -1}))).await?;
+    assert_eq!(r["value"], 2, "counter accumulates");
+    let r = call(&client, &base, post.clone(), "/v1/counters/add", Some(json!({"key": ckey, "delta": 100, "prev_revision": 0}))).await?;
+    assert_eq!(r["reason"], "cas_mismatch", "stale CAS rejected");
+    let r = call(&client, &base, get.clone(), &format!("/v1/counters?key={ckey}"), None).await?;
+    assert_eq!(r["counter"]["value"], 2, "counter read-after-write");
+
+    // --- barriers: quorum resolves on distinct arrivals; duplicates idempotent ---
+    let bname = format!("{p}/panel");
+    call(&client, &base, post.clone(), "/v1/barriers/create", Some(json!({"name": bname, "policy": {"kind": "quorum", "required": 2}, "expected": 3}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/barriers/arrive", Some(json!({"name": bname, "participant": "a"}))).await?;
+    assert_eq!(r["resolved"], false, "1/2 pending");
+    call(&client, &base, post.clone(), "/v1/barriers/arrive", Some(json!({"name": bname, "participant": "a"}))).await?; // duplicate
+    let r = call(&client, &base, post.clone(), "/v1/barriers/arrive", Some(json!({"name": bname, "participant": "b"}))).await?;
+    assert_eq!(r["barrier"]["status"], "satisfied", "2nd distinct arrival resolves");
+
+    // --- tasks: exclusive claim + stale-token fencing ---
+    let tname = format!("{p}/issue-482");
+    call(&client, &base, post.clone(), "/v1/tasks/create", Some(json!({"name": tname, "task_type": "impl"}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/tasks/claim", Some(json!({"name": tname, "worker": "agent-a", "ttl_ms": 60000}))).await?;
+    let tok = r["fencing_token"].as_u64().expect("fencing token");
+    let r = call(&client, &base, post.clone(), "/v1/tasks/claim", Some(json!({"name": tname, "worker": "agent-b"}))).await?;
+    assert_eq!(r["reason"], "already_claimed", "second claim rejected");
+    let r = call(&client, &base, post.clone(), "/v1/tasks/progress", Some(json!({"name": tname, "worker": "agent-a", "fencing_token": tok + 999, "percent": 50}))).await?;
+    assert_eq!(r["reason"], "fenced", "stale token fenced");
+    let r = call(&client, &base, post.clone(), "/v1/tasks/complete", Some(json!({"name": tname, "worker": "agent-a", "fencing_token": tok, "result": {"pr": 1}}))).await?;
+    assert_eq!(r["task"]["status"], "completed", "current token completes");
+
+    // --- effects: approval gate + exactly-once commit (replay) ---
+    let ename = format!("{p}/pay");
+    call(&client, &base, post.clone(), "/v1/effects/prepare", Some(json!({"name": ename, "effect_type": "send_payment", "idempotency_key": ename, "required_approvals": 2}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/effects/commit", Some(json!({"name": ename, "result": {}}))).await?;
+    assert_eq!(r["reason"], "not_approved", "commit before approval rejected");
+    call(&client, &base, post.clone(), "/v1/effects/approve", Some(json!({"name": ename, "principal": "finance-a"}))).await?;
+    call(&client, &base, post.clone(), "/v1/effects/approve", Some(json!({"name": ename, "principal": "finance-a"}))).await?; // dup
+    call(&client, &base, post.clone(), "/v1/effects/approve", Some(json!({"name": ename, "principal": "finance-b"}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/effects/commit", Some(json!({"name": ename, "result": {"c": "ok1"}}))).await?;
+    assert_eq!(r["committed"], true, "first commit executes");
+    let r = call(&client, &base, post.clone(), "/v1/effects/commit", Some(json!({"name": ename, "result": {"c": "ok2"}}))).await?;
+    assert_eq!(r["committed"], false, "duplicate commit replays");
+    let r = call(&client, &base, get.clone(), &format!("/v1/effects?name={ename}"), None).await?;
+    assert_eq!(r["effect"]["result"]["c"], "ok1", "original result preserved");
+
+    // --- handoffs: atomic transfer, strictly higher to_token ---
+    let hres = format!("{p}/ticket");
+    call(&client, &base, post.clone(), "/v1/tasks/create", Some(json!({"name": hres, "task_type": "research"}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/tasks/claim", Some(json!({"name": hres, "worker": "research-agent"}))).await?;
+    let ftok = r["fencing_token"].as_u64().expect("from token");
+    let hname = format!("{p}/ho");
+    call(&client, &base, post.clone(), "/v1/handoffs/offer", Some(json!({"name": hname, "resource": format!("task:{hres}"), "from": "research-agent", "to": "legal-agent", "from_token": ftok}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/handoffs/accept", Some(json!({"name": hname, "to": "wrong"}))).await?;
+    assert_eq!(r["reason"], "not_recipient", "only recipient accepts");
+    let r = call(&client, &base, post.clone(), "/v1/handoffs/accept", Some(json!({"name": hname, "to": "legal-agent"}))).await?;
+    assert!(r["to_token"].as_u64().unwrap() > ftok, "accept mints strictly higher token");
+
+    // --- decisions: weighted plurality + unknown-option rejection ---
+    let dname = format!("{p}/deploy");
+    call(&client, &base, post.clone(), "/v1/decisions/propose", Some(json!({"name": dname, "question": "safe?", "options": ["approve", "reject"], "policy": {"kind": "plurality", "min_votes": 3}}))).await?;
+    call(&client, &base, post.clone(), "/v1/decisions/vote", Some(json!({"name": dname, "voter": "a", "option": "approve", "weight": 1}))).await?;
+    call(&client, &base, post.clone(), "/v1/decisions/vote", Some(json!({"name": dname, "voter": "b", "option": "reject", "weight": 1}))).await?;
+    let r = call(&client, &base, get.clone(), &format!("/v1/decisions?name={dname}"), None).await?;
+    assert_eq!(r["decision"]["status"], "open", "open below min_votes");
+    call(&client, &base, post.clone(), "/v1/decisions/vote", Some(json!({"name": dname, "voter": "c", "option": "approve", "weight": 5}))).await?;
+    let r = call(&client, &base, get.clone(), &format!("/v1/decisions?name={dname}"), None).await?;
+    assert_eq!(r["decision"]["winner"], "approve", "resolves to heaviest option");
+    let r = call(&client, &base, post.clone(), "/v1/decisions/vote", Some(json!({"name": dname, "voter": "d", "option": "maybe"}))).await?;
+    assert_eq!(r["reason"], "unknown_option", "unknown option rejected");
+
+    // --- budgets: no oversubscribe; commit frees the difference ---
+    let gname = format!("{p}/wf");
+    call(&client, &base, post.clone(), "/v1/budgets/set", Some(json!({"name": gname, "limit": {"usd_micros": 1000000}}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/budgets/reserve", Some(json!({"name": gname, "reservation_id": "a", "holder": "agent-a", "amount": {"usd_micros": 600000}}))).await?;
+    assert_eq!(r["reserved"], true, "first reservation ok");
+    let r = call(&client, &base, post.clone(), "/v1/budgets/reserve", Some(json!({"name": gname, "reservation_id": "b", "holder": "agent-b", "amount": {"usd_micros": 600000}}))).await?;
+    assert_eq!(r["reason"], "insufficient_budget", "cannot oversubscribe");
+    call(&client, &base, post.clone(), "/v1/budgets/commit", Some(json!({"name": gname, "reservation_id": "a", "actual": {"usd_micros": 200000}}))).await?;
+    let r = call(&client, &base, get.clone(), &format!("/v1/budgets?name={gname}"), None).await?;
+    assert_eq!(r["budget"]["available"]["usd_micros"], 800000, "commit frees the difference");
+
+    // --- claims: contest → re-assert version bump → authoritative resolve ---
+    let clname = format!("{p}/refund");
+    call(&client, &base, post.clone(), "/v1/claims/assert", Some(json!({"name": clname, "subject": "customer:219", "predicate": "refund_eligible", "value": true, "author": "billing"}))).await?;
+    call(&client, &base, post.clone(), "/v1/claims/support", Some(json!({"name": clname, "agent": "audit"}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/claims/contest", Some(json!({"name": clname, "agent": "fraud", "reason": "chargeback"}))).await?;
+    assert_eq!(r["claim"]["status"], "contested", "contest → contested");
+    let r = call(&client, &base, post.clone(), "/v1/claims/assert", Some(json!({"name": clname, "subject": "customer:219", "predicate": "refund_eligible", "value": false, "author": "fraud"}))).await?;
+    assert_eq!(r["claim"]["version"], 2, "re-assert bumps version");
+    call(&client, &base, post.clone(), "/v1/claims/resolve", Some(json!({"name": clname, "accepted": true}))).await?;
+    let r = call(&client, &base, post.clone(), "/v1/claims/support", Some(json!({"name": clname, "agent": "late"}))).await?;
+    assert_eq!(r["reason"], "terminal", "resolved claim is terminal");
+
+    Ok(())
+}
