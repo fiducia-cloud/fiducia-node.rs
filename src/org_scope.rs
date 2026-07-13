@@ -114,6 +114,7 @@ pub async fn require_org(mut request: Request, next: Next) -> Response {
 /// Extractor: pull the validated [`OrgScope`] a handler runs under. Infallible in
 /// practice because [`require_org`] runs first on every non-exempt `/v1` route;
 /// a missing scope (a route mounted without the middleware) is a 500 config bug.
+#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for OrgScope {
     type Rejection = Response;
 
