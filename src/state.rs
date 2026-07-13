@@ -878,7 +878,7 @@ pub enum IdempotencyStatus {
 /// in-flight `lease_expires_ms` (so an abandoned claim frees the key quickly);
 /// `complete` then extends `lease_expires_ms` by `retention_ms` so a `Completed`
 /// record — and its replayable result — survives for the full retention window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     pub key: String,
     pub owner: String,
