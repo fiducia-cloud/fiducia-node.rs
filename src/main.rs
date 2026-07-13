@@ -26,6 +26,7 @@ mod kv;
 mod locks;
 mod metrics;
 mod observe;
+mod org_scope;
 mod persist;
 mod raft_api;
 mod rate_limit;
