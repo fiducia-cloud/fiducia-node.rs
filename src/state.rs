@@ -2232,12 +2232,12 @@ impl StateMachine {
     /// the keyspace). Serializable read off applied state; callers fan this out
     /// across shards and merge.
     pub fn kv_list(&self, prefix: &str) -> Vec<KvListItem> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         store
             .kv
             .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
+            .filter(|(key, entry)| key.starts_with(prefix) && kv_live(entry, now))
             .map(|(key, entry)| KvListItem {
                 key: key.clone(),
                 entry: entry.clone(),
