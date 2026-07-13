@@ -155,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_state(node)
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(MAX_PEER_BODY_BYTES))
         .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
