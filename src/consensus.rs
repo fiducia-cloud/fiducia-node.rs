@@ -1277,6 +1277,76 @@ impl ShardActor {
         }
     }
 
+    /// Ship the current applied state to a follower whose `next_index` fell
+    /// behind the compacted log base. Snapshots at `last_applied` (always ≥ the
+    /// base, and exact because apply is sequential inside this actor), so the
+    /// follower lands as close to the tail as we can put it.
+    fn send_snapshot_to(&mut self, peer: &str) {
+        let last_included = self.last_applied;
+        let req = InstallSnapshotReq {
+            term: self.current_term,
+            leader_id: self.node_id.clone(),
+            last_included_index: last_included,
+            last_included_term: self.term_at(last_included),
+            data: self.state.snapshot(),
+        };
+        let Some(ls) = self.leader.as_mut() else {
+            return;
+        };
+        ls.in_flight.insert(peer.to_string(), true);
+
+        let transport = self.transport.clone();
+        let self_tx = self.self_tx.clone();
+        let shard = self.shard_id;
+        let peer_owned = peer.to_string();
+        tokio::spawn(async move {
+            let resp = transport.install_snapshot(&peer_owned, shard, req).await;
+            let _ = self_tx
+                .send(ShardMsg::SnapshotReply {
+                    from: peer_owned,
+                    last_included,
+                    resp,
+                })
+                .await;
+        });
+    }
+
+    fn handle_snapshot_reply(
+        &mut self,
+        from: String,
+        last_included: u64,
+        resp: Option<InstallSnapshotResp>,
+    ) {
+        if let Some(ls) = self.leader.as_mut() {
+            ls.in_flight.insert(from.clone(), false);
+        }
+        let Some(resp) = resp else {
+            return; // peer unreachable; retry next heartbeat tick
+        };
+        if resp.term > self.current_term {
+            self.step_down(resp.term, None);
+            return;
+        }
+        if self.role != Role::Leader || resp.term != self.current_term {
+            return;
+        }
+        if let Some(ls) = self.leader.as_mut() {
+            // Any reply at our term is proof of contact (leader lease).
+            ls.last_contact.insert(from.clone(), Instant::now());
+            if resp.success {
+                let matched = ls.match_index.entry(from.clone()).or_default();
+                *matched = (*matched).max(last_included);
+                ls.next_index.insert(from.clone(), last_included + 1);
+            }
+        }
+        if resp.success {
+            self.maybe_advance_commit();
+            self.refresh_follower_lag_metric();
+            // Continue with the log tail beyond the snapshot.
+            self.send_append_to(&from);
+        }
+    }
+
     /// Advance `commit_index` to the highest index replicated on a majority that
     /// is **from the current term** (Raft's commit rule), then apply.
     fn maybe_advance_commit(&mut self) {
