@@ -357,6 +357,7 @@ pub enum ShardMsg {
 /// across every hosted shard by [`Node::query_kv_prefix`].
 pub enum ReadRequest {
     Kv { key: String },
+    #[allow(dead_code)]
     KvPrefix { prefix: String },
     Counter { key: String },
     Barrier { name: String },
@@ -420,6 +421,7 @@ impl ReadRequest {
 #[derive(Debug)]
 pub enum ReadResponse {
     Kv(Option<KvEntry>),
+    #[allow(dead_code)]
     KvPrefix(Vec<(String, KvEntry)>),
     Counter(Option<CounterEntry>),
     Barrier(Option<BarrierState>),
@@ -548,6 +550,7 @@ struct ShardActor {
 }
 
 impl ShardActor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         shard_id: ShardId,
         node_id: String,
@@ -1838,6 +1841,7 @@ impl Node {
 
     /// Query every hosted shard for entries under a prefix and merge the partial
     /// results in deterministic key order.
+    #[allow(dead_code)]
     pub async fn query_kv_prefix(
         &self,
         prefix: String,

@@ -3569,6 +3569,7 @@ impl Store {
         json!({ "abandoned": true, "key": key, "revision": revision })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_schedule_upsert(
         &mut self,
         name: String,
