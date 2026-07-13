@@ -666,7 +666,7 @@ pub struct BarrierState {
 }
 
 /// Internal barrier record: the durable facts (arrivals); status is derived.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BarrierRecord {
     policy: BarrierPolicy,
     expected: u32,
