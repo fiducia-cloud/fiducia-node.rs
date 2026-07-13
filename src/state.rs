@@ -2049,6 +2049,22 @@ impl StateMachine {
         self.store.lock().unwrap().revision
     }
 
+    /// Serialize the entire applied state, for a Raft snapshot taken at a known
+    /// applied index. The caller (the shard actor) is single-threaded per shard,
+    /// so the snapshot is exactly the state at `last_applied`.
+    pub fn snapshot(&self) -> Value {
+        serde_json::to_value(&*self.store.lock().unwrap()).unwrap_or(Value::Null)
+    }
+
+    /// Replace the applied state with a previously-taken [`Self::snapshot`] —
+    /// boot recovery from a compacted log, or an `InstallSnapshot` from the
+    /// leader. On a parse error the current state is left untouched.
+    pub fn restore(&self, snapshot: Value) -> Result<(), serde_json::Error> {
+        let store: Store = serde_json::from_value(snapshot)?;
+        *self.store.lock().unwrap() = store;
+        Ok(())
+    }
+
     // Reads are **pure**: they filter expired state at view time (local wall
     // clock) but never mutate the store. Actual removal — and, crucially, waiter
     // promotion, which mints fencing tokens — happens only in `apply_at`'s
