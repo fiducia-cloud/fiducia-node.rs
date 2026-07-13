@@ -2592,6 +2592,10 @@ pub struct ShardStatus {
     /// is apply lag.
     pub last_applied: u64,
     pub last_log_index: u64,
+    /// Index of the last log entry folded into the state-machine snapshot by
+    /// compaction (0 = nothing compacted). Live log length is
+    /// `last_log_index - snapshot_base_index`.
+    pub snapshot_base_index: u64,
     /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
     pub healthy_replicas: usize,
     /// Whether a majority of the group is caught up — i.e. the shard can survive
