@@ -1026,7 +1026,7 @@ pub struct TaskState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskRecord {
     task_type: String,
     payload: Value,
