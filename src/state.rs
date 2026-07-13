@@ -891,7 +891,7 @@ pub struct IdempotencyRecord {
     /// retention window without the state machine reading the wall clock.
     pub retention_ms: u64,
     pub metadata: HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
 }
 
