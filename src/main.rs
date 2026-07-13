@@ -62,6 +62,18 @@ const SERVICE: &str = "fiducia-node";
 /// `watch` streams and blocking lock acquires are long-lived by design.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Body cap for the **peer** plane (`/raft`). Unlike a client write, an
+/// `InstallSnapshot` carries an entire shard's state-machine image and an
+/// `AppendEntries` can carry the whole retained log suffix (up to the
+/// compaction threshold of entries, each holding a near-`MAX_BODY_BYTES`
+/// value). Capping peers at `MAX_BODY_BYTES` would make a follower that fell
+/// behind unrecoverable the moment a shard's state outgrew 1 MiB: every
+/// snapshot install would 413 and replication would stall forever. Peers are
+/// authenticated by the internal-secret guard (which rejects before reading
+/// the body), so the larger cap is not exposed to untrusted callers; it still
+/// bounds a misbehaving peer.
+const MAX_PEER_BODY_BYTES: usize = 256 * 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
@@ -226,5 +238,35 @@ mod interface_contract_tests {
             ProposeErrorReason::NotLeader,
             ProposeErrorReason::NotLeader
         ));
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use std::sync::Arc;
+
+    use axum::{body::to_bytes, response::Response};
+
+    use crate::consensus::{Node, NodeConfig};
+    use crate::transport::{LoopbackRegistry, Transport};
+
+    pub fn node(shard_count: u32) -> Arc<Node> {
+        let registry = LoopbackRegistry::new();
+        Arc::new(Node::bootstrap(
+            NodeConfig {
+                node_id: "org-isolation-test".to_string(),
+                peers: Vec::new(),
+                shard_count,
+                data_dir: None,
+            },
+            Transport::loopback(registry),
+        ))
+    }
+
+    pub async fn json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&body).expect("JSON response")
     }
 }

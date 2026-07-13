@@ -27,7 +27,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 /// Acquire body. Supply `keys` for a union lock, or `key` for a single-key lock.
@@ -62,9 +63,19 @@ pub fn router() -> Router<Arc<Node>> {
 
 /// `GET /v1/locks?key=K` — inspect lock state for one member key.
 #[tracing::instrument(name = "http.lock.get", skip(node, uri), fields(key = %q.key))]
-async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<KeyParam>) -> Response {
-    match node.query(ReadRequest::Lock { key: q.key.clone() }).await {
-        Ok(ReadResponse::Lock(lock)) => Json(json!({ "key": q.key, "lock": lock })).into_response(),
+async fn get_lock(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Query(q): Query<KeyParam>,
+) -> Response {
+    match node
+        .query(ReadRequest::Lock {
+            key: org.scope(&q.key),
+        })
+        .await
+    {
+        Ok(ReadResponse::Lock(lock)) => org.response(json!({ "key": q.key, "lock": lock })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
@@ -78,6 +89,7 @@ async fn get_lock(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<KeyPa
 )]
 async fn acquire_union(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<AcquireBody>,
 ) -> Response {
@@ -96,19 +108,28 @@ async fn acquire_union(
     if let Err(rejection) = crate::validate::lock_acquire(&keys, &body.holder, body.ttl_ms) {
         return rejection.into_response();
     }
-    acquire(node, uri, keys, body).await
+    acquire(node, org, uri, keys, body).await
 }
 
-async fn acquire(node: Arc<Node>, uri: Uri, keys: Vec<String>, body: AcquireBody) -> Response {
+async fn acquire(
+    node: Arc<Node>,
+    org: OrgScope,
+    uri: Uri,
+    keys: Vec<String>,
+    body: AcquireBody,
+) -> Response {
+    let holder = body.holder.unwrap_or_else(|| "anonymous".to_string());
     let result = node
         .propose(Command::LockAcquire {
-            keys,
-            holder: body.holder.unwrap_or_else(|| "anonymous".to_string()),
+            keys: org.scope_all(keys),
+            // Release has no key, so fence the holder too: another org cannot
+            // release a grant even if it learns the globally unique token.
+            holder: org.scope(&holder),
             ttl_ms: body.ttl_ms.unwrap_or(30_000),
             wait: body.wait.unwrap_or(false),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/locks/release` — release a (possibly multi-key) grant by token.
@@ -119,20 +140,21 @@ async fn acquire(node: Arc<Node>, uri: Uri, keys: Vec<String>, body: AcquireBody
 )]
 async fn release_token(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ReleaseBody>,
 ) -> Response {
-    release(node, uri, body).await
+    release(node, org, uri, body).await
 }
 
-async fn release(node: Arc<Node>, uri: Uri, body: ReleaseBody) -> Response {
+async fn release(node: Arc<Node>, org: OrgScope, uri: Uri, body: ReleaseBody) -> Response {
     let result = node
         .propose(Command::LockRelease {
-            holder: body.holder,
+            holder: org.scope(&body.holder),
             fencing_token: body.fencing_token,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]
@@ -163,5 +185,89 @@ mod tests {
         assert_eq!(body.holder.as_deref(), Some("worker-a"));
         assert_eq!(body.ttl_ms, Some(15_000));
         assert_eq!(body.wait, Some(true));
+    }
+
+    #[tokio::test]
+    async fn identical_lock_keys_are_isolated_and_tokens_cannot_cross_orgs() {
+        let node = crate::test_support::node(4);
+        let org_a = OrgScope("org-a".into());
+        let org_b = OrgScope("org-b".into());
+        let uri = Uri::from_static("/v1/locks/acquire");
+
+        let acquire_for = |holder: &str| AcquireBody {
+            keys: Some(vec!["orders/42".to_string()]),
+            key: None,
+            holder: Some(holder.to_string()),
+            ttl_ms: Some(30_000),
+            wait: Some(false),
+        };
+        let a = crate::test_support::json(
+            acquire_union(
+                State(node.clone()),
+                org_a.clone(),
+                uri.clone(),
+                Json(acquire_for("worker")),
+            )
+            .await,
+        )
+        .await;
+        let b = crate::test_support::json(
+            acquire_union(
+                State(node.clone()),
+                org_b.clone(),
+                uri,
+                Json(acquire_for("worker")),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(a["result"]["output"]["acquired"], true);
+        assert_eq!(b["result"]["output"]["acquired"], true);
+        assert_eq!(a["result"]["output"]["keys"], json!(["orders/42"]));
+        assert_eq!(b["result"]["output"]["keys"], json!(["orders/42"]));
+        assert_eq!(a["result"]["output"]["holder"], "worker");
+        assert_eq!(b["result"]["output"]["holder"], "worker");
+
+        let token_a = a["result"]["output"]["fencing_token"]
+            .as_u64()
+            .expect("org A fencing token");
+        let cross_org_release = crate::test_support::json(
+            release_token(
+                State(node.clone()),
+                org_b,
+                Uri::from_static("/v1/locks/release"),
+                Json(ReleaseBody {
+                    holder: "worker".to_string(),
+                    fencing_token: token_a,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            cross_org_release["result"]["output"]["released"], false,
+            "org B must not release org A's grant even with its token"
+        );
+
+        let inspected = crate::test_support::json(
+            get_lock(
+                State(node),
+                org_a,
+                Uri::from_static("/v1/locks"),
+                Query(KeyParam {
+                    key: "orders/42".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inspected["key"], "orders/42");
+        assert_eq!(inspected["lock"]["holder"], "worker");
+        assert_eq!(inspected["lock"]["held_keys"], json!(["orders/42"]));
+        assert!(
+            !inspected.to_string().contains("\u{1}"),
+            "internal org prefixes never reach the response"
+        );
     }
 }

@@ -19,7 +19,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::{valid_cron_expression, Command, DeliverySemantics, ScheduleTarget};
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +48,7 @@ pub fn router() -> Router<Arc<Node>> {
 /// `PUT /v1/cron/schedules/{name}` — create or update a schedule.
 async fn upsert(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<UpsertBody>,
@@ -70,7 +72,7 @@ async fn upsert(
 
     let result = node
         .propose(Command::ScheduleUpsert {
-            name,
+            name: org.scope(&name),
             cron: body.cron,
             one_shot_at_ms: body.one_shot_at_ms,
             target: body.target,
@@ -81,21 +83,24 @@ async fn upsert(
             now_ms: now_ms(),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/cron/schedules/{name}` — read a schedule definition.
 async fn get_schedule(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(name): Path<String>,
 ) -> Response {
     match node
-        .query(ReadRequest::Schedule { name: name.clone() })
+        .query(ReadRequest::Schedule {
+            name: org.scope(&name),
+        })
         .await
     {
         Ok(ReadResponse::Schedule(Some(schedule))) => {
-            Json(json!({ "found": true, "schedule": schedule })).into_response()
+            org.response(json!({ "found": true, "schedule": schedule }))
         }
         Ok(ReadResponse::Schedule(None)) => {
             Json(json!({ "found": false, "name": name })).into_response()
@@ -108,24 +113,32 @@ async fn get_schedule(
 /// `POST /v1/cron/schedules/{name}/runs` — record a fired delivery.
 async fn record_run(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<RecordRunBody>,
 ) -> Response {
     let result = node
         .propose(Command::ScheduleRecordRun {
-            name,
+            name: org.scope(&name),
             fire_id: body.fire_id,
             fired_at_ms: body.fired_at_ms.unwrap_or_else(now_ms),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/cron/schedules/{name}/history` — read durable run history.
-async fn history(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<String>) -> Response {
+async fn history(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Path(name): Path<String>,
+) -> Response {
     match node
-        .query(ReadRequest::ScheduleHistory { name: name.clone() })
+        .query(ReadRequest::ScheduleHistory {
+            name: org.scope(&name),
+        })
         .await
     {
         Ok(ReadResponse::ScheduleHistory(history)) => {

@@ -34,7 +34,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::{Command, ServiceInstance};
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +66,16 @@ pub fn router() -> Router<Arc<Node>> {
 ///
 /// Services span shards, so this fans a serializable read out across every shard
 /// and merges the per-shard summaries.
-async fn list_services(State(node): State<Arc<Node>>) -> Response {
-    let services = node.list_services().await;
+async fn list_services(State(node): State<Arc<Node>>, org: OrgScope) -> Response {
+    let services: Vec<_> = node
+        .list_services()
+        .await
+        .into_iter()
+        .filter_map(|mut summary| {
+            summary.service = org.unscope(&summary.service)?.to_string();
+            Some(summary)
+        })
+        .collect();
     Json(json!({ "count": services.len(), "services": services })).into_response()
 }
 
@@ -74,6 +83,7 @@ async fn list_services(State(node): State<Arc<Node>>) -> Response {
 /// exact metadata matches such as `?metadata.region=us-east`.
 async fn list_instances(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(service): Path<String>,
     Query(query): Query<HashMap<String, String>>,
@@ -81,7 +91,7 @@ async fn list_instances(
     let filters = metadata_filters(&query);
     match node
         .query(ReadRequest::Service {
-            service: service.clone(),
+            service: org.scope(&service),
         })
         .await
     {
@@ -125,6 +135,7 @@ fn filter_instances(
 /// `PUT /v1/services/{service}/instances/{id}` — register/refresh an instance.
 async fn register(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path((service, id)): Path<(String, String)>,
     Json(body): Json<RegisterBody>,
@@ -137,46 +148,48 @@ async fn register(
     }
     let result = node
         .propose(Command::ServiceRegister {
-            service,
+            service: org.scope(&service),
             instance_id: id,
             address: body.address,
             ttl_ms: body.ttl_ms,
             metadata,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/services/{service}/instances/{id}/heartbeat` — renew the lease.
 async fn heartbeat(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path((service, id)): Path<(String, String)>,
     Json(body): Json<HeartbeatBody>,
 ) -> Response {
     let result = node
         .propose(Command::ServiceHeartbeat {
-            service,
+            service: org.scope(&service),
             instance_id: id,
             ttl_ms: body.ttl_ms,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `DELETE /v1/services/{service}/instances/{id}` — deregister an instance.
 async fn deregister(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path((service, id)): Path<(String, String)>,
 ) -> Response {
     let result = node
         .propose(Command::ServiceDeregister {
-            service,
+            service: org.scope(&service),
             instance_id: id,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/services/{service}/watch` — SSE stream of instance add/remove events.
@@ -185,7 +198,11 @@ async fn deregister(
 /// committed `register`/`heartbeat`/`deregister` for this service, so clients can
 /// keep a live view of the instance set instead of polling. (TTL-expiry removals
 /// surface on the next read/registration rather than as a push event.)
-async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
+async fn watch(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    Path(service): Path<String>,
+) -> Response {
     // Service events are committed on the single SERVICE_DOMAIN shard (writes all
     // route there), so subscribe to that shard's broadcast — not shard_for(service)
     // — then filter to this service below. Watching the name-hashed shard would miss
@@ -196,15 +213,20 @@ async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Re
         )
         .into_response();
     };
+    let scoped_service = org.scope(&service);
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
-        if event.scope != "service" || event.key != service {
+        if event.scope != "service" || event.key != scoped_service {
+            return None;
+        }
+        let mut value = serde_json::to_value(&event).ok()?;
+        if !org.unscope_value(&mut value) {
             return None;
         }
         Some(Ok::<Event, Infallible>(
             Event::default()
                 .event(event.kind)
-                .json_data(&event)
+                .json_data(value)
                 .unwrap_or_else(|_| Event::default().comment("serialize-error")),
         ))
     });
@@ -272,6 +294,55 @@ mod tests {
             address: format!("http://{id}.internal"),
             lease_expires_ms: u64::MAX,
             metadata: HashMap::from(metadata),
+        }
+    }
+
+    #[tokio::test]
+    async fn service_inventory_and_instances_are_filtered_per_org() {
+        let node = crate::test_support::node(4);
+        let org_a = OrgScope("org-a".into());
+        let org_b = OrgScope("org-b".into());
+
+        for (org, id) in [(org_a.clone(), "a-1"), (org_b.clone(), "b-1")] {
+            let response = register(
+                State(node.clone()),
+                org,
+                Uri::from_static("/v1/services/api/instances/test"),
+                Path(("api".to_string(), id.to_string())),
+                Json(RegisterBody {
+                    address: format!("http://{id}.internal"),
+                    ttl_ms: 30_000,
+                    metadata: None,
+                }),
+            )
+            .await;
+            let body = crate::test_support::json(response).await;
+            assert_eq!(body["result"]["output"]["registered"], true);
+            assert_eq!(body["result"]["output"]["service"], "api");
+        }
+
+        for (org, own_id) in [(org_a, "a-1"), (org_b, "b-1")] {
+            let inventory =
+                crate::test_support::json(list_services(State(node.clone()), org.clone()).await)
+                    .await;
+            assert_eq!(inventory["count"], 1);
+            assert_eq!(inventory["services"][0]["service"], "api");
+            assert_eq!(inventory["services"][0]["instances"], 1);
+
+            let instances = crate::test_support::json(
+                list_instances(
+                    State(node.clone()),
+                    org,
+                    Uri::from_static("/v1/services/api"),
+                    Path("api".to_string()),
+                    Query(HashMap::new()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(instances["service"], "api");
+            assert_eq!(instances["instances"].as_array().unwrap().len(), 1);
+            assert_eq!(instances["instances"][0]["instance_id"], own_id);
         }
     }
 }

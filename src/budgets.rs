@@ -31,7 +31,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::{BudgetAmount, Command};
 
 #[derive(Debug, Deserialize)]
@@ -77,41 +78,47 @@ pub fn router() -> Router<Arc<Node>> {
 
 async fn get_budget(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
     match node
         .query(ReadRequest::Budget {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Budget(budget)) => Json(json!({
+        Ok(ReadResponse::Budget(budget)) => org.response(json!({
             "name": q.name,
             "found": budget.is_some(),
             "budget": budget,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
-async fn set(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<SetBody>) -> Response {
+async fn set(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<SetBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::budget(&body.name, None, None) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::BudgetSet {
-            name: body.name,
+            name: org.scope(&body.name),
             limit: body.limit,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn reserve(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ReserveBody>,
 ) -> Response {
@@ -122,31 +129,37 @@ async fn reserve(
     }
     let result = node
         .propose(Command::BudgetReserve {
-            name: body.name,
+            name: org.scope(&body.name),
             reservation_id: body.reservation_id,
-            holder: body.holder,
+            holder: org.scope(&body.holder),
             amount: body.amount,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn commit(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<CommitBody>) -> Response {
+async fn commit(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<CommitBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::budget(&body.name, Some(&body.reservation_id), None) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::BudgetCommit {
-            name: body.name,
+            name: org.scope(&body.name),
             reservation_id: body.reservation_id,
             actual: body.actual,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn release(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ReleaseBody>,
 ) -> Response {
@@ -155,11 +168,11 @@ async fn release(
     }
     let result = node
         .propose(Command::BudgetRelease {
-            name: body.name,
+            name: org.scope(&body.name),
             reservation_id: body.reservation_id,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

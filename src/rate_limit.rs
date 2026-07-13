@@ -16,7 +16,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::{Command, RateLimitAlgorithm};
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +38,7 @@ pub fn router() -> Router<Arc<Node>> {
 /// `POST /v1/rate-limit/{tenant}/{key}/check` — atomic quota decision.
 async fn check(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path((tenant, key)): Path<(String, String)>,
     Json(body): Json<CheckBody>,
@@ -46,8 +48,8 @@ async fn check(
     }
     let result = node
         .propose(Command::RateLimitCheck {
-            key,
-            tenant,
+            key: org.scope(&key),
+            tenant: org.scope(&tenant),
             algorithm: body.algorithm,
             limit: body.limit,
             window_ms: body.window_ms,
@@ -55,12 +57,13 @@ async fn check(
             cost: body.cost.unwrap_or(1),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/rate-limit/{tenant}/{key}` — inspect current limiter snapshot.
 async fn get_limit(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path((tenant, key)): Path<(String, String)>,
 ) -> Response {
@@ -69,13 +72,13 @@ async fn get_limit(
     }
     match node
         .query(ReadRequest::RateLimit {
-            tenant: tenant.clone(),
-            key: key.clone(),
+            tenant: org.scope(&tenant),
+            key: org.scope(&key),
         })
         .await
     {
         Ok(ReadResponse::RateLimit(Some(snapshot))) => {
-            Json(json!({ "found": true, "limit": snapshot })).into_response()
+            org.response(json!({ "found": true, "limit": snapshot }))
         }
         Ok(ReadResponse::RateLimit(None)) => {
             Json(json!({ "found": false, "tenant": tenant, "key": key })).into_response()

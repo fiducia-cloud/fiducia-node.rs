@@ -28,7 +28,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::{Command, DecisionPolicy};
 
 #[derive(Debug, Deserialize)]
@@ -74,21 +75,21 @@ pub fn router() -> Router<Arc<Node>> {
 
 async fn get_decision(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
     match node
         .query(ReadRequest::Decision {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Decision(decision)) => Json(json!({
+        Ok(ReadResponse::Decision(decision)) => org.response(json!({
             "name": q.name,
             "found": decision.is_some(),
             "decision": decision,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
@@ -96,6 +97,7 @@ async fn get_decision(
 
 async fn propose(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ProposeBody>,
 ) -> Response {
@@ -104,23 +106,28 @@ async fn propose(
     }
     let result = node
         .propose(Command::DecisionPropose {
-            name: body.name,
+            name: org.scope(&body.name),
             question: body.question,
             options: body.options,
             policy: body.policy,
             deadline_ms: body.deadline_ms,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn vote(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<VoteBody>) -> Response {
+async fn vote(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<VoteBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::decision(&body.name, Some(&body.voter)) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::DecisionVote {
-            name: body.name,
+            name: org.scope(&body.name),
             voter: body.voter,
             option: body.option,
             confidence: body.confidence,
@@ -129,7 +136,7 @@ async fn vote(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<VoteBody
             evidence: body.evidence,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

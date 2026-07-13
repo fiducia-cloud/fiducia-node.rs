@@ -29,7 +29,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -65,33 +66,38 @@ pub fn router() -> Router<Arc<Node>> {
 
 async fn get_handoff(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
     match node
         .query(ReadRequest::Handoff {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Handoff(handoff)) => Json(json!({
+        Ok(ReadResponse::Handoff(handoff)) => org.response(json!({
             "name": q.name,
             "found": handoff.is_some(),
             "handoff": handoff,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
-async fn offer(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<OfferBody>) -> Response {
+async fn offer(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<OfferBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::handoff(&body.name, Some(&body.from), Some(&body.to)) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::HandoffOffer {
-            name: body.name,
+            name: org.scope(&body.name),
             resource: body.resource,
             from: body.from,
             to: body.to,
@@ -100,11 +106,12 @@ async fn offer(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<OfferBo
             ttl_ms: body.ttl_ms.unwrap_or(30_000),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn accept(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<DecisionBody>,
 ) -> Response {
@@ -113,15 +120,16 @@ async fn accept(
     }
     let result = node
         .propose(Command::HandoffAccept {
-            name: body.name,
+            name: org.scope(&body.name),
             to: body.to,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn reject(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<DecisionBody>,
 ) -> Response {
@@ -130,11 +138,11 @@ async fn reject(
     }
     let result = node
         .propose(Command::HandoffReject {
-            name: body.name,
+            name: org.scope(&body.name),
             to: body.to,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

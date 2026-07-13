@@ -31,7 +31,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -92,33 +93,38 @@ pub fn router() -> Router<Arc<Node>> {
 
 async fn get_claim(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
     match node
         .query(ReadRequest::Claim {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Claim(claim)) => Json(json!({
+        Ok(ReadResponse::Claim(claim)) => org.response(json!({
             "name": q.name,
             "found": claim.is_some(),
             "claim": claim,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
-async fn assert(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<AssertBody>) -> Response {
+async fn assert(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<AssertBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::claim(&body.name, Some(&body.author)) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::ClaimAssert {
-            name: body.name,
+            name: org.scope(&body.name),
             subject: body.subject,
             predicate: body.predicate,
             value: body.value,
@@ -128,11 +134,12 @@ async fn assert(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Assert
             valid_until_ms: body.valid_until_ms,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn support(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<SupportBody>,
 ) -> Response {
@@ -141,15 +148,16 @@ async fn support(
     }
     let result = node
         .propose(Command::ClaimSupport {
-            name: body.name,
+            name: org.scope(&body.name),
             agent: body.agent,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn contest(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ContestBody>,
 ) -> Response {
@@ -158,16 +166,17 @@ async fn contest(
     }
     let result = node
         .propose(Command::ClaimContest {
-            name: body.name,
+            name: org.scope(&body.name),
             agent: body.agent,
             reason: body.reason,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn resolve(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ResolveBody>,
 ) -> Response {
@@ -176,15 +185,16 @@ async fn resolve(
     }
     let result = node
         .propose(Command::ClaimResolve {
-            name: body.name,
+            name: org.scope(&body.name),
             accepted: body.accepted,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn supersede(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<SupersedeBody>,
 ) -> Response {
@@ -193,11 +203,11 @@ async fn supersede(
     }
     let result = node
         .propose(Command::ClaimSupersede {
-            name: body.name,
-            superseded_by: body.superseded_by,
+            name: org.scope(&body.name),
+            superseded_by: org.scope(&body.superseded_by),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

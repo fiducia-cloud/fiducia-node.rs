@@ -37,7 +37,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
 use crate::org_scope::OrgScope;
 use crate::state::Command;
 
@@ -82,7 +82,12 @@ async fn get_or_list(
         // The caller's key is namespaced into their org before it reaches the
         // state machine; the response echoes the caller-facing key, not the scoped
         // one, so the isolation is invisible to the client.
-        Some(key) => match node.query(ReadRequest::Kv { key: org.scope(&key) }).await {
+        Some(key) => match node
+            .query(ReadRequest::Kv {
+                key: org.scope(&key),
+            })
+            .await
+        {
             Ok(ReadResponse::Kv(Some(entry))) => {
                 Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
             }
@@ -115,7 +120,7 @@ async fn put_key(
             prev_revision: body.prev_revision,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `DELETE /v1/kv?key=K` — remove a key.
@@ -128,8 +133,12 @@ async fn delete_key(
     let Some(key) = q.key else {
         return bad_request("missing `key`");
     };
-    let result = node.propose(Command::KvDelete { key: org.scope(&key) }).await;
-    propose_response(result, &uri)
+    let result = node
+        .propose(Command::KvDelete {
+            key: org.scope(&key),
+        })
+        .await;
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/kv?prefix=...` — list live keys under a prefix, scoped to the caller's

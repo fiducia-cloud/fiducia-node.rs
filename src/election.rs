@@ -36,7 +36,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +77,7 @@ pub fn router() -> Router<Arc<Node>> {
 /// `POST /v1/elections/{name}/campaign` — try to become leader.
 async fn campaign(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<CampaignBody>,
@@ -87,54 +89,63 @@ async fn campaign(
     }
     let result = node
         .propose(Command::ElectionCampaign {
-            name,
+            name: org.scope(&name),
             candidate: body.candidate,
             ttl_ms: body.ttl_ms,
             metadata: body.metadata,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/elections/{name}/renew` — extend the lease (must hold the token).
 async fn renew(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<RenewBody>,
 ) -> Response {
     let result = node
         .propose(Command::ElectionRenew {
-            name,
+            name: org.scope(&name),
             candidate: body.candidate,
             fencing_token: body.fencing_token,
             ttl_ms: body.ttl_ms,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/elections/{name}/resign` — give up leadership.
 async fn resign(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Path(name): Path<String>,
     Json(body): Json<HoldBody>,
 ) -> Response {
     let result = node
         .propose(Command::ElectionResign {
-            name,
+            name: org.scope(&name),
             candidate: body.candidate,
             fencing_token: body.fencing_token,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/elections/{name}` — observe the current leader.
-async fn observe(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<String>) -> Response {
+async fn observe(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Path(name): Path<String>,
+) -> Response {
     match node
-        .query(ReadRequest::Election { name: name.clone() })
+        .query(ReadRequest::Election {
+            name: org.scope(&name),
+        })
         .await
     {
         Ok(ReadResponse::Election(Some(l))) => {
@@ -154,20 +165,25 @@ async fn observe(State(node): State<Arc<Node>>, uri: Uri, Path(name): Path<Strin
 /// committed `elected`/`renewed`/`resigned` for this election. A client watches
 /// this to learn, e.g., that the old leader's lease lapsed and a new candidate
 /// won — then re-routes to the new leader without polling.
-async fn watch(State(node): State<Arc<Node>>, Path(name): Path<String>) -> Response {
-    let Some(rx) = node.watch(&name).await else {
+async fn watch(State(node): State<Arc<Node>>, org: OrgScope, Path(name): Path<String>) -> Response {
+    let scoped_name = org.scope(&name);
+    let Some(rx) = node.watch(&scoped_name).await else {
         return Json(json!({ "error": "unavailable", "op": "election.watch", "name": name }))
             .into_response();
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
-        if event.scope != "election" || event.key != name {
+        if event.scope != "election" || event.key != scoped_name {
+            return None;
+        }
+        let mut value = serde_json::to_value(&event).ok()?;
+        if !org.unscope_value(&mut value) {
             return None;
         }
         Some(Ok::<Event, Infallible>(
             Event::default()
                 .event(event.kind)
-                .json_data(&event)
+                .json_data(value)
                 .unwrap_or_else(|_| Event::default().comment("serialize-error")),
         ))
     });
