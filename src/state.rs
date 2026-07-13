@@ -4074,7 +4074,10 @@ fn canonical_keys(keys: &[String]) -> Vec<String> {
     out
 }
 
-fn now_ms() -> u64 {
+/// Local wall clock in epoch ms. Used to **stamp** commands/entries at propose
+/// time and to filter read views — never inside `apply_at`, which must stay
+/// deterministic.
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
