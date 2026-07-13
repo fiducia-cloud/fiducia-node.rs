@@ -372,6 +372,19 @@ pub enum ShardMsg {
         req: RequestVoteReq,
         resp: oneshot::Sender<RequestVoteResp>,
     },
+    /// Inbound `InstallSnapshot` from a peer leader (this replica fell behind
+    /// the leader's compacted log base).
+    InstallSnapshot {
+        req: InstallSnapshotReq,
+        resp: oneshot::Sender<InstallSnapshotResp>,
+    },
+    /// A peer's reply to an `InstallSnapshot` this shard sent (routed back to
+    /// self). `last_included` is the snapshot index that was shipped.
+    SnapshotReply {
+        from: String,
+        last_included: u64,
+        resp: Option<InstallSnapshotResp>,
+    },
     /// A peer's reply to a `RequestVote` this shard sent (routed back to self).
     /// `pre_vote` echoes whether the request that produced it was a pre-vote, so
     /// the candidate counts it toward the right round.
