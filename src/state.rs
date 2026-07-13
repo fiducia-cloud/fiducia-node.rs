@@ -1560,7 +1560,7 @@ impl BudgetRecord {
 
 /// The lifecycle of a claim in the contestable ledger. Semantic similarity may
 /// surface a claim, but only an authorized resolution moves it to `Accepted`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
     Asserted,
