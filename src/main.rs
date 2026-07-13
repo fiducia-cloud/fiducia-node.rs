@@ -273,6 +273,8 @@ mod test_support {
 
 #[cfg(test)]
 mod peer_plane_limit_tests {
+    use std::future::IntoFuture;
+
     use axum::Router;
     use tower_http::limit::RequestBodyLimitLayer;
 
