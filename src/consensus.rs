@@ -48,7 +48,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
-use crate::persist::{Recovered, ShardStore};
+use crate::persist::{PersistedSnapshot, Recovered, ShardStore};
 use crate::state::{
     BarrierState, BudgetState, ClaimState, Command, CounterEntry, DecisionState, EffectState,
     ElectionEntry, HandoffState, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
@@ -56,8 +56,8 @@ use crate::state::{
     ServiceSummary, StateMachine, TaskState,
 };
 use crate::transport::{
-    AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
-    Transport,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LoopbackRegistry,
+    RequestVoteReq, RequestVoteResp, Transport,
 };
 
 /// Identifier of a shard (one independent Raft group). Re-exported from the
@@ -232,6 +232,12 @@ pub struct LogEntry {
     pub term: u64,
     /// 1-based position in the shard's log.
     pub index: u64,
+    /// Leader-stamped wall clock used by every replica while applying this
+    /// entry. Zero identifies legacy entries written before deterministic apply
+    /// time; recovery treats those as epoch-anchored so old leases expire rather
+    /// than being resurrected at restart.
+    #[serde(default)]
+    pub proposed_at_ms: u64,
     /// The state-machine command, or `None` for a leader-election no-op.
     pub command: Option<Command>,
 }
@@ -332,6 +338,12 @@ pub enum ShardMsg {
         req: AppendEntriesReq,
         resp: oneshot::Sender<AppendEntriesResp>,
     },
+    /// Inbound state-machine snapshot from a leader that compacted the required
+    /// log prefix.
+    InstallSnapshot {
+        req: InstallSnapshotReq,
+        resp: oneshot::Sender<InstallSnapshotResp>,
+    },
     /// Inbound `RequestVote` from a peer candidate.
     RequestVote {
         req: RequestVoteReq,
@@ -354,6 +366,11 @@ pub enum ShardMsg {
         rtt_ms: Option<u64>,
         /// `None` if the peer was unreachable.
         resp: Option<AppendEntriesResp>,
+    },
+    SnapshotReply {
+        from: String,
+        up_to: u64,
+        resp: Option<InstallSnapshotResp>,
     },
     /// Subscribe to this shard's change stream (for a KV watch).
     Subscribe {
@@ -574,6 +591,10 @@ struct ShardActor {
     current_term: u64,
     voted_for: Option<String>,
     leader_id: Option<String>,
+    /// Highest log index represented by the installed state-machine snapshot.
+    snapshot_index: u64,
+    snapshot_term: u64,
+    snapshot_state: Vec<u8>,
     log: Vec<LogEntry>,
     commit_index: u64,
     last_applied: u64,
@@ -628,7 +649,29 @@ impl ShardActor {
         // Seed from disk when we have it. A fresh shard recovers `term == 0`; this
         // engine numbers terms from 1, so keep the floor at 1 for a clean start.
         let current_term = recovered.current_term.max(1);
-        let recovered_commit = recovered.commit_index.min(recovered.log.len() as u64);
+        let snapshot_index = recovered
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_included_index)
+            .unwrap_or(0);
+        let snapshot_term = recovered
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_included_term)
+            .unwrap_or(0);
+        let snapshot_state = recovered
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.state.clone())
+            .unwrap_or_default();
+        let recovered_tail = snapshot_index.saturating_add(recovered.log.len() as u64);
+        let recovered_commit = recovered.commit_index.clamp(snapshot_index, recovered_tail);
+        let state = StateMachine::new();
+        if let Some(snapshot) = recovered.snapshot.as_ref() {
+            if let Err(error) = state.restore(&snapshot.state) {
+                panic!("invalid state-machine snapshot for shard {shard_id}: {error}");
+            }
+        }
         let mut actor = ShardActor {
             shard_id,
             node_id: node_id.clone(),
@@ -643,9 +686,12 @@ impl ShardActor {
             current_term,
             voted_for: recovered.voted_for,
             leader_id: if single { Some(node_id.clone()) } else { None },
+            snapshot_index,
+            snapshot_term,
+            snapshot_state,
             log: recovered.log,
             commit_index: recovered_commit,
-            last_applied: 0,
+            last_applied: snapshot_index,
             store,
             votes: HashSet::new(),
             pre_votes: HashSet::new(),
@@ -662,7 +708,7 @@ impl ShardActor {
             rng: Rng::seeded(&node_id, shard_id),
             pending: HashMap::new(),
             changes,
-            state: StateMachine::new(),
+            state,
             metrics: ShardMetrics::default(),
         };
         actor.reset_election_deadline();
@@ -703,6 +749,10 @@ impl ShardActor {
                 let out = self.handle_append_entries(req);
                 let _ = resp.send(out);
             }
+            ShardMsg::InstallSnapshot { req, resp } => {
+                let out = self.handle_install_snapshot(req);
+                let _ = resp.send(out);
+            }
             ShardMsg::RequestVote { req, resp } => {
                 let out = self.handle_request_vote(req);
                 let _ = resp.send(out);
@@ -718,6 +768,9 @@ impl ShardActor {
                 rtt_ms,
                 resp,
             } => self.handle_append_reply(from, up_to, rtt_ms, resp),
+            ShardMsg::SnapshotReply { from, up_to, resp } => {
+                self.handle_snapshot_reply(from, up_to, resp)
+            }
             ShardMsg::Subscribe { resp } => {
                 let _ = resp.send(self.changes.subscribe());
             }
@@ -771,19 +824,26 @@ impl ShardActor {
     // --- elections --------------------------------------------------------
 
     fn last_log_index(&self) -> u64 {
-        self.log.len() as u64
+        self.snapshot_index.saturating_add(self.log.len() as u64)
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log
+            .last()
+            .map(|entry| entry.term)
+            .unwrap_or(self.snapshot_term)
     }
 
     fn term_at(&self, index: u64) -> u64 {
         if index == 0 {
             0
+        } else if index == self.snapshot_index {
+            self.snapshot_term
+        } else if index < self.snapshot_index {
+            0
         } else {
             self.log
-                .get((index - 1) as usize)
+                .get((index - self.snapshot_index - 1) as usize)
                 .map(|e| e.term)
                 .unwrap_or(0)
         }
@@ -947,6 +1007,7 @@ impl ShardActor {
         self.log.push(LogEntry {
             term: self.current_term,
             index,
+            proposed_at_ms: now_ms(),
             command: None,
         });
         // Durable before this entry can count toward a commit.
@@ -1048,13 +1109,38 @@ impl ShardActor {
         }
         let next = *ls.next_index.get(peer).unwrap_or(&1);
         ls.in_flight.insert(peer.to_string(), true);
+        if next <= self.snapshot_index {
+            let req = InstallSnapshotReq {
+                term: self.current_term,
+                leader_id: self.node_id.clone(),
+                last_included_index: self.snapshot_index,
+                last_included_term: self.snapshot_term,
+                state: self.snapshot_state.clone(),
+            };
+            let transport = self.transport.clone();
+            let self_tx = self.self_tx.clone();
+            let shard = self.shard_id;
+            let peer_owned = peer.to_string();
+            let up_to = self.snapshot_index;
+            tokio::spawn(async move {
+                let resp = transport.install_snapshot(&peer_owned, shard, req).await;
+                let _ = self_tx
+                    .send(ShardMsg::SnapshotReply {
+                        from: peer_owned,
+                        up_to,
+                        resp,
+                    })
+                    .await;
+            });
+            return;
+        }
 
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
         let entries: Vec<LogEntry> = self
             .log
             .iter()
-            .skip(prev_log_index as usize)
+            .skip(prev_log_index.saturating_sub(self.snapshot_index) as usize)
             .cloned()
             .collect();
         let up_to = self.last_log_index();
@@ -1140,6 +1226,35 @@ impl ShardActor {
         }
         self.refresh_follower_lag_metric();
         if more {
+            self.send_append_to(&from);
+        }
+    }
+
+    fn handle_snapshot_reply(
+        &mut self,
+        from: String,
+        up_to: u64,
+        resp: Option<InstallSnapshotResp>,
+    ) {
+        if let Some(leader) = self.leader.as_mut() {
+            leader.in_flight.insert(from.clone(), false);
+        }
+        let Some(resp) = resp else {
+            return;
+        };
+        if resp.term > self.current_term {
+            self.step_down(resp.term, None);
+            return;
+        }
+        if self.role != Role::Leader || resp.term != self.current_term {
+            return;
+        }
+        if resp.success {
+            if let Some(leader) = self.leader.as_mut() {
+                leader.match_index.insert(from.clone(), up_to);
+                leader.next_index.insert(from.clone(), up_to + 1);
+                leader.last_contact.insert(from.clone(), Instant::now());
+            }
             self.send_append_to(&from);
         }
     }
@@ -1238,6 +1353,76 @@ impl ShardActor {
 
     // --- replication (follower side) --------------------------------------
 
+    fn handle_install_snapshot(&mut self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        if req.term < self.current_term {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index(),
+            };
+        }
+        if req.term > self.current_term {
+            self.current_term = req.term;
+            self.voted_for = None;
+        }
+        self.become_follower_of(req.leader_id);
+        if req.last_included_index <= self.snapshot_index {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: true,
+                match_index: self.snapshot_index,
+            };
+        }
+
+        let restored = StateMachine::new();
+        if let Err(error) = restored.restore(&req.state) {
+            tracing::error!(shard = ?self.shard_id, %error, "raft: rejected invalid snapshot");
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index(),
+            };
+        }
+        let keep_suffix = self.term_at(req.last_included_index) == req.last_included_term;
+        let remaining = if keep_suffix {
+            self.log
+                .iter()
+                .filter(|entry| entry.index > req.last_included_index)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let snapshot = PersistedSnapshot {
+            last_included_index: req.last_included_index,
+            last_included_term: req.last_included_term,
+            state: req.state.clone(),
+        };
+        if let Some(store) = self.store.as_mut() {
+            if let Err(error) = store.save_snapshot(&snapshot, &remaining) {
+                tracing::error!(shard = ?self.shard_id, %error, "raft: failed to persist installed snapshot");
+                return InstallSnapshotResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                };
+            }
+        }
+        self.state = restored;
+        self.snapshot_index = req.last_included_index;
+        self.snapshot_term = req.last_included_term;
+        self.snapshot_state = req.state;
+        self.log = remaining;
+        self.commit_index = self.commit_index.max(self.snapshot_index);
+        self.last_applied = self.snapshot_index;
+        self.persist_hard_state();
+        InstallSnapshotResp {
+            term: self.current_term,
+            success: true,
+            match_index: self.snapshot_index,
+        }
+    }
+
     fn handle_append_entries(&mut self, req: AppendEntriesReq) -> AppendEntriesResp {
         // Reject a stale leader.
         if req.term < self.current_term {
@@ -1274,10 +1459,14 @@ impl ShardActor {
         let mut grew = false;
         for entry in req.entries {
             idx += 1;
-            match self.log.get((idx - 1) as usize) {
+            if idx <= self.snapshot_index {
+                continue;
+            }
+            let offset = (idx - self.snapshot_index - 1) as usize;
+            match self.log.get(offset) {
                 Some(existing) if existing.term == entry.term => {} // already have it
                 Some(_) => {
-                    self.log.truncate((idx - 1) as usize);
+                    self.log.truncate(offset);
                     self.log.push(entry);
                     truncated = true;
                 }
@@ -1424,6 +1613,7 @@ impl ShardActor {
         self.log.push(LogEntry {
             term: self.current_term,
             index,
+            proposed_at_ms: now_ms(),
             command: Some(command),
         });
         // Durable before this entry can count toward a commit / be acked.
@@ -1453,13 +1643,13 @@ impl ShardActor {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let i = self.last_applied;
-            let Some(entry) = self.log.get((i - 1) as usize) else {
+            let Some(entry) = self.log.get((i - self.snapshot_index - 1) as usize) else {
                 break;
             };
             let Some(command) = entry.command.clone() else {
                 continue; // no-op
             };
-            let applied = self.state.apply(command.clone());
+            let applied = self.state.apply_at(command.clone(), entry.proposed_at_ms);
             self.publish_change(&command, &applied.output, applied.revision);
             if let Some(pending) = self.pending.remove(&i) {
                 let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
@@ -1479,6 +1669,46 @@ impl ShardActor {
                 }));
             }
         }
+        self.maybe_compact();
+    }
+
+    fn maybe_compact(&mut self) {
+        let threshold = std::env::var("FIDUCIA_RAFT_SNAPSHOT_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1024);
+        if threshold == 0 || self.last_applied.saturating_sub(self.snapshot_index) < threshold {
+            return;
+        }
+        let last_included_index = self.last_applied;
+        let last_included_term = self.term_at(last_included_index);
+        let Ok(state) = self.state.snapshot() else {
+            tracing::error!(shard = ?self.shard_id, "raft: failed to serialize state snapshot");
+            return;
+        };
+        let remove = last_included_index.saturating_sub(self.snapshot_index) as usize;
+        let remaining = self.log.get(remove..).unwrap_or(&[]).to_vec();
+        let snapshot = PersistedSnapshot {
+            last_included_index,
+            last_included_term,
+            state: state.clone(),
+        };
+        if let Some(store) = self.store.as_mut() {
+            if let Err(error) = store.save_snapshot(&snapshot, &remaining) {
+                tracing::error!(shard = ?self.shard_id, %error, "raft: failed to persist snapshot");
+                return;
+            }
+        }
+        self.log = remaining;
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
+        self.snapshot_state = state;
+        tracing::info!(
+            shard = ?self.shard_id,
+            last_included_index,
+            remaining_entries = self.log.len(),
+            "raft: compacted committed log into state snapshot"
+        );
     }
 
     fn publish_change(&self, command: &Command, output: &serde_json::Value, revision: u64) {
@@ -1737,6 +1967,8 @@ impl ShardActor {
             commit_index: self.commit_index,
             last_applied: self.last_applied,
             last_log_index: self.last_log_index(),
+            snapshot_index: self.snapshot_index,
+            retained_log_entries: self.log.len(),
             healthy_replicas,
             has_quorum,
             replication,
@@ -1961,6 +2193,19 @@ impl Node {
     }
 
     /// Deliver an inbound `RequestVote` to the owning shard actor.
+    pub async fn install_snapshot(
+        &self,
+        shard: ShardId,
+        req: InstallSnapshotReq,
+    ) -> Option<InstallSnapshotResp> {
+        let tx = self.sender(shard)?;
+        let (resp, rx) = oneshot::channel();
+        tx.send(ShardMsg::InstallSnapshot { req, resp })
+            .await
+            .ok()?;
+        rx.await.ok()
+    }
+
     pub async fn request_vote(
         &self,
         shard: ShardId,
@@ -2214,6 +2459,13 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -2234,6 +2486,10 @@ pub struct ShardStatus {
     /// is apply lag.
     pub last_applied: u64,
     pub last_log_index: u64,
+    /// Highest index included in the durable state-machine snapshot.
+    pub snapshot_index: u64,
+    /// Log suffix still retained after compaction.
+    pub retained_log_entries: usize,
     /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
     pub healthy_replicas: usize,
     /// Whether a majority of the group is caught up — i.e. the shard can survive
@@ -3353,6 +3609,7 @@ mod tests {
         a.log.push(LogEntry {
             term: 1,
             index: 1,
+            proposed_at_ms: 1_000,
             command: None,
         });
         assert!(
@@ -3363,5 +3620,132 @@ mod tests {
             a.handle_pre_vote(&pre_vote_req(5, 1, 1)).granted,
             "caught-up log granted"
         );
+    }
+
+    #[test]
+    fn install_snapshot_restores_state_and_accepts_suffix_entries() {
+        let image = StateMachine::new();
+        image.apply_at(
+            Command::KvPut {
+                key: "from-snapshot".to_string(),
+                value: "v1".to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            },
+            10_000,
+        );
+        let mut follower = follower_actor();
+        let installed = follower.handle_install_snapshot(InstallSnapshotReq {
+            term: 2,
+            leader_id: "b".to_string(),
+            last_included_index: 5,
+            last_included_term: 2,
+            state: image.snapshot().unwrap(),
+        });
+        assert!(installed.success);
+        assert_eq!(installed.match_index, 5);
+        assert_eq!(follower.snapshot_index, 5);
+        assert_eq!(follower.last_applied, 5);
+
+        let appended = follower.handle_append_entries(AppendEntriesReq {
+            term: 2,
+            leader_id: "b".to_string(),
+            prev_log_index: 5,
+            prev_log_term: 2,
+            entries: vec![LogEntry {
+                term: 2,
+                index: 6,
+                proposed_at_ms: 11_000,
+                command: Some(Command::KvPut {
+                    key: "after-snapshot".to_string(),
+                    value: "v2".to_string(),
+                    ttl_ms: None,
+                    prev_revision: None,
+                }),
+            }],
+            leader_commit: 6,
+        });
+        assert!(appended.success);
+        assert_eq!(follower.last_applied, 6);
+        assert_eq!(follower.state.kv_get("from-snapshot").unwrap().value, "v1");
+        assert_eq!(follower.state.kv_get("after-snapshot").unwrap().value, "v2");
+    }
+
+    #[test]
+    fn committed_log_is_compacted_at_the_snapshot_threshold() {
+        let mut actor = follower_actor();
+        actor.log = (1..=1024)
+            .map(|index| LogEntry {
+                term: 1,
+                index,
+                proposed_at_ms: 10_000 + index,
+                command: Some(Command::CounterAdd {
+                    key: "compaction-count".to_string(),
+                    delta: 1,
+                    prev_revision: None,
+                }),
+            })
+            .collect();
+        actor.commit_index = 1024;
+        actor.apply_committed();
+        assert_eq!(actor.snapshot_index, 1024);
+        assert_eq!(actor.snapshot_term, 1);
+        assert_eq!(actor.last_applied, 1024);
+        assert!(actor.log.is_empty());
+        assert!(!actor.snapshot_state.is_empty());
+        assert_eq!(
+            actor.state.counter_get("compaction-count").unwrap().value,
+            1024
+        );
+    }
+
+    #[test]
+    fn restart_restores_snapshot_then_replays_only_the_retained_suffix() {
+        let snapshotted = StateMachine::new();
+        snapshotted.apply_at(
+            Command::KvPut {
+                key: "before".to_string(),
+                value: "snapshot".to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            },
+            20_000,
+        );
+        let reg = LoopbackRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let actor = ShardActor::new(
+            0,
+            "restart".to_string(),
+            Vec::new(),
+            Arc::new(Transport::loopback(reg)),
+            tx,
+            RaftTiming::default(),
+            None,
+            Recovered {
+                current_term: 3,
+                voted_for: None,
+                commit_index: 6,
+                snapshot: Some(PersistedSnapshot {
+                    last_included_index: 5,
+                    last_included_term: 2,
+                    state: snapshotted.snapshot().unwrap(),
+                }),
+                log: vec![LogEntry {
+                    term: 3,
+                    index: 6,
+                    proposed_at_ms: 21_000,
+                    command: Some(Command::KvPut {
+                        key: "after".to_string(),
+                        value: "suffix".to_string(),
+                        ttl_ms: None,
+                        prev_revision: None,
+                    }),
+                }],
+            },
+        );
+        assert_eq!(actor.last_applied, 6);
+        assert_eq!(actor.snapshot_index, 5);
+        assert_eq!(actor.state.kv_get("before").unwrap().value, "snapshot");
+        assert_eq!(actor.state.kv_get("after").unwrap().value, "suffix");
     }
 }

@@ -592,7 +592,7 @@ pub struct ApplyResult {
 }
 
 /// A single versioned KV entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvEntry {
     pub value: String,
     pub mod_revision: u64,
@@ -602,7 +602,7 @@ pub struct KvEntry {
 /// A distributed counter: a signed 64-bit value with a monotonic revision, used
 /// for success/failure thresholds, quotas, and fan-in tallies. Every mutation
 /// stamps `mod_revision`, so callers can compare-and-set against a known value.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterEntry {
     pub value: i64,
     pub mod_revision: u64,
@@ -643,7 +643,7 @@ impl BarrierStatus {
 }
 
 /// One participant's arrival at a barrier.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BarrierArrival {
     pub participant: String,
     pub weight: u64,
@@ -666,7 +666,7 @@ pub struct BarrierState {
 }
 
 /// Internal barrier record: the durable facts (arrivals); status is derived.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BarrierRecord {
     policy: BarrierPolicy,
     expected: u32,
@@ -773,7 +773,7 @@ pub struct LockInventory {
 }
 
 /// One held union-lock acquisition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LockGrant {
     holder: String,
     keys: Vec<String>,
@@ -782,7 +782,7 @@ struct LockGrant {
 }
 
 /// One queued union-lock request awaiting its whole key set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueuedLock {
     holder: String,
     keys: Vec<String>,
@@ -792,7 +792,7 @@ struct QueuedLock {
 
 /// The multi-key lock table: which member key is held by which grant, the grants
 /// themselves, and the FIFO wait queue of whole requests.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct LockManager {
     /// member key → owning grant's fencing token.
     held: HashMap<String, u64>,
@@ -822,14 +822,14 @@ pub struct SemaphoreHolder {
     pub lease_expires_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SemaphoreSlot {
     holder: String,
     fencing_token: u64,
     lease_expires_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueuedPermit {
     holder: String,
     ttl_ms: u64,
@@ -837,7 +837,7 @@ struct QueuedPermit {
 }
 
 /// A counting semaphore: up to `limit` permits, plus a FIFO queue for the rest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Semaphore {
     limit: u32,
     holders: Vec<SemaphoreSlot>,
@@ -856,7 +856,7 @@ pub struct RateLimitSnapshot {
     pub reset_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RateLimitRecord {
     algorithm: RateLimitAlgorithm,
     limit: u32,
@@ -878,7 +878,7 @@ pub enum IdempotencyStatus {
 /// in-flight `lease_expires_ms` (so an abandoned claim frees the key quickly);
 /// `complete` then extends `lease_expires_ms` by `retention_ms` so a `Completed`
 /// record — and its replayable result — survives for the full retention window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     pub key: String,
     pub owner: String,
@@ -896,7 +896,7 @@ pub struct IdempotencyRecord {
 }
 
 /// The current holder of a named election.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
@@ -933,7 +933,7 @@ pub struct ServiceSummary {
 }
 
 /// A scheduled job definition.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub name: String,
     pub cron: Option<String>,
@@ -949,7 +949,7 @@ pub struct Schedule {
 }
 
 /// Lifecycle of one fire's delivery, recorded durably in the schedule's history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// Claimed and being delivered (or interrupted before the result was recorded).
@@ -960,7 +960,7 @@ pub enum RunStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleRun {
     pub fire_id: String,
     pub fired_at_ms: u64,
@@ -971,14 +971,14 @@ pub struct ScheduleRun {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScheduleRecord {
     definition: Schedule,
     history: Vec<ScheduleRun>,
 }
 
 /// One registered service instance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceInstance {
     pub instance_id: String,
     pub address: String,
@@ -987,7 +987,7 @@ pub struct ServiceInstance {
 }
 
 /// The lifecycle of a durable task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
@@ -1026,7 +1026,7 @@ pub struct TaskState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskRecord {
     task_type: String,
     payload: Value,
@@ -1080,7 +1080,7 @@ impl TaskRecord {
 /// The lifecycle of an approval-escrow effect. Preparing, authorizing, and
 /// executing a dangerous action are separated so a risky side effect cannot be
 /// performed until it is approved, and is committed at most once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectStatus {
     Prepared,
@@ -1110,7 +1110,7 @@ pub struct EffectState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EffectRecord {
     effect_type: String,
     payload: Value,
@@ -1141,7 +1141,7 @@ impl EffectRecord {
 }
 
 /// The lifecycle of an ownership handoff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffStatus {
     Offered,
@@ -1168,7 +1168,7 @@ pub struct HandoffState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HandoffRecord {
     resource: String,
     from: String,
@@ -1263,7 +1263,7 @@ pub struct DecisionState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionVoteRecord {
     option: Option<String>,
     confidence: f32,
@@ -1272,7 +1272,7 @@ struct DecisionVoteRecord {
     evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionRecord {
     question: String,
     options: Vec<String>,
@@ -1390,7 +1390,7 @@ impl DecisionRecord {
 }
 
 /// The status of a single budget reservation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReservationStatus {
     Held,
@@ -1442,7 +1442,7 @@ pub struct BudgetState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReservationRecord {
     holder: String,
     reserved: BudgetAmount,
@@ -1450,7 +1450,7 @@ struct ReservationRecord {
     status: ReservationStatus,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BudgetRecord {
     limit: BudgetAmount,
     reservations: std::collections::BTreeMap<String, ReservationRecord>,
@@ -1560,7 +1560,7 @@ impl BudgetRecord {
 
 /// The lifecycle of a claim in the contestable ledger. Semantic similarity may
 /// surface a claim, but only an authorized resolution moves it to `Accepted`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
     Asserted,
@@ -1606,7 +1606,7 @@ pub struct ClaimState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaimRecord {
     subject: String,
     predicate: String,
@@ -1651,7 +1651,8 @@ impl ClaimRecord {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Store {
     revision: u64,
     next_fencing_token: u64,
@@ -1703,9 +1704,29 @@ impl StateMachine {
         }
     }
 
+    /// Serialize the complete applied state for Raft log compaction.
+    pub fn snapshot(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&*self.store.lock().unwrap())
+    }
+
+    /// Restore an atomically persisted state-machine snapshot.
+    pub fn restore(&self, bytes: &[u8]) -> Result<(), serde_json::Error> {
+        let restored: Store = serde_json::from_slice(bytes)?;
+        *self.store.lock().unwrap() = restored;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn apply(&self, command: Command) -> ApplyResult {
+        self.apply_at(command, now_ms())
+    }
+
+    /// Apply a committed command using the timestamp captured by its Raft log
+    /// entry. Replicas and restart recovery must pass the same value so leases,
+    /// TTLs, refill windows, and deadlines cannot move when an entry is replayed.
+    pub fn apply_at(&self, command: Command, proposed_at_ms: u64) -> ApplyResult {
         let mut store = self.store.lock().unwrap();
-        let now = now_ms();
+        let now = proposed_at_ms;
         store.expire_due(now);
         store.revision += 1;
         let revision = store.revision;
@@ -5952,5 +5973,56 @@ mod tests {
         ] {
             assert_eq!(command.routing_key(), SERVICE_DOMAIN);
         }
+    }
+
+    #[test]
+    fn replay_uses_the_original_proposal_time_for_leases() {
+        let command = Command::LockAcquire {
+            keys: vec!["replay-safe".to_string()],
+            holder: "worker-a".to_string(),
+            ttl_ms: 5_000,
+            wait: false,
+        };
+        let original = StateMachine::new();
+        let first = original.apply_at(command.clone(), 10_000);
+        let restarted = StateMachine::new();
+        let replay = restarted.apply_at(command, 10_000);
+        assert_eq!(
+            first.output["lease_expires_ms"],
+            replay.output["lease_expires_ms"]
+        );
+        assert_eq!(replay.output["lease_expires_ms"], 15_000);
+    }
+
+    #[test]
+    fn snapshot_restores_fencing_tokens_and_wait_queues() {
+        let original = StateMachine::new();
+        let base = now_ms();
+        original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["snapshot-lock".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 300_000,
+                wait: false,
+            },
+            base,
+        );
+        original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["snapshot-lock".to_string()],
+                holder: "waiter".to_string(),
+                ttl_ms: 300_000,
+                wait: true,
+            },
+            base + 1,
+        );
+        let bytes = original.snapshot().unwrap();
+        let restored = StateMachine::new();
+        restored.restore(&bytes).unwrap();
+        let inventory = restored.lock_inventory();
+        assert_eq!(inventory.held.len(), 1);
+        assert_eq!(inventory.wait_queue.len(), 1);
+        assert_eq!(inventory.held[0].fencing_token, 1);
+        assert_eq!(inventory.wait_queue[0].holder, "waiter");
     }
 }

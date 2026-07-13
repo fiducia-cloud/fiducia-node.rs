@@ -59,6 +59,24 @@ pub struct AppendEntriesResp {
     pub match_index: u64,
 }
 
+/// InstallSnapshot transfers compacted state to a follower whose next required
+/// log entry is no longer retained.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReq {
+    pub term: u64,
+    pub leader_id: String,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub state: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResp {
+    pub term: u64,
+    pub success: bool,
+    pub match_index: u64,
+}
+
 /// `RequestVote` — a candidate solicits a vote for one shard's Raft group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteReq {
@@ -223,6 +241,37 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/vote");
+                with_internal_auth(client.post(url))
+                    .json(&req)
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()
+            }
+        }
+    }
+
+    /// Send a compacted state-machine snapshot to a lagging follower.
+    pub async fn install_snapshot(
+        &self,
+        peer: &str,
+        shard: ShardId,
+        req: InstallSnapshotReq,
+    ) -> Option<InstallSnapshotResp> {
+        match self {
+            Transport::Loopback(reg) => {
+                let inbox = reg.sender(peer, shard)?;
+                let (resp, rx) = oneshot::channel();
+                inbox
+                    .send(ShardMsg::InstallSnapshot { req, resp })
+                    .await
+                    .ok()?;
+                rx.await.ok()
+            }
+            Transport::Http(client) => {
+                let url = format!("http://{peer}/raft/{shard}/snapshot");
                 with_internal_auth(client.post(url))
                     .json(&req)
                     .send()

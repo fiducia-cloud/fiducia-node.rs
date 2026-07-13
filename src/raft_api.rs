@@ -16,12 +16,25 @@ use axum::{
 };
 
 use crate::consensus::{Node, ShardId};
-use crate::transport::{AppendEntriesReq, RequestVoteReq};
+use crate::transport::{AppendEntriesReq, InstallSnapshotReq, RequestVoteReq};
 
 pub fn router() -> Router<Arc<Node>> {
     Router::new()
         .route("/:shard/append", post(append))
+        .route("/:shard/snapshot", post(snapshot))
         .route("/:shard/vote", post(vote))
+}
+
+/// Install a compacted state-machine snapshot on a lagging follower.
+async fn snapshot(
+    State(node): State<Arc<Node>>,
+    Path(shard): Path<ShardId>,
+    Json(req): Json<InstallSnapshotReq>,
+) -> Response {
+    match node.install_snapshot(shard, req).await {
+        Some(resp) => Json(resp).into_response(),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 /// `POST /raft/{shard}/append` — replicate log entries / heartbeat.

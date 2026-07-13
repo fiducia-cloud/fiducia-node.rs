@@ -2,7 +2,7 @@
 //!
 //! Raft requires three pieces of state to survive a restart **before** the node
 //! acts on them, or its safety guarantees break: `current_term`, `voted_for`,
-//! and the replicated `log`. Without them a restarted member could vote twice in
+//! the replicated `log`, and the latest state-machine snapshot. Without them a restarted member could vote twice in
 //! one term or forget an entry it had already acknowledged — and because this
 //! engine keeps its state machine in memory, a pod restart would otherwise drop
 //! every committed record, letting a "leader + one follower" group collapse to a
@@ -10,9 +10,9 @@
 //! that state, fsync'd before the caller treats the matching action as durable.
 //!
 //! We also persist `commit_index`. The Raft paper treats it as volatile, but it
-//! does so assuming a persisted state machine; here the state machine is rebuilt
-//! by **replaying the log up to `commit_index`** at boot, so the pointer has to
-//! survive too.
+//! does so assuming a persisted state machine; here the state machine is restored
+//! from a snapshot and replays the retained suffix up to `commit_index`, so the
+//! pointer has to survive too.
 //!
 //! Layout, under `<data_dir>/shard-<id>/`:
 //!   * `meta` — JSON `{current_term, voted_for, commit_index}`, written with the
@@ -21,6 +21,8 @@
 //!   * `log`  — newline-delimited JSON, one [`LogEntry`] per line, appended and
 //!     fsync'd. A trailing torn line (crash mid-append) is dropped on load and
 //!     the file is canonicalized so the next append starts from clean bytes.
+//!   * `snapshot` — atomic JSON state-machine image plus its last included
+//!     index/term. Once durable, the matching log prefix is removed.
 //!
 //! NOTE: fsync here is synchronous inside the shard actor's task — correctness
 //! over throughput for this build. A high-write deployment should move the log
@@ -43,6 +45,14 @@ struct Meta {
     commit_index: u64,
 }
 
+/// Durable state-machine image at one committed Raft index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSnapshot {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub state: Vec<u8>,
+}
+
 /// Raft state recovered from disk at boot. Empty (all-zero, empty log) for a
 /// fresh shard with no prior on-disk state.
 #[derive(Debug, Default)]
@@ -51,6 +61,7 @@ pub struct Recovered {
     pub voted_for: Option<String>,
     pub commit_index: u64,
     pub log: Vec<LogEntry>,
+    pub snapshot: Option<PersistedSnapshot>,
 }
 
 /// A shard's durable store: the `meta` file plus an append handle to `log`.
@@ -58,6 +69,7 @@ pub struct ShardStore {
     dir: PathBuf,
     log_path: PathBuf,
     meta_path: PathBuf,
+    snapshot_path: PathBuf,
     log_file: File,
     /// Number of log entries known to be on disk (so appends write only the tail).
     durable_len: usize,
@@ -73,6 +85,7 @@ impl ShardStore {
         fs::create_dir_all(&dir)?;
         let meta_path = dir.join("meta");
         let log_path = dir.join("log");
+        let snapshot_path = dir.join("snapshot");
 
         let meta: Meta = match fs::read(&meta_path) {
             Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
@@ -82,6 +95,17 @@ impl ShardStore {
 
         // Parse every complete JSON line; stop at the first that fails to parse —
         // that's a record torn by a crash mid-append, and everything after it.
+        let snapshot: Option<PersistedSnapshot> = match fs::read(&snapshot_path) {
+            Ok(bytes) if !bytes.is_empty() => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            ),
+            _ => None,
+        };
+        let snapshot_index = snapshot
+            .as_ref()
+            .map(|value| value.last_included_index)
+            .unwrap_or(0);
         let mut log: Vec<LogEntry> = Vec::new();
         if let Ok(file) = File::open(&log_path) {
             for line in BufReader::new(file).split(b'\n') {
@@ -90,7 +114,8 @@ impl ShardStore {
                     continue;
                 }
                 match serde_json::from_slice::<LogEntry>(&line) {
-                    Ok(entry) => log.push(entry),
+                    Ok(entry) if entry.index > snapshot_index => log.push(entry),
+                    Ok(_) => {}
                     Err(_) => break,
                 }
             }
@@ -105,6 +130,7 @@ impl ShardStore {
             dir,
             log_path,
             meta_path,
+            snapshot_path,
             log_file,
             durable_len: 0,
         };
@@ -116,6 +142,7 @@ impl ShardStore {
             voted_for: meta.voted_for,
             commit_index: meta.commit_index,
             log,
+            snapshot,
         };
         Ok((store, recovered))
     }
@@ -189,6 +216,26 @@ impl ShardStore {
         self.durable_len = log.len();
         Ok(())
     }
+
+    /// Atomically persist a state-machine snapshot, then compact the log to the
+    /// suffix after it. Writing the snapshot first makes a crash between the two
+    /// steps safe: recovery filters the still-present prefix by snapshot index.
+    pub fn save_snapshot(
+        &mut self,
+        snapshot: &PersistedSnapshot,
+        remaining_log: &[LogEntry],
+    ) -> io::Result<()> {
+        let tmp = self.snapshot_path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp)?;
+            serde_json::to_writer(&mut file, snapshot)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &self.snapshot_path)?;
+        sync_dir(&self.dir)?;
+        self.rewrite(remaining_log)
+    }
 }
 
 /// fsync a directory so a rename of one of its entries is itself durable.
@@ -205,6 +252,7 @@ mod tests {
         LogEntry {
             term,
             index,
+            proposed_at_ms: 1_000,
             command: Some(Command::KvPut {
                 key: key.to_string(),
                 value: "v".to_string(),
@@ -299,5 +347,37 @@ mod tests {
         let (_store, rec) = ShardStore::open(&root, 9).unwrap();
         assert_eq!(rec.log.len(), 1, "torn record must be dropped");
         assert_eq!(rec.log[0].index, 1);
+    }
+
+    #[test]
+    fn snapshot_compacts_log_and_survives_reopen() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 4).unwrap();
+            store
+                .append_tail(&[
+                    entry(1, 2, "old-a"),
+                    entry(2, 2, "old-b"),
+                    entry(3, 3, "tail"),
+                ])
+                .unwrap();
+            store.save_meta(3, Some("node-a"), 3).unwrap();
+            store
+                .save_snapshot(
+                    &PersistedSnapshot {
+                        last_included_index: 2,
+                        last_included_term: 2,
+                        state: br#"{"revision":2}"#.to_vec(),
+                    },
+                    &[entry(3, 3, "tail")],
+                )
+                .unwrap();
+        }
+        let (_store, recovered) = ShardStore::open(&root, 4).unwrap();
+        let snapshot = recovered.snapshot.unwrap();
+        assert_eq!(snapshot.last_included_index, 2);
+        assert_eq!(snapshot.last_included_term, 2);
+        assert_eq!(recovered.log.len(), 1);
+        assert_eq!(recovered.log[0].index, 3);
     }
 }

@@ -275,6 +275,7 @@ FIDUCIA_RAFT_HEARTBEAT_MS=100
 FIDUCIA_RAFT_ELECTION_MIN_MS=1000
 FIDUCIA_RAFT_ELECTION_JITTER_MS=500
 FIDUCIA_RAFT_COMMIT_WAIT_MS=10000
+FIDUCIA_RAFT_SNAPSHOT_THRESHOLD=1024 # committed entries between snapshots; 0 disables
 ```
 
 `/v1/status` reports the active timing and per-shard metrics including append
@@ -292,29 +293,25 @@ database: the **replicated log + the deterministic state machine** are the store
 - **Durability = replication.** A write is durable once a **quorum** of the
   shard's Raft group has it in their logs. Losing a minority of replicas loses no
   committed data; a new leader is elected from the up-to-date majority.
-- **Recovery = replay.** A restarted/replacement replica catches up by replaying
-  the log (tail via `AppendEntries`, or a snapshot + tail once the leader has
-  compacted).
+- **Recovery = snapshot + deterministic replay.** Every log entry carries the
+  leader-stamped proposal time used by all replicas. Restart replay therefore
+  cannot refresh a lock, idempotency record, election, service registration, or
+  other TTL. Legacy entries without a timestamp are conservatively epoch-anchored
+  and expire instead of resurrecting.
+- **Compaction is automatic.** After
+  `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` newly applied entries (default 1024), the
+  complete state machine is atomically snapshotted and the committed log prefix
+  is removed. A lagging follower whose required prefix was compacted receives
+  `InstallSnapshot`, then resumes with the retained log suffix.
+- **Each shard is persisted under `FIDUCIA_DATA_DIR`** (default
+  `/var/lib/fiducia`): atomic `meta`, newline-delimited `log`, and atomic
+  `snapshot` files. The node fsyncs before acknowledging durability. Kubernetes
+  deployments must mount this directory on stable persistent storage.
 
-Today the per-shard log and state machine are **in-memory** (durability comes
-from replication across nodes). That is not enough for production Kubernetes
-unless every Raft member has stable persistent storage: losing a pod's ephemeral
-disk can silently erase one of the durable copies. The seam to add on-disk
-durability is narrow and deliberate:
-
-| Piece | Status | On-disk path |
-|-------|--------|--------------|
-| Raft log + `commit_index`/`voted_for` | in-memory `Vec<LogEntry>` per shard | append-only WAL with periodic `fsync` (one shared engine batches fsync across shards) |
-| State machine | in-memory maps | rebuilt from the log; bounded by **snapshots** |
-| Log growth | unbounded | **snapshot + compaction**: persist a state-machine snapshot, truncate the log before it |
-
-This is the standard Raft durability stack (WAL → snapshot → compaction); none of
-it changes the API or the state-machine semantics above. A single embedded engine
-plugs in behind that seam — see [`docs/storage.md`](docs/storage.md) for the
-concrete design: embedded RocksDB under `FIDUCIA_NODE_DATA_DIR`, with column
-families for the Raft log/meta, applied coordination state, watch indexes, and
-snapshots. (Postgres/Supabase stay the *business*/control-plane database — orgs,
-projects, users, API keys, audit, billing — never the coordination store.)
+`/v1/status` exposes `snapshot_index` and `retained_log_entries` per shard so
+operators can verify compaction rather than inferring it from disk usage.
+Postgres/Supabase remain the business/control-plane database for organizations,
+projects, users, API keys, audit, and billing—not the coordination store.
 
 ## Layout
 
