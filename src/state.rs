@@ -1143,12 +1143,6 @@ pub enum HandoffStatus {
     Expired,
 }
 
-impl HandoffStatus {
-    pub fn is_terminal(self) -> bool {
-        !matches!(self, HandoffStatus::Offered)
-    }
-}
-
 /// Read view of an atomic ownership handoff. While `Offered`, the original owner
 /// (`from`, holding `from_token`) still owns the resource; on `Accepted`, `to`
 /// receives a strictly higher `to_token`, so the resource's fencing rejects the
