@@ -163,7 +163,11 @@ mod tests {
             assert!(authorized(Some("s3cret"), Some("s3cret"), allow_insecure));
             assert!(!authorized(Some("s3cret"), Some("s3cre7"), allow_insecure));
             // length mismatch
-            assert!(!authorized(Some("s3cret"), Some("s3cret-extra"), allow_insecure));
+            assert!(!authorized(
+                Some("s3cret"),
+                Some("s3cret-extra"),
+                allow_insecure
+            ));
             // header absent
             assert!(!authorized(Some("s3cret"), None, allow_insecure));
         }

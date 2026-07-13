@@ -90,8 +90,17 @@ pub fn router() -> Router<Arc<Node>> {
         .route("/supersede", post(supersede))
 }
 
-async fn get_claim(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<NameParam>) -> Response {
-    match node.query(ReadRequest::Claim { name: q.name.clone() }).await {
+async fn get_claim(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Query(q): Query<NameParam>,
+) -> Response {
+    match node
+        .query(ReadRequest::Claim {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Claim(claim)) => Json(json!({
             "name": q.name,
             "found": claim.is_some(),
@@ -122,7 +131,11 @@ async fn assert(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Assert
     propose_response(result, &uri)
 }
 
-async fn support(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<SupportBody>) -> Response {
+async fn support(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<SupportBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::claim(&body.name, Some(&body.agent)) {
         return rejection.into_response();
     }
@@ -135,7 +148,11 @@ async fn support(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Suppo
     propose_response(result, &uri)
 }
 
-async fn contest(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ContestBody>) -> Response {
+async fn contest(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ContestBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::claim(&body.name, Some(&body.agent)) {
         return rejection.into_response();
     }
@@ -149,7 +166,11 @@ async fn contest(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Conte
     propose_response(result, &uri)
 }
 
-async fn resolve(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ResolveBody>) -> Response {
+async fn resolve(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ResolveBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::claim(&body.name, None) {
         return rejection.into_response();
     }

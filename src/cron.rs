@@ -19,9 +19,9 @@
 pub struct CronSchedule {
     minute: [bool; 60],
     hour: [bool; 24],
-    dom: [bool; 32], // index 1..=31
+    dom: [bool; 32],   // index 1..=31
     month: [bool; 13], // index 1..=12
-    dow: [bool; 7], // 0=Sun..6=Sat
+    dow: [bool; 7],    // 0=Sun..6=Sat
     dom_restricted: bool,
     dow_restricted: bool,
 }
@@ -110,16 +110,37 @@ impl CronSchedule {
 }
 
 const MONTHS: &[(&str, u32)] = &[
-    ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4), ("may", 5), ("jun", 6),
-    ("jul", 7), ("aug", 8), ("sep", 9), ("oct", 10), ("nov", 11), ("dec", 12),
+    ("jan", 1),
+    ("feb", 2),
+    ("mar", 3),
+    ("apr", 4),
+    ("may", 5),
+    ("jun", 6),
+    ("jul", 7),
+    ("aug", 8),
+    ("sep", 9),
+    ("oct", 10),
+    ("nov", 11),
+    ("dec", 12),
 ];
 const DAYS: &[(&str, u32)] = &[
-    ("sun", 0), ("mon", 1), ("tue", 2), ("wed", 3), ("thu", 4), ("fri", 5), ("sat", 6),
+    ("sun", 0),
+    ("mon", 1),
+    ("tue", 2),
+    ("wed", 3),
+    ("thu", 4),
+    ("fri", 5),
+    ("sat", 6),
 ];
 
 /// Parse one field into the set of values it matches, plus whether it is
 /// *restricted* (anything other than a bare `*`). `max` is inclusive.
-fn parse_field(spec: &str, min: u32, max: u32, names: &[(&str, u32)]) -> Result<(Vec<u32>, bool), String> {
+fn parse_field(
+    spec: &str,
+    min: u32,
+    max: u32,
+    names: &[(&str, u32)],
+) -> Result<(Vec<u32>, bool), String> {
     let mut values = Vec::new();
     let restricted = spec != "*";
     for part in spec.split(',') {
@@ -222,12 +243,27 @@ mod tests {
     #[test]
     fn rejects_malformed_expressions() {
         assert!(CronSchedule::parse("* * * *").is_err(), "too few fields");
-        assert!(CronSchedule::parse("* * * * * *").is_err(), "too many fields");
-        assert!(CronSchedule::parse("60 * * * *").is_err(), "minute out of range");
-        assert!(CronSchedule::parse("* 24 * * *").is_err(), "hour out of range");
+        assert!(
+            CronSchedule::parse("* * * * * *").is_err(),
+            "too many fields"
+        );
+        assert!(
+            CronSchedule::parse("60 * * * *").is_err(),
+            "minute out of range"
+        );
+        assert!(
+            CronSchedule::parse("* 24 * * *").is_err(),
+            "hour out of range"
+        );
         assert!(CronSchedule::parse("*/0 * * * *").is_err(), "zero step");
-        assert!(CronSchedule::parse("5-1 * * * *").is_err(), "reversed range");
-        assert!(CronSchedule::parse("* * * FOO *").is_err(), "bad month name");
+        assert!(
+            CronSchedule::parse("5-1 * * * *").is_err(),
+            "reversed range"
+        );
+        assert!(
+            CronSchedule::parse("* * * FOO *").is_err(),
+            "bad month name"
+        );
     }
 
     #[test]
@@ -269,7 +305,11 @@ mod tests {
         let fri = CronSchedule::parse("0 0 * * 5").unwrap();
         assert_eq!(fri.next_after(0), Some(DAY), "next Friday is day 1");
         let thu = CronSchedule::parse("0 0 * * 4").unwrap();
-        assert_eq!(thu.next_after(0), Some(7 * DAY), "next Thursday after day 0 is day 7");
+        assert_eq!(
+            thu.next_after(0),
+            Some(7 * DAY),
+            "next Thursday after day 0 is day 7"
+        );
         // Sunday via both spellings resolves identically.
         assert_eq!(
             CronSchedule::parse("0 0 * * 0").unwrap().next_after(0),

@@ -79,7 +79,10 @@ impl IntoResponse for Rejection {
 
 fn check_str(label: &str, value: &str, max: usize, allow_empty: bool) -> Result<(), Rejection> {
     if !allow_empty && value.is_empty() {
-        return Err(Rejection::new("empty_field", format!("{label} must not be empty")));
+        return Err(Rejection::new(
+            "empty_field",
+            format!("{label} must not be empty"),
+        ));
     }
     if value.len() > max {
         return Err(Rejection::new(
@@ -104,7 +107,10 @@ fn check_metadata(metadata: &HashMap<String, String>) -> Result<(), Rejection> {
     if metadata.len() > MAX_METADATA_ENTRIES {
         return Err(Rejection::new(
             "too_much_metadata",
-            format!("metadata has {} entries; max is {MAX_METADATA_ENTRIES}", metadata.len()),
+            format!(
+                "metadata has {} entries; max is {MAX_METADATA_ENTRIES}",
+                metadata.len()
+            ),
         ));
     }
     for (k, v) in metadata {
@@ -200,7 +206,11 @@ pub fn handoff(name: &str, from: Option<&str>, to: Option<&str>) -> Result<(), R
 }
 
 /// Validate a budget name plus a reservation id / holder when named.
-pub fn budget(name: &str, reservation_id: Option<&str>, holder: Option<&str>) -> Result<(), Rejection> {
+pub fn budget(
+    name: &str,
+    reservation_id: Option<&str>,
+    holder: Option<&str>,
+) -> Result<(), Rejection> {
     check_str("budget name", name, MAX_NAME_BYTES, false)?;
     if let Some(id) = reservation_id {
         check_str("reservation_id", id, MAX_NAME_BYTES, false)?;
@@ -311,20 +321,28 @@ mod tests {
     #[test]
     fn lock_acquire_rejects_an_oversized_key() {
         let keys = vec![big(MAX_KEY_BYTES + 1)];
-        assert_eq!(lock_acquire(&keys, &None, None).unwrap_err().code, "field_too_long");
+        assert_eq!(
+            lock_acquire(&keys, &None, None).unwrap_err().code,
+            "field_too_long"
+        );
     }
 
     #[test]
     fn lock_acquire_rejects_an_empty_key() {
         let keys = vec![String::new()];
-        assert_eq!(lock_acquire(&keys, &None, None).unwrap_err().code, "empty_field");
+        assert_eq!(
+            lock_acquire(&keys, &None, None).unwrap_err().code,
+            "empty_field"
+        );
     }
 
     #[test]
     fn ttl_ceiling_is_enforced() {
         let keys = vec!["k".to_string()];
         assert_eq!(
-            lock_acquire(&keys, &None, Some(MAX_TTL_MS + 1)).unwrap_err().code,
+            lock_acquire(&keys, &None, Some(MAX_TTL_MS + 1))
+                .unwrap_err()
+                .code,
             "ttl_too_large"
         );
         assert!(lock_acquire(&keys, &None, Some(MAX_TTL_MS)).is_ok());

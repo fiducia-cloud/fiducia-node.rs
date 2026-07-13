@@ -10,9 +10,9 @@
 
 mod barriers;
 mod budgets;
+mod claims;
 mod consensus;
 mod counters;
-mod claims;
 mod cron;
 mod decisions;
 mod discovery;

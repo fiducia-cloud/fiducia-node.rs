@@ -131,6 +131,7 @@ impl<K: Eq + Hash + Clone, V> IndexedQueue<K, V> {
     }
 
     /// Borrow the value for `key`. O(1).
+    #[allow(dead_code)]
     pub fn get(&self, key: &K) -> Option<&V> {
         self.index
             .get(key)
@@ -138,12 +139,14 @@ impl<K: Eq + Hash + Clone, V> IndexedQueue<K, V> {
     }
 
     /// Mutably borrow the value for `key`. O(1).
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let i = *self.index.get(key)?;
         Some(&mut self.slab[i].as_mut().expect("indexed slot occupied").value)
     }
 
     /// Borrow the front (oldest) `(key, value)`. O(1).
+    #[allow(dead_code)]
     pub fn front(&self) -> Option<(&K, &V)> {
         self.head.map(|i| {
             let n = self.slab[i].as_ref().expect("head occupied");
@@ -373,7 +376,11 @@ mod tests {
             q.push_back(n, n);
         }
         let expected: Vec<i32> = (50..150).collect();
-        assert_eq!(drain_order(q), expected, "FIFO order holds across slot reuse");
+        assert_eq!(
+            drain_order(q),
+            expected,
+            "FIFO order holds across slot reuse"
+        );
     }
 
     #[test]
@@ -383,7 +390,11 @@ mod tests {
             q.push_back(n, n);
         }
         let seen: Vec<i32> = q.iter().map(|(_, v)| *v).collect();
-        assert_eq!(seen, vec![3, 1, 2], "iteration follows links, not key hashes");
+        assert_eq!(
+            seen,
+            vec![3, 1, 2],
+            "iteration follows links, not key hashes"
+        );
     }
 
     #[test]

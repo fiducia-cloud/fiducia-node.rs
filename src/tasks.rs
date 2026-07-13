@@ -104,7 +104,12 @@ pub fn router() -> Router<Arc<Node>> {
 }
 
 async fn get_task(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<NameParam>) -> Response {
-    match node.query(ReadRequest::Task { name: q.name.clone() }).await {
+    match node
+        .query(ReadRequest::Task {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Task(task)) => Json(json!({
             "name": q.name,
             "found": task.is_some(),

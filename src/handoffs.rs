@@ -68,7 +68,12 @@ async fn get_handoff(
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
-    match node.query(ReadRequest::Handoff { name: q.name.clone() }).await {
+    match node
+        .query(ReadRequest::Handoff {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Handoff(handoff)) => Json(json!({
             "name": q.name,
             "found": handoff.is_some(),
@@ -98,7 +103,11 @@ async fn offer(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<OfferBo
     propose_response(result, &uri)
 }
 
-async fn accept(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<DecisionBody>) -> Response {
+async fn accept(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<DecisionBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::handoff(&body.name, None, Some(&body.to)) {
         return rejection.into_response();
     }
@@ -111,7 +120,11 @@ async fn accept(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Decisi
     propose_response(result, &uri)
 }
 
-async fn reject(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<DecisionBody>) -> Response {
+async fn reject(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<DecisionBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::handoff(&body.name, None, Some(&body.to)) {
         return rejection.into_response();
     }

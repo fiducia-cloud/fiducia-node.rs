@@ -87,7 +87,12 @@ async fn get_effect(
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
-    match node.query(ReadRequest::Effect { name: q.name.clone() }).await {
+    match node
+        .query(ReadRequest::Effect {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Effect(effect)) => Json(json!({
             "name": q.name,
             "found": effect.is_some(),
@@ -99,7 +104,11 @@ async fn get_effect(
     }
 }
 
-async fn prepare(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<PrepareBody>) -> Response {
+async fn prepare(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<PrepareBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::effect(&body.name, None) {
         return rejection.into_response();
     }
@@ -116,7 +125,11 @@ async fn prepare(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Prepa
     propose_response(result, &uri)
 }
 
-async fn approve(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ApproveBody>) -> Response {
+async fn approve(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ApproveBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::effect(&body.name, Some(&body.principal)) {
         return rejection.into_response();
     }
