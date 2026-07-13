@@ -365,7 +365,7 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_PEERS` | string | *(empty)* | no | Comma-separated peer node addresses; empty ⇒ single-node mode. |
 | `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Number of shards the keyspace is partitioned into (min `1`). |
 | `FIDUCIA_DATA_DIR` | string | `/var/lib/fiducia` | no | Directory for durable per-shard Raft state (log/meta/snapshot). Must be writable. |
-| `FIDUCIA_RAFT_COMPACT_THRESHOLD` | integer | `1024` | no | Live log-entry count that triggers snapshot + compaction; `0` disables. |
+| `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` | integer | `1024` | no | Committed entries between snapshots and compaction; `0` disables. |
 | `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
 | `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Debug-build-only local-dev opt-out. Release binaries compile the bypass out. |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
@@ -411,20 +411,25 @@ request (fail-closed) — that is intended, not a bug.
 
 ### flags-2-env: flags → env
 
-`.cli-flags.toml` maps CLI flags to these environment variables via the pinned
+`.cli-flags.toml` maps non-secret operational flags to these environment variables via the pinned
 [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 (`vendor/flags-2-env`). `scripts/with-flags2env.sh` parses the flags against that
 schema, exports the resulting env map, then execs the command:
 
 ```bash
-# Build the pinned parser once (a prebuilt binary may already be vendored):
-make -C vendor/flags-2-env all
+# Build the pinned parser for this platform:
+make -B -C vendor/flags-2-env all
 # Derive FIDUCIA_* from flags, then run the node:
 scripts/with-flags2env.sh --node-id node-a --peers node-b:8090,node-c:8090 \
   --shard-count 16 -- cargo run
 # Audit the schema (also run in CI by .github/workflows/cli-flags.yml):
 vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 ```
+
+`FIDUCIA_INTERNAL_SECRET` and the dangerous
+`FIDUCIA_ALLOW_INSECURE_INTERNAL` escape hatch are deliberately excluded from
+the CLI schema. Configure them only through the environment or deployment
+configuration so neither can be enabled or exposed casually through argv.
 
 ## Security
 

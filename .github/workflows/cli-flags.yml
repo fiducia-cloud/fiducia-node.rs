@@ -27,5 +27,5 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - run: make -B -C vendor/flags-2-env all
       - run: vendor/flags-2-env/build/flags2env audit .cli-flags.toml
-

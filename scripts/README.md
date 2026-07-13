@@ -3,6 +3,7 @@
 Helper scripts for working with the crate.
 
 - `with-flags2env.sh` — bridges CLI flags to the `FIDUCIA_*` environment
-  variables the `fiducia-region` binary reads. It runs the pinned `flags2env`
+  variables the node binary reads. It runs the pinned `flags2env`
   parser against the `.cli-flags.toml` schema, exports the resulting env map,
-  then execs the given command (e.g. `cargo run --bin fiducia-region`).
+  then execs the given command (e.g. `cargo run`). Secrets and the insecure
+  trust-boundary escape hatch remain environment-only.
