@@ -896,7 +896,7 @@ pub struct IdempotencyRecord {
 }
 
 /// The current holder of a named election.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Leadership {
     pub leader: String,
     pub fencing_token: u64,
