@@ -45,6 +45,10 @@ pub const MAX_METADATA_ENTRIES: usize = 64;
 pub const MAX_METADATA_KEY_BYTES: usize = 256;
 /// Max bytes for a single metadata value.
 pub const MAX_METADATA_VALUE_BYTES: usize = 4096;
+/// Max bytes for a rate-limit `{tenant}` / `{key}` path segment. Each distinct
+/// tenant+key becomes a long-lived limiter bucket (a map entry), so an unbounded
+/// value is both a memory-growth vector and a way to mint arbitrary bucket names.
+pub const MAX_RATE_LIMIT_SEGMENT_BYTES: usize = 256;
 
 /// A rejected write. Renders as `400 Bad Request` with a stable machine code and
 /// a human-readable detail, matching the node's other error bodies.
@@ -234,6 +238,27 @@ pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// Validate a rate-limit `{tenant}` / `{key}` pair taken straight from the request
+/// path. Both come from untrusted URL segments and become long-lived limiter
+/// bucket keys, so reject empty, over-long, or control/whitespace-bearing values
+/// before they can grow the map unboundedly or forge cross-tenant bucket names.
+pub fn rate_limit(tenant: &str, key: &str) -> Result<(), Rejection> {
+    check_path_segment("tenant", tenant)?;
+    check_path_segment("key", key)?;
+    Ok(())
+}
+
+fn check_path_segment(label: &str, value: &str) -> Result<(), Rejection> {
+    check_str(label, value, MAX_RATE_LIMIT_SEGMENT_BYTES, false)?;
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(Rejection::new(
+            "invalid_field",
+            format!("{label} must not contain control or whitespace characters"),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a service registration: name, instance id, address, TTL, metadata.
 pub fn service_register(
     service: &str,
@@ -309,6 +334,34 @@ mod tests {
     fn semaphore_limit_ceiling_is_enforced() {
         let err = semaphore_acquire("k", &None, MAX_SEMAPHORE_LIMIT + 1, None).unwrap_err();
         assert_eq!(err.code, "limit_too_large");
+    }
+
+    #[test]
+    fn rate_limit_accepts_normal_segments() {
+        assert!(rate_limit("acme", "login").is_ok());
+        assert!(rate_limit("tenant-42", "api/v1:read").is_ok());
+    }
+
+    #[test]
+    fn rate_limit_rejects_empty_segments() {
+        assert_eq!(rate_limit("", "k").unwrap_err().code, "empty_field");
+        assert_eq!(rate_limit("t", "").unwrap_err().code, "empty_field");
+    }
+
+    #[test]
+    fn rate_limit_rejects_oversized_segments() {
+        let long = big(MAX_RATE_LIMIT_SEGMENT_BYTES + 1);
+        assert_eq!(rate_limit(&long, "k").unwrap_err().code, "field_too_long");
+        assert_eq!(rate_limit("t", &long).unwrap_err().code, "field_too_long");
+        // Exactly at the cap is allowed.
+        assert!(rate_limit(&big(MAX_RATE_LIMIT_SEGMENT_BYTES), "k").is_ok());
+    }
+
+    #[test]
+    fn rate_limit_rejects_control_and_whitespace() {
+        assert_eq!(rate_limit("a b", "k").unwrap_err().code, "invalid_field");
+        assert_eq!(rate_limit("t", "a\nb").unwrap_err().code, "invalid_field");
+        assert_eq!(rate_limit("t", "a\0b").unwrap_err().code, "invalid_field");
     }
 
     #[test]
