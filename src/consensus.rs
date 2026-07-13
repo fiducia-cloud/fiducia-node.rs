@@ -2158,6 +2158,7 @@ impl Node {
                 transport.clone(),
                 tx.clone(),
                 timing,
+                config.compact_threshold,
                 store,
                 recovered,
             );
