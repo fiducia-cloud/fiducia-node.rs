@@ -3151,6 +3151,202 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn test_data_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fiducia-node-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// The replay-resurrection fix (fiducia-node #8): a lease that expired
+    /// before a restart must STAY expired after it, because replay applies each
+    /// entry at its proposer-stamped `ts_ms`, not at boot time. Compaction is
+    /// disabled so recovery really replays the log.
+    #[tokio::test]
+    async fn restart_replay_at_stamped_time_does_not_resurrect_expired_leases() {
+        let dir = test_data_dir("stamped-replay");
+        let cfg = || NodeConfig {
+            node_id: "solo".to_string(),
+            peers: vec![],
+            shard_count: 1,
+            data_dir: Some(dir.clone()),
+            compact_threshold: 0, // force pure log replay at boot
+        };
+        let claim = |owner: &str| Command::IdempotencyClaim {
+            key: "req-1".to_string(),
+            owner: owner.to_string(),
+            ttl_ms: 100, // in-flight lease shorter than the sleep below
+            retention_ms: None,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            let out = n.propose(claim("worker-a")).await.expect("commit");
+            assert_eq!(out.output["claimed"], true);
+            n.shutdown(None);
+        }
+
+        // The lease dies while the "pod" is down.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            // Before the fix, boot replay re-applied the claim at wall time,
+            // resurrecting the record with a fresh lease — this read returned it
+            // and a re-claim came back `duplicate: true`.
+            match n
+                .query(ReadRequest::Idempotency {
+                    key: "req-1".to_string(),
+                })
+                .await
+            {
+                Ok(ReadResponse::Idempotency(None)) => {}
+                other => panic!("expired claim resurrected across restart: {other:?}"),
+            }
+            let reclaim = n.propose(claim("worker-b")).await.expect("commit");
+            assert_eq!(reclaim.output["claimed"], true);
+            assert_eq!(
+                reclaim.output["duplicate"], false,
+                "a lease that expired before the restart must be re-claimable"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction folds the applied log prefix into a snapshot, bounds the live
+    /// log, and recovery restores the snapshot + replays only the tail.
+    #[tokio::test]
+    async fn log_compaction_bounds_the_log_and_state_survives_restart() {
+        let dir = test_data_dir("compaction");
+        let cfg = || NodeConfig {
+            node_id: "solo".to_string(),
+            peers: vec![],
+            shard_count: 1,
+            data_dir: Some(dir.clone()),
+            compact_threshold: 8,
+        };
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            for i in 0..40 {
+                n.propose(put(&format!("flags/key-{i}"), "on"))
+                    .await
+                    .expect("commit");
+            }
+            let status = n.status().await;
+            let shard = &status.shards[0];
+            assert!(
+                shard.snapshot_base_index > 0,
+                "log should have been compacted"
+            );
+            assert!(
+                shard.last_log_index - shard.snapshot_base_index < 40,
+                "live log must be bounded, got {} live entries",
+                shard.last_log_index - shard.snapshot_base_index
+            );
+            n.shutdown(None);
+        }
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            // Every committed write is readable: the ones folded into the
+            // snapshot and the ones replayed from the remaining log tail.
+            for i in [0usize, 20, 39] {
+                match n
+                    .query(ReadRequest::Kv {
+                        key: format!("flags/key-{i}"),
+                    })
+                    .await
+                {
+                    Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "on"),
+                    other => panic!("key-{i} lost across compaction + restart: {other:?}"),
+                }
+            }
+            let status = n.status().await;
+            assert!(
+                status.shards[0].snapshot_base_index > 0,
+                "recovery must seed from the persisted snapshot, not replay from index 1"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A follower that joins after the leader compacted past its position can
+    /// no longer be caught up with log entries — the leader must ship an
+    /// InstallSnapshot, then continue with the live tail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lagging_follower_catches_up_via_install_snapshot() {
+        let reg = LoopbackRegistry::new();
+        let compacting_node = |id: &str, peers: &[&str]| {
+            Node::bootstrap(
+                NodeConfig {
+                    node_id: id.to_string(),
+                    peers: peers.iter().map(|s| s.to_string()).collect(),
+                    shard_count: 1,
+                    data_dir: None,
+                    compact_threshold: 8,
+                },
+                Transport::loopback(reg.clone()),
+            )
+        };
+
+        // c is a configured member but not running yet: a+b are a quorum of 3.
+        let a = compacting_node("a", &["b", "c"]);
+        let b = compacting_node("b", &["a", "c"]);
+        let leader_idx = await_leader(&[&a, &b], 0, 250).await;
+        let leader = [&a, &b][leader_idx];
+
+        for i in 0..40 {
+            leader
+                .propose(put(&format!("flags/key-{i}"), "on"))
+                .await
+                .expect("commit");
+        }
+        let base = leader.status().await.shards[0].snapshot_base_index;
+        assert!(base > 0, "leader should have compacted its log");
+
+        // c boots with an empty log; the entries it needs are compacted away on
+        // the leader, so only an InstallSnapshot can catch it up.
+        let c = compacting_node("c", &["a", "b"]);
+        let mut caught_up = false;
+        for _ in 0..250 {
+            let status = c.status().await;
+            let shard = &status.shards[0];
+            if shard.role == Role::Follower && shard.last_applied >= base {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            caught_up,
+            "late follower never caught up past the leader's compaction base"
+        );
+
+        // c's own applied state serves the folded-in writes (serializable read).
+        let items = c.list_kv("flags/").await;
+        assert_eq!(
+            items.len(),
+            40,
+            "the snapshot-installed state machine must hold every committed write"
+        );
+        assert!(
+            c.status().await.shards[0].snapshot_base_index >= base,
+            "the follower should have adopted the leader's snapshot base"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn single_process_hosts_multiple_leaders_and_followers_across_shards() {
         let reg = LoopbackRegistry::new();
