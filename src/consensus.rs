@@ -291,7 +291,17 @@ pub struct NodeConfig {
     /// deployment points this at a persistent volume so a pod restart can't drop
     /// a member's log.
     pub data_dir: Option<PathBuf>,
+    /// Compact a shard's log once its live (post-snapshot) entry count reaches
+    /// this many entries: the applied prefix is folded into a state-machine
+    /// snapshot and truncated. Bounds log storage and boot replay time. `0`
+    /// disables compaction. Env: `FIDUCIA_RAFT_COMPACT_THRESHOLD`.
+    pub compact_threshold: usize,
 }
+
+/// Default live-log length that triggers a compaction. Low enough that an idle
+/// but long-lived shard never carries weeks of lease-renew history; high enough
+/// that compaction (a full state serialize + log rewrite) stays rare.
+const DEFAULT_COMPACT_THRESHOLD: usize = 1024;
 
 impl Default for NodeConfig {
     fn default() -> Self {
