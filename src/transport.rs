@@ -235,6 +235,40 @@ impl Transport {
         }
     }
 
+    /// Send `InstallSnapshot` to `peer` for `shard`; `None` if unreachable.
+    /// Uses a longer HTTP timeout than the small RPCs: the payload is the whole
+    /// serialized state machine of one shard.
+    pub async fn install_snapshot(
+        &self,
+        peer: &str,
+        shard: ShardId,
+        req: InstallSnapshotReq,
+    ) -> Option<InstallSnapshotResp> {
+        match self {
+            Transport::Loopback(reg) => {
+                let inbox = reg.sender(peer, shard)?;
+                let (resp, rx) = oneshot::channel();
+                inbox
+                    .send(ShardMsg::InstallSnapshot { req, resp })
+                    .await
+                    .ok()?;
+                rx.await.ok()
+            }
+            Transport::Http(client) => {
+                let url = format!("http://{peer}/raft/{shard}/snapshot");
+                with_internal_auth(client.post(url))
+                    .timeout(std::time::Duration::from_secs(30))
+                    .json(&req)
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()
+            }
+        }
+    }
+
     /// Send `RequestVote` to `peer` for `shard`; `None` if unreachable.
     pub async fn request_vote(
         &self,
