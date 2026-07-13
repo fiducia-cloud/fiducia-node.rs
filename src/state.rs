@@ -2248,15 +2248,20 @@ impl StateMachine {
     /// Every service that has at least one live instance on this shard, with the
     /// live-instance count. Callers fan this out across shards and sum.
     pub fn service_names(&self) -> Vec<ServiceSummary> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         store
             .services
             .iter()
-            .filter(|(_, instances)| !instances.is_empty())
-            .map(|(service, instances)| ServiceSummary {
-                service: service.clone(),
-                instances: instances.len(),
+            .filter_map(|(service, instances)| {
+                let live = instances
+                    .values()
+                    .filter(|instance| instance.lease_expires_ms > now)
+                    .count();
+                (live > 0).then(|| ServiceSummary {
+                    service: service.clone(),
+                    instances: live,
+                })
             })
             .collect()
     }
