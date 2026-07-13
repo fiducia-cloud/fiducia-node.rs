@@ -119,7 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         // Missing auth fails closed unless local dev explicitly opts out.
-        .nest("/v1", v1.layer(middleware::from_fn(internal_auth::guard)))
+        // Order (axum layers apply bottom-up): internal_auth runs first to prove
+        // the trusted hop, THEN require_org enforces + attaches a validated org
+        // scope so every coordination handler runs under a tenant namespace.
+        .nest(
+            "/v1",
+            v1.layer(middleware::from_fn(org_scope::require_org))
+                .layer(middleware::from_fn(internal_auth::guard)),
+        )
         .with_state(node.clone())
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — watches/long-poll are intentionally long-lived.
