@@ -1450,7 +1450,7 @@ struct ReservationRecord {
     status: ReservationStatus,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BudgetRecord {
     limit: BudgetAmount,
     reservations: std::collections::BTreeMap<String, ReservationRecord>,
