@@ -277,14 +277,30 @@ mod tests {
 
     #[test]
     fn introspection_paths_are_exempt() {
+        // The middleware runs on the router nested under `/v1`, so at match
+        // time the prefix is already stripped — these are the forms the guard
+        // actually sees at runtime. (This was once tested only via the
+        // `/v1/...` forms, which never occur in practice, so the exemption was
+        // dead and even `/v1/status` demanded an org.)
+        assert!(is_exempt("/status"));
+        assert!(is_exempt("/observe/metrics"));
+        assert!(is_exempt("/observe/shards"));
+        // Defensive: the full-path forms stay covered too.
         assert!(is_exempt("/v1/status"));
         assert!(is_exempt("/v1/observe/metrics"));
         assert!(is_exempt("/v1/observe/shards"));
-        assert!(!is_exempt("/v1/observe/locks"));
-        assert!(!is_exempt("/v1/observe/semaphores"));
-        assert!(!is_exempt("/v1/observe/elections"));
-        assert!(!is_exempt("/v1/kv"));
-        assert!(!is_exempt("/v1/locks/acquire"));
+        for path in [
+            "/observe/locks",
+            "/observe/semaphores",
+            "/observe/elections",
+            "/kv",
+            "/locks/acquire",
+            "/v1/observe/locks",
+            "/v1/kv",
+            "/v1/locks/acquire",
+        ] {
+            assert!(!is_exempt(path), "{path} must require an org");
+        }
     }
 
     #[test]
