@@ -5273,6 +5273,29 @@ mod tests {
     }
 
     #[test]
+    fn handoff_accept_token_exceeds_a_from_token_minted_on_another_shard() {
+        // Fencing tokens are per-shard. A handoff may live on a different shard
+        // than the resource it transfers, so its `from_token` can be far ahead of
+        // this shard's counter. The accept must still mint a strictly higher
+        // token (regression: this shard's fresh counter would return 1).
+        let sm = StateMachine::new();
+        sm.apply(Command::HandoffOffer {
+            name: "cross/shard".to_string(),
+            resource: "task:elsewhere".to_string(),
+            from: "owner-a".to_string(),
+            to: "owner-b".to_string(),
+            from_token: 1_000_000,
+            context: Value::Null,
+            ttl_ms: 30_000,
+        });
+        let accept = sm.apply(Command::HandoffAccept {
+            name: "cross/shard".to_string(),
+            to: "owner-b".to_string(),
+        });
+        assert!(accept.output["to_token"].as_u64().unwrap() > 1_000_000);
+    }
+
+    #[test]
     fn decision_resolves_by_weight_and_vetoes_abort() {
         let sm = StateMachine::new();
         let propose = |name: &str| {
