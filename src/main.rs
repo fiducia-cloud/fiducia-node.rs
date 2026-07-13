@@ -297,7 +297,10 @@ mod peer_plane_limit_tests {
         let app = Router::new()
             .nest("/raft", crate::raft_api::router())
             .with_state(node)
-            .layer(RequestBodyLimitLayer::new(super::MAX_PEER_BODY_BYTES));
+            .layer(RequestBodyLimitLayer::new(super::MAX_PEER_BODY_BYTES))
+            .layer(axum::extract::DefaultBodyLimit::max(
+                super::MAX_PEER_BODY_BYTES,
+            ));
 
         // Build a genuine >1 MiB state-machine image (a committed 2 MiB value).
         let machine = StateMachine::new();
