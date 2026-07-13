@@ -856,7 +856,7 @@ pub struct RateLimitSnapshot {
     pub reset_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RateLimitRecord {
     algorithm: RateLimitAlgorithm,
     limit: u32,
