@@ -592,7 +592,7 @@ pub struct ApplyResult {
 }
 
 /// A single versioned KV entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvEntry {
     pub value: String,
     pub mod_revision: u64,
