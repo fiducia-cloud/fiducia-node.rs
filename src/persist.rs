@@ -94,6 +94,7 @@ impl ShardStore {
         fs::create_dir_all(&dir)?;
         let meta_path = dir.join("meta");
         let log_path = dir.join("log");
+        let snapshot_path = dir.join("snapshot");
 
         let meta: Meta = match fs::read(&meta_path) {
             Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
@@ -101,8 +102,27 @@ impl ShardStore {
             _ => Meta::default(),
         };
 
+        // A snapshot is written atomically (tmp + rename), so it is either absent
+        // or complete. A present-but-corrupt one is fatal: the log below its
+        // index is gone, so no replay could rebuild that state — fail closed.
+        let snapshot: Option<ShardSnapshot> = match fs::read(&snapshot_path) {
+            Ok(bytes) if !bytes.is_empty() => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            ),
+            _ => None,
+        };
+        let base_index = snapshot
+            .as_ref()
+            .map(|s| s.last_included_index)
+            .unwrap_or(0);
+
         // Parse every complete JSON line; stop at the first that fails to parse —
         // that's a record torn by a crash mid-append, and everything after it.
+        // Entries at or below the snapshot index are already folded into the
+        // snapshot (a crash between snapshot write and log rewrite leaves them
+        // behind) and are dropped; so is anything after a gap in the indices,
+        // since a non-contiguous suffix could never be applied.
         let mut log: Vec<LogEntry> = Vec::new();
         if let Ok(file) = File::open(&log_path) {
             for line in BufReader::new(file).split(b'\n') {
@@ -111,7 +131,16 @@ impl ShardStore {
                     continue;
                 }
                 match serde_json::from_slice::<LogEntry>(&line) {
-                    Ok(entry) => log.push(entry),
+                    Ok(entry) => {
+                        if entry.index <= base_index {
+                            continue;
+                        }
+                        let expected = base_index + log.len() as u64 + 1;
+                        if entry.index != expected {
+                            break;
+                        }
+                        log.push(entry);
+                    }
                     Err(_) => break,
                 }
             }
@@ -126,6 +155,7 @@ impl ShardStore {
             dir,
             log_path,
             meta_path,
+            snapshot_path,
             log_file,
             durable_len: 0,
         };
@@ -136,9 +166,26 @@ impl ShardStore {
             current_term: meta.current_term,
             voted_for: meta.voted_for,
             commit_index: meta.commit_index,
+            snapshot,
             log,
         };
         Ok((store, recovered))
+    }
+
+    /// Durably record a state-machine snapshot. Atomic via tmp-file + rename +
+    /// dir fsync. Callers must write this **before** truncating the log at the
+    /// snapshot index (see the module docs for the crash-ordering argument).
+    pub fn save_snapshot(&self, snapshot: &ShardSnapshot) -> io::Result<()> {
+        let bytes = serde_json::to_vec(snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.snapshot_path.with_extension("tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &self.snapshot_path)?;
+        sync_dir(&self.dir)
     }
 
     /// Durably record the hard state. Atomic via tmp-file + rename + dir fsync.
