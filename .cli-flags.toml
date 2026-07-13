@@ -1,0 +1,76 @@
+# flags-2-env flag schema for the fiducia-node CLI: maps command-line flags to
+# the environment variables the node reads at boot (see src/consensus.rs,
+# src/main.rs, src/internal_auth.rs). Consumed by scripts/with-flags2env.sh and
+# audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-node.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[flags.allow-insecure-internal]
+env = "FIDUCIA_ALLOW_INSECURE_INTERNAL"
+aliases = ["allow-insecure-internal"]
+type = "bool"
+help = "Disable the internal trust boundary for local single-node dev; /v1 and /raft accept any caller. NEVER set in production."
+
+[flags.data-dir]
+env = "FIDUCIA_DATA_DIR"
+aliases = ["data-dir"]
+type = "string"
+help = "Directory for durable per-shard Raft state (log/meta/snapshot)."
+
+[flags.internal-secret]
+env = "FIDUCIA_INTERNAL_SECRET"
+aliases = ["internal-secret"]
+type = "string"
+help = "Shared cluster secret enforced on /v1 and /raft (secret). Share with the load balancer and peer nodes."
+
+[flags.node-id]
+env = "FIDUCIA_NODE_ID"
+aliases = ["node-id"]
+type = "string"
+help = "Stable Raft member id / redirect target for this node."
+
+[flags.peers]
+env = "FIDUCIA_PEERS"
+aliases = ["peers"]
+type = "string"
+help = "Comma-separated peer node addresses; empty for single-node mode."
+
+[flags.peer-port]
+env = "FIDUCIA_PEER_PORT"
+aliases = ["peer-port"]
+type = "integer"
+help = "Port for the node-to-node Raft RPC (/raft) peer plane."
+
+[flags.raft-check-quorum]
+env = "FIDUCIA_RAFT_CHECK_QUORUM"
+aliases = ["raft-check-quorum"]
+type = "bool"
+help = "Enable Raft check-quorum (a leader steps down without a quorum of live followers)."
+
+[flags.raft-compact-threshold]
+env = "FIDUCIA_RAFT_COMPACT_THRESHOLD"
+aliases = ["raft-compact-threshold"]
+type = "integer"
+help = "Live log-entry count that triggers snapshot + compaction; 0 disables."
+
+[flags.raft-prevote]
+env = "FIDUCIA_RAFT_PREVOTE"
+aliases = ["raft-prevote"]
+type = "bool"
+help = "Enable Raft PreVote to avoid term inflation from a partitioned node."
+
+[flags.shard-count]
+env = "FIDUCIA_SHARD_COUNT"
+aliases = ["shard-count"]
+type = "integer"
+help = "Number of shards the keyspace is partitioned into."
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+type = "integer"
+help = "Port for the client/data plane (/healthz, /readyz, /v1)."

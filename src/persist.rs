@@ -21,6 +21,13 @@
 //!   * `log`  — newline-delimited JSON, one [`LogEntry`] per line, appended and
 //!     fsync'd. A trailing torn line (crash mid-append) is dropped on load and
 //!     the file is canonicalized so the next append starts from clean bytes.
+//!     With a snapshot present the log holds only entries **after** the
+//!     snapshot's `last_included_index`.
+//!   * `snapshot` — JSON [`ShardSnapshot`]: the serialized state machine at
+//!     `last_included_index`, written atomically like `meta`. Compaction writes
+//!     the snapshot **before** rewriting the log, so a crash between the two
+//!     leaves a log whose prefix merely duplicates the snapshot — recovery drops
+//!     any entry at or below the snapshot index.
 //!
 //! NOTE: fsync here is synchronous inside the shard actor's task — correctness
 //! over throughput for this build. A high-write deployment should move the log
@@ -43,21 +50,35 @@ struct Meta {
     commit_index: u64,
 }
 
-/// Raft state recovered from disk at boot. Empty (all-zero, empty log) for a
-/// fresh shard with no prior on-disk state.
+/// A state-machine snapshot at a log position: everything at or below
+/// `last_included_index` is folded into `state` and truncated from the log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSnapshot {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    /// The serialized state machine (see `StateMachine::snapshot`).
+    pub state: serde_json::Value,
+}
+
+/// Raft state recovered from disk at boot. Empty (all-zero, empty log, no
+/// snapshot) for a fresh shard with no prior on-disk state. When a snapshot is
+/// present, `log` holds only entries strictly after its `last_included_index`.
 #[derive(Debug, Default)]
 pub struct Recovered {
     pub current_term: u64,
     pub voted_for: Option<String>,
     pub commit_index: u64,
+    pub snapshot: Option<ShardSnapshot>,
     pub log: Vec<LogEntry>,
 }
 
-/// A shard's durable store: the `meta` file plus an append handle to `log`.
+/// A shard's durable store: the `meta` + `snapshot` files plus an append handle
+/// to `log`.
 pub struct ShardStore {
     dir: PathBuf,
     log_path: PathBuf,
     meta_path: PathBuf,
+    snapshot_path: PathBuf,
     log_file: File,
     /// Number of log entries known to be on disk (so appends write only the tail).
     durable_len: usize,
@@ -73,6 +94,7 @@ impl ShardStore {
         fs::create_dir_all(&dir)?;
         let meta_path = dir.join("meta");
         let log_path = dir.join("log");
+        let snapshot_path = dir.join("snapshot");
 
         let meta: Meta = match fs::read(&meta_path) {
             Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
@@ -80,8 +102,27 @@ impl ShardStore {
             _ => Meta::default(),
         };
 
+        // A snapshot is written atomically (tmp + rename), so it is either absent
+        // or complete. A present-but-corrupt one is fatal: the log below its
+        // index is gone, so no replay could rebuild that state — fail closed.
+        let snapshot: Option<ShardSnapshot> = match fs::read(&snapshot_path) {
+            Ok(bytes) if !bytes.is_empty() => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            ),
+            _ => None,
+        };
+        let base_index = snapshot
+            .as_ref()
+            .map(|s| s.last_included_index)
+            .unwrap_or(0);
+
         // Parse every complete JSON line; stop at the first that fails to parse —
         // that's a record torn by a crash mid-append, and everything after it.
+        // Entries at or below the snapshot index are already folded into the
+        // snapshot (a crash between snapshot write and log rewrite leaves them
+        // behind) and are dropped; so is anything after a gap in the indices,
+        // since a non-contiguous suffix could never be applied.
         let mut log: Vec<LogEntry> = Vec::new();
         if let Ok(file) = File::open(&log_path) {
             for line in BufReader::new(file).split(b'\n') {
@@ -90,7 +131,16 @@ impl ShardStore {
                     continue;
                 }
                 match serde_json::from_slice::<LogEntry>(&line) {
-                    Ok(entry) => log.push(entry),
+                    Ok(entry) => {
+                        if entry.index <= base_index {
+                            continue;
+                        }
+                        let expected = base_index + log.len() as u64 + 1;
+                        if entry.index != expected {
+                            break;
+                        }
+                        log.push(entry);
+                    }
                     Err(_) => break,
                 }
             }
@@ -105,6 +155,7 @@ impl ShardStore {
             dir,
             log_path,
             meta_path,
+            snapshot_path,
             log_file,
             durable_len: 0,
         };
@@ -115,9 +166,26 @@ impl ShardStore {
             current_term: meta.current_term,
             voted_for: meta.voted_for,
             commit_index: meta.commit_index,
+            snapshot,
             log,
         };
         Ok((store, recovered))
+    }
+
+    /// Durably record a state-machine snapshot. Atomic via tmp-file + rename +
+    /// dir fsync. Callers must write this **before** truncating the log at the
+    /// snapshot index (see the module docs for the crash-ordering argument).
+    pub fn save_snapshot(&self, snapshot: &ShardSnapshot) -> io::Result<()> {
+        let bytes = serde_json::to_vec(snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.snapshot_path.with_extension("tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &self.snapshot_path)?;
+        sync_dir(&self.dir)
     }
 
     /// Durably record the hard state. Atomic via tmp-file + rename + dir fsync.
@@ -205,6 +273,7 @@ mod tests {
         LogEntry {
             term,
             index,
+            ts_ms: 0,
             command: Some(Command::KvPut {
                 key: key.to_string(),
                 value: "v".to_string(),
@@ -280,6 +349,53 @@ mod tests {
         let (_s, rec) = ShardStore::open(&root, 0).unwrap();
         assert_eq!(rec.log.len(), 2);
         assert_eq!(rec.log[1].term, 5);
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_stale_log_prefix_is_dropped() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 4).unwrap();
+            store
+                .append_tail(&[entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")])
+                .unwrap();
+            // Compaction order: snapshot first. Simulate a crash BEFORE the log
+            // rewrite — the log still holds entries 1..=3, of which 1..=2 are now
+            // duplicated by the snapshot.
+            store
+                .save_snapshot(&ShardSnapshot {
+                    last_included_index: 2,
+                    last_included_term: 1,
+                    state: serde_json::json!({ "kv": { "a": "folded" } }),
+                })
+                .unwrap();
+        }
+        let (_store, rec) = ShardStore::open(&root, 4).unwrap();
+        let snap = rec.snapshot.expect("snapshot recovered");
+        assert_eq!(snap.last_included_index, 2);
+        assert_eq!(snap.last_included_term, 1);
+        assert_eq!(snap.state["kv"]["a"], "folded");
+        assert_eq!(
+            rec.log.len(),
+            1,
+            "entries at or below the snapshot index are dropped"
+        );
+        assert_eq!(rec.log[0].index, 3);
+    }
+
+    #[test]
+    fn non_contiguous_log_suffix_is_dropped_on_load() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 5).unwrap();
+            // Index 3 with no index 2 before it: an unusable gap.
+            store
+                .append_tail(&[entry(1, 1, "a"), entry(3, 1, "c")])
+                .unwrap();
+        }
+        let (_store, rec) = ShardStore::open(&root, 5).unwrap();
+        assert_eq!(rec.log.len(), 1, "everything after a gap is unusable");
+        assert_eq!(rec.log[0].index, 1);
     }
 
     #[test]

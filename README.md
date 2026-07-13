@@ -296,25 +296,20 @@ database: the **replicated log + the deterministic state machine** are the store
   the log (tail via `AppendEntries`, or a snapshot + tail once the leader has
   compacted).
 
-Today the per-shard log and state machine are **in-memory** (durability comes
-from replication across nodes). That is not enough for production Kubernetes
-unless every Raft member has stable persistent storage: losing a pod's ephemeral
-disk can silently erase one of the durable copies. The seam to add on-disk
-durability is narrow and deliberate:
+The standard Raft durability stack (WAL → snapshot → compaction) is implemented:
 
-| Piece | Status | On-disk path |
-|-------|--------|--------------|
-| Raft log + `commit_index`/`voted_for` | in-memory `Vec<LogEntry>` per shard | append-only WAL with periodic `fsync` (one shared engine batches fsync across shards) |
-| State machine | in-memory maps | rebuilt from the log; bounded by **snapshots** |
-| Log growth | unbounded | **snapshot + compaction**: persist a state-machine snapshot, truncate the log before it |
+| Piece | Status |
+|-------|--------|
+| Raft log + `commit_index`/`voted_for` | crash-safe on-disk per shard (`persist.rs`): fsync'd append-only log + atomic `meta`, under `FIDUCIA_DATA_DIR` |
+| State machine | in-memory, rebuilt at boot from **snapshot + log-tail replay**; every entry replays at its proposer-stamped `ts_ms`, so lease expiry is deterministic (an expired lease can't resurrect on restart) |
+| Log growth | bounded by **snapshot + compaction** (`FIDUCIA_RAFT_COMPACT_THRESHOLD`, default 1024 live entries): the applied prefix is folded into an atomic `snapshot` file and truncated; a follower behind the compacted base is caught up via `InstallSnapshot` |
 
-This is the standard Raft durability stack (WAL → snapshot → compaction); none of
-it changes the API or the state-machine semantics above. A single embedded engine
-plugs in behind that seam — see [`docs/storage.md`](docs/storage.md) for the
-concrete design: embedded RocksDB under `FIDUCIA_NODE_DATA_DIR`, with column
-families for the Raft log/meta, applied coordination state, watch indexes, and
-snapshots. (Postgres/Supabase stay the *business*/control-plane database — orgs,
-projects, users, API keys, audit, billing — never the coordination store.)
+None of it changes the API or the state-machine semantics above. A single
+embedded engine can still plug in behind that seam — see
+[`docs/storage.md`](docs/storage.md) for the RocksDB design (column families for
+the Raft log/meta, applied coordination state, watch indexes, and snapshots).
+(Postgres/Supabase stay the *business*/control-plane database — orgs, projects,
+users, API keys, audit, billing — never the coordination store.)
 
 ## Layout
 
@@ -323,7 +318,7 @@ projects, users, API keys, audit, billing — never the coordination store.)
 | `src/main.rs`      | axum wiring, router, health/status                                   |
 | `src/consensus.rs` | **multi-Raft core**: per-shard election, replication, quorum commit  |
 | `src/transport.rs` | peer transport (HTTP + in-process loopback) + Raft RPC wire types    |
-| `src/raft_api.rs`  | inbound `/raft/{shard}/{append,vote}` peer endpoints                  |
+| `src/raft_api.rs`  | inbound `/raft/{shard}/{append,vote,snapshot}` peer endpoints         |
 | `src/state.rs`     | replicated state machine: `Command`s, **union locks**, semaphores, KV, … |
 | `src/locks.rs`     | multi-key union lock handlers                                        |
 | `src/semaphore.rs` | counting-semaphore handlers                                          |
@@ -340,6 +335,103 @@ cargo run          # listens on :8090 (override PORT)
 #   FIDUCIA_NODE_ID=node-a:8090 FIDUCIA_PEERS=node-b:8090,node-c:8090 cargo run
 curl localhost:8090/v1/status        # per-shard role / term / commit index
 ```
+
+## Configuration & environment
+
+Every knob is an environment variable, read once at boot. The full surface:
+
+| Variable | Type | Default | Secret? | Meaning |
+|----------|------|---------|---------|---------|
+| `PORT` | integer | `8090` | no | Client/data-plane port (`/healthz`, `/readyz`, `/v1/*`). |
+| `FIDUCIA_PEER_PORT` | integer | `9090` | no | Peer-plane port for node↔node Raft RPC (`/raft/*`). |
+| `FIDUCIA_NODE_ID` | string | `node-a` | no | Stable Raft member id / client redirect target for this node. |
+| `FIDUCIA_PEERS` | string | *(empty)* | no | Comma-separated peer node addresses; empty ⇒ single-node mode. |
+| `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Number of shards the keyspace is partitioned into (min `1`). |
+| `FIDUCIA_DATA_DIR` | string | `/var/lib/fiducia` | no | Directory for durable per-shard Raft state (log/meta/snapshot). Must be writable. |
+| `FIDUCIA_RAFT_COMPACT_THRESHOLD` | integer | `1024` | no | Live log-entry count that triggers snapshot + compaction; `0` disables. |
+| `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
+| `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Explicit local-dev opt-out of the trust boundary. **Never set in production.** |
+| `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
+| `FIDUCIA_RAFT_CHECK_QUORUM` | bool | `true` | no | Leader steps down without a quorum of live followers. Disable with `0`/`false`/`off`. |
+| `FIDUCIA_RAFT_TICK_MS` | integer | `20` | no | Timer granularity; clamped ≤ heartbeat. |
+| `FIDUCIA_RAFT_HEARTBEAT_MS` | integer | `50` | no | Leader heartbeat interval. |
+| `FIDUCIA_RAFT_ELECTION_MIN_MS` | integer | `150` | no | Election-timeout floor; clamped up to ≥ 2× heartbeat. |
+| `FIDUCIA_RAFT_ELECTION_JITTER_MS` | integer | `150` | no | Random jitter added to the election timeout. |
+
+Bool vars accept `1`/`true` (and, for the Raft toggles, `0`/`false`/`off`).
+
+### Secure-by-default trust boundary
+
+The node has no per-request user auth of its own: it trusts the
+`x-fiducia-org-id` the load balancer injects, and trusts `AppendEntries` from
+peers. That trust is only sound if nothing else can reach the ports. The
+internal-auth guard ([`src/internal_auth.rs`](src/internal_auth.rs)) enforces it
+with a shared cluster secret and **fails closed**:
+
+- `FIDUCIA_INTERNAL_SECRET` **set** → every `/v1` and `/raft` request must carry
+  a matching `x-fiducia-internal-auth` header (compared in **constant time**);
+  the LB and peer transport attach it. This is the production posture.
+- `FIDUCIA_INTERNAL_SECRET` **unset** and no opt-out → the guard **rejects every
+  internal request** (HTTP 401), and logs a loud `warn`. A prod node that boots
+  without its secret refuses forged `x-fiducia-*` headers instead of trusting them.
+- `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` with the secret unset → the boundary is
+  **disabled** (any caller accepted); logged loudly at `warn` on every boot. This
+  is the *only* way an unset secret serves traffic, and is for local dev only.
+
+### Run a single node safely (local dev)
+
+```bash
+# Insecure local mode — no cluster secret, boundary explicitly disabled:
+FIDUCIA_ALLOW_INSECURE_INTERNAL=1 cargo run    # listens on :8090 (override PORT)
+
+# Or exercise the real posture locally by setting a secret and sending it:
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run
+curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8090/v1/status
+```
+
+Without either variable the node boots but rejects every `/v1` and `/raft`
+request (fail-closed) — that is intended, not a bug.
+
+### flags-2-env: flags → env
+
+`.cli-flags.toml` maps CLI flags to these environment variables via the pinned
+[`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
+(`vendor/flags-2-env`). `scripts/with-flags2env.sh` parses the flags against that
+schema, exports the resulting env map, then execs the command:
+
+```bash
+# Build the pinned parser once (a prebuilt binary may already be vendored):
+make -C vendor/flags-2-env all
+# Derive FIDUCIA_* from flags, then run the node:
+scripts/with-flags2env.sh --node-id node-a --peers node-b:8090,node-c:8090 \
+  --shard-count 16 -- cargo run
+# Audit the schema (also run in CI by .github/workflows/cli-flags.yml):
+vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+```
+
+## Security
+
+Trust-boundary and hardening posture applied to this crate:
+
+- **Fail-closed internal auth.** `FIDUCIA_INTERNAL_SECRET` guards both `/v1` and
+  `/raft`; an unset secret rejects all internal traffic unless
+  `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` is set explicitly for local dev (logged
+  loudly). See [`src/internal_auth.rs`](src/internal_auth.rs).
+- **Constant-time secret comparison.** The shared secret is compared with a
+  length-checked, non-short-circuiting byte compare, so it can't be recovered a
+  byte at a time via response timing.
+- **Split client/peer planes.** Client (`:8090`) and peer (`:9090`) listeners are
+  separable at L4 so a NetworkPolicy can lock the client port in-namespace while
+  the peer port stays cross-cluster reachable; both still require the secret at L7.
+- **Request-body cap.** All bodies are capped at 1 MiB (`RequestBodyLimitLayer`)
+  to reject memory-exhaustion payloads. Watch/long-poll streams are intentionally
+  exempt from any request timeout.
+- **Panic containment.** `CatchPanicLayer` converts a handler panic into a 500
+  instead of crashing the process.
+
+**Dependency advisories:** `cargo audit` is clean — 0 advisories across the
+dependency tree (171 crates), reconfirmed at the latest scan. No known or
+accepted (ignored) advisories.
 
 ## Related
 

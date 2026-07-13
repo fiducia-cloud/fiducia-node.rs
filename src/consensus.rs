@@ -26,6 +26,18 @@
 //! and linearizable reads gated to the leader. Client writes block until their
 //! entry commits (the `pending` waiters).
 //!
+//! **Log compaction**: once a shard's live log passes a threshold, the applied
+//! prefix is folded into a state-machine snapshot and truncated
+//! ([`ShardActor::maybe_compact`]), bounding both storage and replay time at
+//! boot. A follower that has fallen behind the compacted base is caught up with
+//! an `InstallSnapshot` RPC instead of log entries it can no longer receive.
+//!
+//! **Deterministic time**: every log entry is stamped with the proposing
+//! leader's wall clock ([`LogEntry::ts_ms`], kept monotonic per shard), and the
+//! state machine applies at that committed stamp — never the local clock — so
+//! lease expiry is identical on every replica and on every restart replay (an
+//! expired lease can not resurrect because the log was replayed later).
+//!
 //! ## Fixed-membership simplification
 //!
 //! Every node hosts every shard, so a shard's Raft group is `self + peers`
@@ -48,7 +60,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
-use crate::persist::{Recovered, ShardStore};
+use crate::persist::{Recovered, ShardSnapshot, ShardStore};
 use crate::state::{
     BarrierState, BudgetState, ClaimState, Command, CounterEntry, DecisionState, EffectState,
     ElectionEntry, HandoffState, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
@@ -56,8 +68,8 @@ use crate::state::{
     ServiceSummary, StateMachine, TaskState,
 };
 use crate::transport::{
-    AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
-    Transport,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LoopbackRegistry,
+    RequestVoteReq, RequestVoteResp, Transport,
 };
 
 /// Identifier of a shard (one independent Raft group). Re-exported from the
@@ -232,6 +244,15 @@ pub struct LogEntry {
     pub term: u64,
     /// 1-based position in the shard's log.
     pub index: u64,
+    /// The proposing leader's wall clock (epoch ms) when it appended this entry,
+    /// kept monotonically non-decreasing along the log. This is the **only**
+    /// time the state machine sees: applying at the committed stamp instead of
+    /// the local clock keeps replicas identical and stops a restart replay from
+    /// refreshing (resurrecting) long-expired leases. `0` marks an entry written
+    /// before stamping existed; those replay with the local clock (the old
+    /// behaviour) until compaction folds them into a snapshot.
+    #[serde(default)]
+    pub ts_ms: u64,
     /// The state-machine command, or `None` for a leader-election no-op.
     pub command: Option<Command>,
 }
@@ -270,7 +291,17 @@ pub struct NodeConfig {
     /// deployment points this at a persistent volume so a pod restart can't drop
     /// a member's log.
     pub data_dir: Option<PathBuf>,
+    /// Compact a shard's log once its live (post-snapshot) entry count reaches
+    /// this many entries: the applied prefix is folded into a state-machine
+    /// snapshot and truncated. Bounds log storage and boot replay time. `0`
+    /// disables compaction. Env: `FIDUCIA_RAFT_COMPACT_THRESHOLD`.
+    pub compact_threshold: usize,
 }
+
+/// Default live-log length that triggers a compaction. Low enough that an idle
+/// but long-lived shard never carries weeks of lease-renew history; high enough
+/// that compaction (a full state serialize + log rewrite) stays rare.
+const DEFAULT_COMPACT_THRESHOLD: usize = 1024;
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -298,6 +329,10 @@ impl Default for NodeConfig {
                     .unwrap_or_else(|_| "/var/lib/fiducia".to_string())
                     .into(),
             ),
+            compact_threshold: std::env::var("FIDUCIA_RAFT_COMPACT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_COMPACT_THRESHOLD),
         }
     }
 }
@@ -336,6 +371,19 @@ pub enum ShardMsg {
     RequestVote {
         req: RequestVoteReq,
         resp: oneshot::Sender<RequestVoteResp>,
+    },
+    /// Inbound `InstallSnapshot` from a peer leader (this replica fell behind
+    /// the leader's compacted log base).
+    InstallSnapshot {
+        req: InstallSnapshotReq,
+        resp: oneshot::Sender<InstallSnapshotResp>,
+    },
+    /// A peer's reply to an `InstallSnapshot` this shard sent (routed back to
+    /// self). `last_included` is the snapshot index that was shipped.
+    SnapshotReply {
+        from: String,
+        last_included: u64,
+        resp: Option<InstallSnapshotResp>,
     },
     /// A peer's reply to a `RequestVote` this shard sent (routed back to self).
     /// `pre_vote` echoes whether the request that produced it was a pre-vote, so
@@ -574,7 +622,20 @@ struct ShardActor {
     current_term: u64,
     voted_for: Option<String>,
     leader_id: Option<String>,
+    /// Live log entries **after** `snapshot_base_index`. Entry `i` (1-based log
+    /// position) lives at `log[i - snapshot_base_index - 1]`.
     log: Vec<LogEntry>,
+    /// Index of the last entry folded into the state-machine snapshot (0 = none
+    /// compacted yet; the log still starts at index 1).
+    snapshot_base_index: u64,
+    /// Term of the entry at `snapshot_base_index`.
+    snapshot_base_term: u64,
+    /// Live-log length that triggers a compaction (0 = disabled).
+    compact_threshold: usize,
+    /// Highest `ts_ms` ever appended to this shard's log — the monotonic floor
+    /// for stamping the next entry, so a leader clock step-back can never make
+    /// apply time run backwards.
+    last_entry_ts: u64,
     commit_index: u64,
     last_applied: u64,
     /// Durable backing for term/vote/log, or `None` for an in-memory shard.
@@ -619,6 +680,7 @@ impl ShardActor {
         transport: Arc<Transport>,
         self_tx: mpsc::Sender<ShardMsg>,
         timing: RaftTiming,
+        compact_threshold: usize,
         store: Option<ShardStore>,
         recovered: Recovered,
     ) -> Self {
@@ -628,7 +690,20 @@ impl ShardActor {
         // Seed from disk when we have it. A fresh shard recovers `term == 0`; this
         // engine numbers terms from 1, so keep the floor at 1 for a clean start.
         let current_term = recovered.current_term.max(1);
-        let recovered_commit = recovered.commit_index.min(recovered.log.len() as u64);
+        let (snapshot_base_index, snapshot_base_term) = recovered
+            .snapshot
+            .as_ref()
+            .map(|s| (s.last_included_index, s.last_included_term))
+            .unwrap_or((0, 0));
+        // The persisted commit pointer can never be below the snapshot base
+        // (compaction only folds applied ≤ committed entries), but clamp both
+        // ways so corrupt meta can't point outside the recovered log.
+        let recovered_commit = recovered.commit_index.clamp(
+            snapshot_base_index,
+            snapshot_base_index + recovered.log.len() as u64,
+        );
+        let last_entry_ts = recovered.log.iter().map(|e| e.ts_ms).max().unwrap_or(0);
+        let snapshot_state = recovered.snapshot.map(|s| s.state);
         let mut actor = ShardActor {
             shard_id,
             node_id: node_id.clone(),
@@ -644,8 +719,12 @@ impl ShardActor {
             voted_for: recovered.voted_for,
             leader_id: if single { Some(node_id.clone()) } else { None },
             log: recovered.log,
+            snapshot_base_index,
+            snapshot_base_term,
+            compact_threshold,
+            last_entry_ts,
             commit_index: recovered_commit,
-            last_applied: 0,
+            last_applied: snapshot_base_index,
             store,
             votes: HashSet::new(),
             pre_votes: HashSet::new(),
@@ -666,9 +745,21 @@ impl ShardActor {
             metrics: ShardMetrics::default(),
         };
         actor.reset_election_deadline();
-        // Rebuild the in-memory state machine from the recovered log up to the
-        // committed point (the state machine itself is not persisted).
-        if actor.commit_index > 0 {
+        // Rebuild the in-memory state machine: restore the snapshot (the applied
+        // state at the compaction base), then replay the remaining recovered log
+        // up to the committed point. Replay applies each entry at its **stamped**
+        // time, so leases that expired before the restart stay expired.
+        if let Some(state) = snapshot_state {
+            if let Err(e) = actor.state.restore(state) {
+                // Fail closed, matching the bootstrap contract: silently starting
+                // from an empty state machine would resurrect released locks.
+                panic!(
+                    "fiducia-node: shard {shard_id} snapshot is unusable \
+                     (cannot restore state machine): {e}"
+                );
+            }
+        }
+        if actor.commit_index > actor.last_applied {
             actor.apply_committed();
         }
         actor
@@ -707,6 +798,15 @@ impl ShardActor {
                 let out = self.handle_request_vote(req);
                 let _ = resp.send(out);
             }
+            ShardMsg::InstallSnapshot { req, resp } => {
+                let out = self.handle_install_snapshot(req);
+                let _ = resp.send(out);
+            }
+            ShardMsg::SnapshotReply {
+                from,
+                last_included,
+                resp,
+            } => self.handle_snapshot_reply(from, last_included, resp),
             ShardMsg::VoteReply {
                 from,
                 pre_vote,
@@ -771,22 +871,48 @@ impl ShardActor {
     // --- elections --------------------------------------------------------
 
     fn last_log_index(&self) -> u64 {
-        self.log.len() as u64
+        self.snapshot_base_index + self.log.len() as u64
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.snapshot_base_term)
     }
 
-    fn term_at(&self, index: u64) -> u64 {
-        if index == 0 {
-            0
-        } else {
-            self.log
-                .get((index - 1) as usize)
-                .map(|e| e.term)
-                .unwrap_or(0)
+    /// Slab position of 1-based log `index` within the live (post-snapshot) log,
+    /// or `None` if it is compacted away or beyond the tail.
+    fn log_pos(&self, index: u64) -> Option<usize> {
+        if index <= self.snapshot_base_index {
+            return None;
         }
+        let pos = (index - self.snapshot_base_index - 1) as usize;
+        (pos < self.log.len()).then_some(pos)
+    }
+
+    /// Term of the entry at 1-based `index`: the snapshot's term at the
+    /// compaction boundary, the entry's term within the live log, and `0` for
+    /// index 0, a compacted index, or one beyond the tail. Callers must treat
+    /// indices **below** the base as always-consistent committed prefix (they
+    /// are identical on every member by the snapshot's construction) rather
+    /// than reading a term here.
+    fn term_at(&self, index: u64) -> u64 {
+        if index == self.snapshot_base_index {
+            self.snapshot_base_term
+        } else {
+            self.log_pos(index).map(|p| self.log[p].term).unwrap_or(0)
+        }
+    }
+
+    /// Wall-clock stamp for the next entry this leader appends, forced to be
+    /// monotonically non-decreasing along the shard's log so apply time can
+    /// never run backwards (even across a leader change to a slow clock, since
+    /// election guarantees the new leader has the old entries — and their stamps).
+    fn stamp_next_entry(&mut self) -> u64 {
+        let ts = crate::state::now_ms().max(self.last_entry_ts);
+        self.last_entry_ts = ts;
+        ts
     }
 
     fn majority(&self) -> usize {
@@ -944,9 +1070,11 @@ impl ShardActor {
         // No-op for the new term so prior-term entries can commit (and so a single
         // write isn't needed to make progress). Committing this proves leadership.
         let index = self.last_log_index() + 1;
+        let ts_ms = self.stamp_next_entry();
         self.log.push(LogEntry {
             term: self.current_term,
             index,
+            ts_ms,
             command: None,
         });
         // Durable before this entry can count toward a commit.
@@ -1009,11 +1137,28 @@ impl ShardActor {
         }
     }
 
-    /// Persist the full log after a conflicting suffix was truncated/replaced.
+    /// Persist the full log after a conflicting suffix was truncated/replaced,
+    /// or after compaction dropped the prefix at the snapshot base.
     fn persist_log_rewrite(&mut self) {
         if let Some(store) = self.store.as_mut() {
             if let Err(e) = store.rewrite(&self.log) {
                 tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log rewrite");
+            }
+        }
+    }
+
+    /// Persist the state-machine snapshot at the current compaction base. Must
+    /// run **before** the log rewrite that truncates at that base, or a crash
+    /// between the two would lose the only copy of the folded prefix.
+    fn persist_snapshot(&mut self) {
+        if let Some(store) = self.store.as_ref() {
+            let snapshot = ShardSnapshot {
+                last_included_index: self.snapshot_base_index,
+                last_included_term: self.snapshot_base_term,
+                state: self.state.snapshot(),
+            };
+            if let Err(e) = store.save_snapshot(&snapshot) {
+                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist snapshot");
             }
         }
     }
@@ -1047,6 +1192,12 @@ impl ShardActor {
             return;
         }
         let next = *ls.next_index.get(peer).unwrap_or(&1);
+        // The peer needs an entry we have already compacted away → ship the
+        // state-machine snapshot instead of log entries it can no longer get.
+        if next <= self.snapshot_base_index {
+            self.send_snapshot_to(peer);
+            return;
+        }
         ls.in_flight.insert(peer.to_string(), true);
 
         let prev_log_index = next - 1;
@@ -1054,7 +1205,7 @@ impl ShardActor {
         let entries: Vec<LogEntry> = self
             .log
             .iter()
-            .skip(prev_log_index as usize)
+            .skip((prev_log_index - self.snapshot_base_index) as usize)
             .cloned()
             .collect();
         let up_to = self.last_log_index();
@@ -1140,6 +1291,76 @@ impl ShardActor {
         }
         self.refresh_follower_lag_metric();
         if more {
+            self.send_append_to(&from);
+        }
+    }
+
+    /// Ship the current applied state to a follower whose `next_index` fell
+    /// behind the compacted log base. Snapshots at `last_applied` (always ≥ the
+    /// base, and exact because apply is sequential inside this actor), so the
+    /// follower lands as close to the tail as we can put it.
+    fn send_snapshot_to(&mut self, peer: &str) {
+        let last_included = self.last_applied;
+        let req = InstallSnapshotReq {
+            term: self.current_term,
+            leader_id: self.node_id.clone(),
+            last_included_index: last_included,
+            last_included_term: self.term_at(last_included),
+            data: self.state.snapshot(),
+        };
+        let Some(ls) = self.leader.as_mut() else {
+            return;
+        };
+        ls.in_flight.insert(peer.to_string(), true);
+
+        let transport = self.transport.clone();
+        let self_tx = self.self_tx.clone();
+        let shard = self.shard_id;
+        let peer_owned = peer.to_string();
+        tokio::spawn(async move {
+            let resp = transport.install_snapshot(&peer_owned, shard, req).await;
+            let _ = self_tx
+                .send(ShardMsg::SnapshotReply {
+                    from: peer_owned,
+                    last_included,
+                    resp,
+                })
+                .await;
+        });
+    }
+
+    fn handle_snapshot_reply(
+        &mut self,
+        from: String,
+        last_included: u64,
+        resp: Option<InstallSnapshotResp>,
+    ) {
+        if let Some(ls) = self.leader.as_mut() {
+            ls.in_flight.insert(from.clone(), false);
+        }
+        let Some(resp) = resp else {
+            return; // peer unreachable; retry next heartbeat tick
+        };
+        if resp.term > self.current_term {
+            self.step_down(resp.term, None);
+            return;
+        }
+        if self.role != Role::Leader || resp.term != self.current_term {
+            return;
+        }
+        if let Some(ls) = self.leader.as_mut() {
+            // Any reply at our term is proof of contact (leader lease).
+            ls.last_contact.insert(from.clone(), Instant::now());
+            if resp.success {
+                let matched = ls.match_index.entry(from.clone()).or_default();
+                *matched = (*matched).max(last_included);
+                ls.next_index.insert(from.clone(), last_included + 1);
+            }
+        }
+        if resp.success {
+            self.maybe_advance_commit();
+            self.refresh_follower_lag_metric();
+            // Continue with the log tail beyond the snapshot.
             self.send_append_to(&from);
         }
     }
@@ -1256,8 +1477,13 @@ impl ShardActor {
         }
         self.become_follower_of(req.leader_id.clone());
 
-        // Log-consistency check at prev_log_index.
-        if req.prev_log_index > 0 && self.term_at(req.prev_log_index) != req.prev_log_term {
+        // Log-consistency check at prev_log_index. Indices at or below our
+        // snapshot base are committed on a quorum and identical on every member
+        // (that is what allowed them to be folded into a snapshot), so the check
+        // passes there by construction.
+        if req.prev_log_index > self.snapshot_base_index
+            && self.term_at(req.prev_log_index) != req.prev_log_term
+        {
             return AppendEntriesResp {
                 term: self.current_term,
                 success: false,
@@ -1268,16 +1494,22 @@ impl ShardActor {
             };
         }
 
-        // Append, truncating on the first conflicting term.
+        // Append, truncating on the first conflicting term. Entries at or below
+        // the snapshot base are already folded into our snapshot — skip them.
         let mut idx = req.prev_log_index;
         let mut truncated = false;
         let mut grew = false;
         for entry in req.entries {
             idx += 1;
-            match self.log.get((idx - 1) as usize) {
+            if idx <= self.snapshot_base_index {
+                continue;
+            }
+            self.last_entry_ts = self.last_entry_ts.max(entry.ts_ms);
+            let pos = (idx - self.snapshot_base_index - 1) as usize;
+            match self.log.get(pos) {
                 Some(existing) if existing.term == entry.term => {} // already have it
                 Some(_) => {
-                    self.log.truncate((idx - 1) as usize);
+                    self.log.truncate(pos);
                     self.log.push(entry);
                     truncated = true;
                 }
@@ -1305,6 +1537,82 @@ impl ShardActor {
             term: self.current_term,
             success: true,
             match_index: self.last_log_index(),
+        }
+    }
+
+    /// A follower receiving the leader's snapshot: jump the state machine
+    /// straight to `last_included_index`, because the leader compacted away the
+    /// log entries this replica still needs. Keeps any log suffix consistent
+    /// with the snapshot boundary; conflicting or unverifiable suffixes are
+    /// dropped (the snapshot supersedes them).
+    fn handle_install_snapshot(&mut self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        // Reject a stale leader.
+        if req.term < self.current_term {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+            };
+        }
+        if req.term > self.current_term {
+            self.current_term = req.term;
+            self.voted_for = None;
+            self.persist_hard_state();
+        }
+        self.become_follower_of(req.leader_id.clone());
+
+        // Already at or past this snapshot ⇒ ack without installing (it is stale
+        // to us); the ack lets the leader advance to normal log replication.
+        if req.last_included_index <= self.commit_index {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: true,
+            };
+        }
+
+        // Decide the fate of our live log **before** touching state: keep the
+        // suffix beyond the boundary when the boundary entry matches, else the
+        // whole log is superseded by the snapshot.
+        let boundary_matches = req.last_included_index <= self.last_log_index()
+            && self.term_at(req.last_included_index) == req.last_included_term;
+
+        if let Err(e) = self.state.restore(req.data) {
+            tracing::error!(
+                shard = ?self.shard_id,
+                error = %e,
+                "raft: InstallSnapshot payload failed to restore — not installed"
+            );
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+            };
+        }
+        if boundary_matches {
+            let drop = (req.last_included_index - self.snapshot_base_index) as usize;
+            self.log.drain(..drop);
+        } else {
+            self.log.clear();
+        }
+        self.snapshot_base_index = req.last_included_index;
+        self.snapshot_base_term = req.last_included_term;
+        self.commit_index = req.last_included_index;
+        self.last_applied = req.last_included_index;
+        tracing::info!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            last_included_index = req.last_included_index,
+            kept_log_suffix = boundary_matches,
+            "raft: installed leader snapshot (was behind the compacted log base)"
+        );
+
+        // Durable before we ack: snapshot first, then the truncated log, then
+        // the advanced commit pointer (same ordering as compaction).
+        self.persist_snapshot();
+        self.persist_log_rewrite();
+        self.persist_hard_state();
+
+        InstallSnapshotResp {
+            term: self.current_term,
+            success: true,
         }
     }
 
@@ -1421,9 +1729,13 @@ impl ShardActor {
             return;
         }
         let index = self.last_log_index() + 1;
+        // Stamp the proposer's clock into the entry: this is the time the state
+        // machine will apply at, on every replica and on every replay.
+        let ts_ms = self.stamp_next_entry();
         self.log.push(LogEntry {
             term: self.current_term,
             index,
+            ts_ms,
             command: Some(command),
         });
         // Durable before this entry can count toward a commit / be acked.
@@ -1448,18 +1760,30 @@ impl ShardActor {
     }
 
     /// Apply every newly-committed entry in order, resolving client waiters and
-    /// publishing change events.
+    /// publishing change events, then compact the log if it has grown past the
+    /// threshold. Each entry is applied at its **stamped** time — identical on
+    /// every replica and on every restart replay.
     fn apply_committed(&mut self) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let i = self.last_applied;
-            let Some(entry) = self.log.get((i - 1) as usize) else {
+            let Some(pos) = self.log_pos(i) else {
                 break;
+            };
+            let entry = &self.log[pos];
+            // Entries written before stamping existed carry ts 0 and fall back
+            // to the local clock — the pre-fix behaviour, kept so an upgrade
+            // can't expire leases that were live at shutdown. Compaction folds
+            // such entries into a snapshot, so the fallback ages out.
+            let apply_at_ms = if entry.ts_ms > 0 {
+                entry.ts_ms
+            } else {
+                crate::state::now_ms()
             };
             let Some(command) = entry.command.clone() else {
                 continue; // no-op
             };
-            let applied = self.state.apply(command.clone());
+            let applied = self.state.apply_at(command.clone(), apply_at_ms);
             self.publish_change(&command, &applied.output, applied.revision);
             if let Some(pending) = self.pending.remove(&i) {
                 let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
@@ -1479,6 +1803,40 @@ impl ShardActor {
                 }));
             }
         }
+        self.maybe_compact();
+    }
+
+    // --- log compaction -----------------------------------------------------
+
+    /// Once the live log passes the compaction threshold, fold the applied
+    /// prefix into a state-machine snapshot and truncate it from the log. This
+    /// is what bounds a shard's storage and boot-replay time; without it every
+    /// lease renew and idempotency body lives in the log forever. A follower
+    /// whose `next_index` later falls below the new base is caught up via
+    /// [`Self::send_snapshot_to`].
+    fn maybe_compact(&mut self) {
+        if self.compact_threshold == 0 || self.log.len() < self.compact_threshold {
+            return;
+        }
+        let applied_live = (self.last_applied - self.snapshot_base_index) as usize;
+        if applied_live == 0 {
+            return; // nothing applied beyond the current base yet
+        }
+        self.snapshot_base_term = self.term_at(self.last_applied);
+        self.snapshot_base_index = self.last_applied;
+        self.log.drain(..applied_live);
+        // Durable order: snapshot first, then the truncated log. A crash between
+        // the two leaves a log whose prefix duplicates the snapshot; recovery
+        // drops entries at or below the snapshot index.
+        self.persist_snapshot();
+        self.persist_log_rewrite();
+        tracing::info!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            snapshot_base_index = self.snapshot_base_index,
+            live_entries = self.log.len(),
+            "raft: compacted log into state-machine snapshot"
+        );
     }
 
     fn publish_change(&self, command: &Command, output: &serde_json::Value, revision: u64) {
@@ -1737,6 +2095,7 @@ impl ShardActor {
             commit_index: self.commit_index,
             last_applied: self.last_applied,
             last_log_index: self.last_log_index(),
+            snapshot_base_index: self.snapshot_base_index,
             healthy_replicas,
             has_quorum,
             replication,
@@ -1800,6 +2159,7 @@ impl Node {
                 transport.clone(),
                 tx.clone(),
                 timing,
+                config.compact_threshold,
                 store,
                 recovered,
             );
@@ -1969,6 +2329,20 @@ impl Node {
         let tx = self.sender(shard)?;
         let (resp, rx) = oneshot::channel();
         tx.send(ShardMsg::RequestVote { req, resp }).await.ok()?;
+        rx.await.ok()
+    }
+
+    /// Deliver an inbound `InstallSnapshot` to the owning shard actor.
+    pub async fn install_snapshot(
+        &self,
+        shard: ShardId,
+        req: InstallSnapshotReq,
+    ) -> Option<InstallSnapshotResp> {
+        let tx = self.sender(shard)?;
+        let (resp, rx) = oneshot::channel();
+        tx.send(ShardMsg::InstallSnapshot { req, resp })
+            .await
+            .ok()?;
         rx.await.ok()
     }
 
@@ -2234,6 +2608,10 @@ pub struct ShardStatus {
     /// is apply lag.
     pub last_applied: u64,
     pub last_log_index: u64,
+    /// Index of the last log entry folded into the state-machine snapshot by
+    /// compaction (0 = nothing compacted). Live log length is
+    /// `last_log_index - snapshot_base_index`.
+    pub snapshot_base_index: u64,
     /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
     pub healthy_replicas: usize,
     /// Whether a majority of the group is caught up — i.e. the shard can survive
@@ -2460,6 +2838,7 @@ mod tests {
                 shard_count,
                 // In-memory: the loopback cluster tests don't touch disk.
                 data_dir: None,
+                compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             },
             Transport::loopback(reg.clone()),
         )
@@ -2722,6 +3101,7 @@ mod tests {
                 peers: vec![],
                 shard_count: 0,
                 data_dir: None,
+                compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             },
             Transport::loopback(reg),
         );
@@ -2746,6 +3126,7 @@ mod tests {
             peers: vec![],
             shard_count: 1,
             data_dir: Some(dir.clone()),
+            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
         };
 
         {
@@ -2771,6 +3152,202 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_data_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fiducia-node-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// The replay-resurrection fix (fiducia-node #8): a lease that expired
+    /// before a restart must STAY expired after it, because replay applies each
+    /// entry at its proposer-stamped `ts_ms`, not at boot time. Compaction is
+    /// disabled so recovery really replays the log.
+    #[tokio::test]
+    async fn restart_replay_at_stamped_time_does_not_resurrect_expired_leases() {
+        let dir = test_data_dir("stamped-replay");
+        let cfg = || NodeConfig {
+            node_id: "solo".to_string(),
+            peers: vec![],
+            shard_count: 1,
+            data_dir: Some(dir.clone()),
+            compact_threshold: 0, // force pure log replay at boot
+        };
+        let claim = |owner: &str| Command::IdempotencyClaim {
+            key: "req-1".to_string(),
+            owner: owner.to_string(),
+            ttl_ms: 100, // in-flight lease shorter than the sleep below
+            retention_ms: None,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            let out = n.propose(claim("worker-a")).await.expect("commit");
+            assert_eq!(out.output["claimed"], true);
+            n.shutdown(None);
+        }
+
+        // The lease dies while the "pod" is down.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            // Before the fix, boot replay re-applied the claim at wall time,
+            // resurrecting the record with a fresh lease — this read returned it
+            // and a re-claim came back `duplicate: true`.
+            match n
+                .query(ReadRequest::Idempotency {
+                    key: "req-1".to_string(),
+                })
+                .await
+            {
+                Ok(ReadResponse::Idempotency(None)) => {}
+                other => panic!("expired claim resurrected across restart: {other:?}"),
+            }
+            let reclaim = n.propose(claim("worker-b")).await.expect("commit");
+            assert_eq!(reclaim.output["claimed"], true);
+            assert_eq!(
+                reclaim.output["duplicate"], false,
+                "a lease that expired before the restart must be re-claimable"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction folds the applied log prefix into a snapshot, bounds the live
+    /// log, and recovery restores the snapshot + replays only the tail.
+    #[tokio::test]
+    async fn log_compaction_bounds_the_log_and_state_survives_restart() {
+        let dir = test_data_dir("compaction");
+        let cfg = || NodeConfig {
+            node_id: "solo".to_string(),
+            peers: vec![],
+            shard_count: 1,
+            data_dir: Some(dir.clone()),
+            compact_threshold: 8,
+        };
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            for i in 0..40 {
+                n.propose(put(&format!("flags/key-{i}"), "on"))
+                    .await
+                    .expect("commit");
+            }
+            let status = n.status().await;
+            let shard = &status.shards[0];
+            assert!(
+                shard.snapshot_base_index > 0,
+                "log should have been compacted"
+            );
+            assert!(
+                shard.last_log_index - shard.snapshot_base_index < 40,
+                "live log must be bounded, got {} live entries",
+                shard.last_log_index - shard.snapshot_base_index
+            );
+            n.shutdown(None);
+        }
+
+        {
+            let reg = LoopbackRegistry::new();
+            let n = Node::bootstrap(cfg(), Transport::loopback(reg));
+            // Every committed write is readable: the ones folded into the
+            // snapshot and the ones replayed from the remaining log tail.
+            for i in [0usize, 20, 39] {
+                match n
+                    .query(ReadRequest::Kv {
+                        key: format!("flags/key-{i}"),
+                    })
+                    .await
+                {
+                    Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "on"),
+                    other => panic!("key-{i} lost across compaction + restart: {other:?}"),
+                }
+            }
+            let status = n.status().await;
+            assert!(
+                status.shards[0].snapshot_base_index > 0,
+                "recovery must seed from the persisted snapshot, not replay from index 1"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A follower that joins after the leader compacted past its position can
+    /// no longer be caught up with log entries — the leader must ship an
+    /// InstallSnapshot, then continue with the live tail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lagging_follower_catches_up_via_install_snapshot() {
+        let reg = LoopbackRegistry::new();
+        let compacting_node = |id: &str, peers: &[&str]| {
+            Node::bootstrap(
+                NodeConfig {
+                    node_id: id.to_string(),
+                    peers: peers.iter().map(|s| s.to_string()).collect(),
+                    shard_count: 1,
+                    data_dir: None,
+                    compact_threshold: 8,
+                },
+                Transport::loopback(reg.clone()),
+            )
+        };
+
+        // c is a configured member but not running yet: a+b are a quorum of 3.
+        let a = compacting_node("a", &["b", "c"]);
+        let b = compacting_node("b", &["a", "c"]);
+        let leader_idx = await_leader(&[&a, &b], 0, 250).await;
+        let leader = [&a, &b][leader_idx];
+
+        for i in 0..40 {
+            leader
+                .propose(put(&format!("flags/key-{i}"), "on"))
+                .await
+                .expect("commit");
+        }
+        let base = leader.status().await.shards[0].snapshot_base_index;
+        assert!(base > 0, "leader should have compacted its log");
+
+        // c boots with an empty log; the entries it needs are compacted away on
+        // the leader, so only an InstallSnapshot can catch it up.
+        let c = compacting_node("c", &["a", "b"]);
+        let mut caught_up = false;
+        for _ in 0..250 {
+            let status = c.status().await;
+            let shard = &status.shards[0];
+            if shard.role == Role::Follower && shard.last_applied >= base {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            caught_up,
+            "late follower never caught up past the leader's compaction base"
+        );
+
+        // c's own applied state serves the folded-in writes (serializable read).
+        let items = c.list_kv("flags/").await;
+        assert_eq!(
+            items.len(),
+            40,
+            "the snapshot-installed state machine must hold every committed write"
+        );
+        assert!(
+            c.status().await.shards[0].snapshot_base_index >= base,
+            "the follower should have adopted the leader's snapshot base"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3207,6 +3784,7 @@ mod tests {
             Arc::new(Transport::loopback(reg)),
             tx,
             RaftTiming::default(),
+            DEFAULT_COMPACT_THRESHOLD,
             None,
             Recovered::default(),
         )
@@ -3353,6 +3931,7 @@ mod tests {
         a.log.push(LogEntry {
             term: 1,
             index: 1,
+            ts_ms: 0,
             command: None,
         });
         assert!(
