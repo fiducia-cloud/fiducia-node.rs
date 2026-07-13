@@ -89,6 +89,36 @@ aliases = ["raft-snapshot-threshold"]
 type = "integer"
 help = "Committed entries between snapshots; zero disables snapshots."
 
+[flags.raft-peer-max-body-bytes]
+env = "FIDUCIA_RAFT_PEER_MAX_BODY_BYTES"
+aliases = ["raft-peer-max-body-bytes"]
+type = "integer"
+help = "Maximum serialized request body accepted and emitted on the Raft peer plane."
+
+[flags.raft-append-max-bytes]
+env = "FIDUCIA_RAFT_APPEND_MAX_BYTES"
+aliases = ["raft-append-max-bytes"]
+type = "integer"
+help = "Target maximum serialized bytes in one AppendEntries batch."
+
+[flags.raft-append-max-entries]
+env = "FIDUCIA_RAFT_APPEND_MAX_ENTRIES"
+aliases = ["raft-append-max-entries"]
+type = "integer"
+help = "Maximum log entries in one AppendEntries batch."
+
+[flags.raft-rpc-timeout-ms]
+env = "FIDUCIA_RAFT_RPC_TIMEOUT_MS"
+aliases = ["raft-rpc-timeout-ms"]
+type = "integer"
+help = "Timeout for vote and bounded AppendEntries peer requests."
+
+[flags.raft-snapshot-timeout-ms]
+env = "FIDUCIA_RAFT_SNAPSHOT_TIMEOUT_MS"
+aliases = ["raft-snapshot-timeout-ms"]
+type = "integer"
+help = "Longer timeout for bounded InstallSnapshot peer requests."
+
 [flags.log]
 env = "RUST_LOG"
 aliases = ["log"]

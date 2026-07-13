@@ -180,7 +180,10 @@ impl Transport {
     pub fn http() -> Self {
         Transport::Http(
             reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
+                // Total request timeouts are request-specific below: a vote or
+                // append should fail quickly, while a bounded snapshot needs a
+                // materially longer transfer window.
+                .connect_timeout(crate::peer_config::rpc_timeout())
                 .build()
                 .unwrap_or_default(),
         )
@@ -213,14 +216,14 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/append");
-                with_internal_auth(client.post(url))
-                    .json(&req)
+                let body = encode_peer_body("append", peer, shard, &req)?;
+                let response = with_internal_auth(client.post(url))
+                    .header("content-type", "application/json")
+                    .timeout(crate::peer_config::rpc_timeout())
+                    .body(body)
                     .send()
-                    .await
-                    .ok()?
-                    .json()
-                    .await
-                    .ok()
+                    .await;
+                decode_peer_response("append", peer, shard, response).await
             }
         }
     }
@@ -241,14 +244,12 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/vote");
-                with_internal_auth(client.post(url))
+                let response = with_internal_auth(client.post(url))
                     .json(&req)
+                    .timeout(crate::peer_config::rpc_timeout())
                     .send()
-                    .await
-                    .ok()?
-                    .json()
-                    .await
-                    .ok()
+                    .await;
+                decode_peer_response("vote", peer, shard, response).await
             }
         }
     }
@@ -272,15 +273,75 @@ impl Transport {
             }
             Transport::Http(client) => {
                 let url = format!("http://{peer}/raft/{shard}/snapshot");
-                with_internal_auth(client.post(url))
-                    .json(&req)
+                let body = encode_peer_body("snapshot", peer, shard, &req)?;
+                let response = with_internal_auth(client.post(url))
+                    .header("content-type", "application/json")
+                    .timeout(crate::peer_config::snapshot_timeout())
+                    .body(body)
                     .send()
-                    .await
-                    .ok()?
-                    .json()
-                    .await
-                    .ok()
+                    .await;
+                decode_peer_response("snapshot", peer, shard, response).await
             }
+        }
+    }
+}
+
+fn encode_peer_body<T: Serialize>(
+    rpc: &str,
+    peer: &str,
+    shard: ShardId,
+    request: &T,
+) -> Option<Vec<u8>> {
+    let body = match serde_json::to_vec(request) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(rpc, peer, shard, %error, "failed to serialize Raft peer request");
+            return None;
+        }
+    };
+    let limit = crate::peer_config::max_body_bytes();
+    if body.len() > limit {
+        tracing::error!(
+            rpc,
+            peer,
+            shard,
+            body_bytes = body.len(),
+            max_body_bytes = limit,
+            "Raft peer request exceeds the configured body limit"
+        );
+        return None;
+    }
+    Some(body)
+}
+
+async fn decode_peer_response<T: for<'de> Deserialize<'de>>(
+    rpc: &str,
+    peer: &str,
+    shard: ShardId,
+    response: Result<reqwest::Response, reqwest::Error>,
+) -> Option<T> {
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(rpc, peer, shard, %error, "Raft peer request failed");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            rpc,
+            peer,
+            shard,
+            status = %response.status(),
+            "Raft peer rejected request"
+        );
+        return None;
+    }
+    match response.json().await {
+        Ok(decoded) => Some(decoded),
+        Err(error) => {
+            tracing::warn!(rpc, peer, shard, %error, "Raft peer returned an invalid response");
+            None
         }
     }
 }

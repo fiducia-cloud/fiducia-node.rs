@@ -16,22 +16,22 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           path: repo
           submodules: recursive
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
           path: fiducia-interfaces
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-routing.rs
           path: fiducia-routing.rs
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: repo
       - name: CLI flag contract
@@ -42,17 +42,14 @@ jobs:
       - name: fmt
         working-directory: repo
         run: cargo fmt --check
-        continue-on-error: true
       - name: clippy
         working-directory: repo
-        run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test
         working-directory: repo
-        run: cargo test --bins $(cargo build --lib --quiet 2>/dev/null && echo --lib)
+        run: cargo test --all-targets --all-features --locked
       - name: audit
         working-directory: repo
         run: |
-          cargo install cargo-audit --locked || true
+          cargo install cargo-audit --locked
           cargo audit
-        continue-on-error: true

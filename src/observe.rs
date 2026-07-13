@@ -113,6 +113,9 @@ async fn shards(State(node): State<Arc<Node>>) -> Response {
         .filter(|s| !s.storage_healthy)
         .map(|s| s.shard_id)
         .collect();
+    let status_complete = status.hosted_shards.len() == status.shard_count as usize
+        && status.unresponsive_shards.is_empty()
+        && status.shards.len() == status.hosted_shards.len();
 
     Json(json!({
         "node_id": status.node_id,
@@ -122,9 +125,11 @@ async fn shards(State(node): State<Arc<Node>>) -> Response {
         "quorum": {
             "leaderless_shards": leaderless,
             "at_risk_led_shards": at_risk,
-            "all_led_shards_have_quorum": at_risk.is_empty(),
+            "all_led_shards_have_quorum": status_complete && at_risk.is_empty(),
             "storage_faulted_shards": storage_faulted,
-            "all_shard_storage_healthy": storage_faulted.is_empty(),
+            "unresponsive_shards": status.unresponsive_shards,
+            "status_complete": status_complete,
+            "all_shard_storage_healthy": status_complete && storage_faulted.is_empty(),
         },
         "shards": status.shards,
     }))

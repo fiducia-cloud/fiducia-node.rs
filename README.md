@@ -31,7 +31,8 @@ All over HTTP (`/v1`):
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
 internal `/raft/{shard}/{append,vote}` peer endpoints. `/healthz` is process
 liveness; `/readyz` returns 503 if any shard actor is missing or has tripped its
-durable-storage fail-closed state.
+durable-storage fail-closed state. Local shard-status collection is bounded, so
+a wedged/full actor inbox makes readiness fail instead of hanging the probe.
 
 ## B2B coordination flows
 
@@ -49,6 +50,19 @@ The control plane handles orgs, projects, environments, API keys, billing, and
 placement. The node API below is the data-plane contract those customer replicas
 use after the control plane has issued credentials and an endpoint.
 
+The direct-node examples below use this helper so they exercise the same trusted
+hop and org-scoping contract as production. Start the node with
+`FIDUCIA_INTERNAL_SECRET=dev-secret` first; a load balancer normally injects both
+headers instead.
+
+```bash
+fiducia() {
+  curl -H 'x-fiducia-internal-auth: dev-secret' \
+    -H 'x-fiducia-org-id: demo-org' \
+    -H 'content-type: application/json' "$@"
+}
+```
+
 ### Leader election
 
 Use this when exactly one replica may perform a critical action: run a scheduler,
@@ -59,7 +73,7 @@ regional primary.
 2. Every replica campaigns with its own candidate id, lease TTL, and metadata:
 
 ```bash
-curl -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/campaign \
+fiducia -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/campaign \
   -d '{"candidate":"pod-a","ttl_ms":30000,"metadata":{"region":"us-east","address":"https://pod-a.internal","version":"2026.06.27"}}'
 ```
 
@@ -70,7 +84,7 @@ curl -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/campa
    expires:
 
 ```bash
-curl -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/renew \
+fiducia -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/renew \
   -d '{"candidate":"pod-a","fencing_token":41}'
 ```
 
@@ -83,8 +97,8 @@ curl -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/renew
 7. Other processes can read or watch the leader:
 
 ```bash
-curl localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader
-curl -N localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/watch
+fiducia localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader
+fiducia -N localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/watch
 ```
 
 ### Service discovery
@@ -96,23 +110,23 @@ endpoints or stale DNS answers.
    metadata:
 
 ```bash
-curl -XPUT localhost:8090/v1/services/payments-api/instances/pod-a \
+fiducia -XPUT localhost:8090/v1/services/payments-api/instances/pod-a \
   -d '{"address":"https://pod-a.internal:8443","ttl_ms":30000,"metadata":{"region":"us-east","cloud":"aws","version":"2026.06.27"}}'
 ```
 
 2. The instance heartbeats before its TTL expires:
 
 ```bash
-curl -XPOST localhost:8090/v1/services/payments-api/instances/pod-a/heartbeat \
+fiducia -XPOST localhost:8090/v1/services/payments-api/instances/pod-a/heartbeat \
   -d '{"ttl_ms":30000}'
 ```
 
 3. Clients resolve only live instances:
 
 ```bash
-curl localhost:8090/v1/services/payments-api
-curl 'localhost:8090/v1/services/payments-api?metadata.region=us-east&metadata.cloud=aws'
-curl -N localhost:8090/v1/services/payments-api/watch
+fiducia localhost:8090/v1/services/payments-api
+fiducia 'localhost:8090/v1/services/payments-api?metadata.region=us-east&metadata.cloud=aws'
+fiducia -N localhost:8090/v1/services/payments-api/watch
 ```
 
 4. Metadata filters are exact-match AND filters over live instances, so callers
@@ -132,14 +146,14 @@ at a time. You can lock the **union** of a key *set*:
 
 ```bash
 # Acquire {orders/42, inventory/sku-9} atomically — all or nothing.
-curl -XPOST localhost:8090/v1/locks/acquire \
+fiducia -XPOST localhost:8090/v1/locks/acquire \
   -d '{"keys":["orders/42","inventory/sku-9"],"holder":"worker-a","ttl_ms":30000,"wait":true}'
 # → { "committed": true, "result": { "output": {
 #       "acquired": true, "keys": ["inventory/sku-9","orders/42"],
 #       "fencing_token": 7, "lease_expires_ms": ... } } }
 
 # Release the whole set by its fencing token.
-curl -XPOST localhost:8090/v1/locks/release -d '{"holder":"worker-a","fencing_token":7}'
+fiducia -XPOST localhost:8090/v1/locks/release -d '{"holder":"worker-a","fencing_token":7}'
 ```
 
 Semantics (this is the [live-mutex](https://github.com/ORESoftware/live-mutex)
@@ -160,7 +174,7 @@ model, made linearizable by Raft):
 **Semaphores** generalize a lock to *N* holders (a mutex is `limit = 1`):
 
 ```bash
-curl -XPOST localhost:8090/v1/semaphores/acquire \
+fiducia -XPOST localhost:8090/v1/semaphores/acquire \
   -d '{"key":"db-pool","holder":"conn-1","limit":10,"ttl_ms":30000,"wait":true}'
 ```
 
@@ -168,11 +182,11 @@ curl -XPOST localhost:8090/v1/semaphores/acquire \
 fulfillment, and "run this job once" APIs:
 
 ```bash
-curl -XPOST localhost:8090/v1/idempotency/claim \
+fiducia -XPOST localhost:8090/v1/idempotency/claim \
   -d '{"key":"stripe-webhook/event_123","owner":"worker-a","ttl":"24h","metadata":{"source":"stripe"}}'
-curl -XPOST localhost:8090/v1/idempotency/complete \
+fiducia -XPOST localhost:8090/v1/idempotency/complete \
   -d '{"key":"stripe-webhook/event_123","owner":"worker-a","fencing_token":7,"result":{"status":"ok"}}'
-curl 'localhost:8090/v1/idempotency?key=stripe-webhook/event_123'
+fiducia 'localhost:8090/v1/idempotency?key=stripe-webhook/event_123'
 ```
 
 The first active claim receives a fencing token and stores the owner/metadata
@@ -186,10 +200,10 @@ contain slashes, dots, or be empty (`flags/checkout`, `orders/42`,
 `pools/db/primary`, even a key named `acquire`):
 
 ```bash
-curl     'localhost:8090/v1/kv?key=flags/checkout'              # read
-curl -XPUT 'localhost:8090/v1/kv?key=flags/checkout' -d '{"value":"on"}'
-curl -N   'localhost:8090/v1/kv?key=flags/checkout&watch=true'  # SSE watch
-curl     'localhost:8090/v1/locks?key=orders/42'               # inspect
+fiducia       'localhost:8090/v1/kv?key=flags/checkout'              # read
+fiducia -XPUT 'localhost:8090/v1/kv?key=flags/checkout' -d '{"value":"on"}'
+fiducia -N    'localhost:8090/v1/kv?key=flags/checkout&watch=true'  # SSE watch
+fiducia       'localhost:8090/v1/locks?key=orders/42'               # inspect
 ```
 
 This is also why the load balancer can read the routing key the same way on every
@@ -304,7 +318,12 @@ database: the **replicated log + the deterministic state machine** are the store
   `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` newly applied entries (default 1024), the
   complete state machine is atomically snapshotted and the committed log prefix
   is removed. A lagging follower whose required prefix was compacted receives
-  `InstallSnapshot`, then resumes with the retained log suffix.
+  `InstallSnapshot`, then resumes with the retained log suffix. Leaders send that
+  suffix in bounded, response-driven batches rather than one unbounded JSON
+  request. Snapshot bodies still have an explicit operational ceiling
+  (`FIDUCIA_RAFT_PEER_MAX_BODY_BYTES`); a shard whose serialized snapshot exceeds
+  it requires a larger consistently configured ceiling (chunked snapshot
+  transfer is not yet implemented).
 - **Each shard is persisted under `FIDUCIA_DATA_DIR`** (default
   `/var/lib/fiducia`): atomic `meta`, newline-delimited `log`, and atomic
   `snapshot` files. The node fsyncs before acknowledging durability. Kubernetes
@@ -325,6 +344,9 @@ database: the **replicated log + the deterministic state machine** are the store
 `/v1/status` exposes `snapshot_index` and `retained_log_entries` per shard so
 operators can verify compaction rather than inferring it from disk usage. It
 also exposes `storage_healthy` and, only after a fault, `storage_error`.
+`hosted_shards` remains the actual actor inventory even when one actor wedges;
+`unresponsive_shards` identifies bounded status probes that timed out, and both
+readiness and the observe rollups fail closed while that list is non-empty.
 Postgres/Supabase remain the business/control-plane database for organizations,
 projects, users, API keys, audit, and billing—not the coordination store.
 
@@ -335,6 +357,7 @@ projects, users, API keys, audit, and billing—not the coordination store.
 | `src/main.rs`      | axum wiring, router, health/status                                   |
 | `src/consensus.rs` | **multi-Raft core**: per-shard election, replication, quorum commit  |
 | `src/transport.rs` | peer transport (HTTP + in-process loopback) + Raft RPC wire types    |
+| `src/peer_config.rs` | shared peer body/batch bounds and request timeouts                  |
 | `src/raft_api.rs`  | inbound `/raft/{shard}/{append,vote,snapshot}` peer endpoints         |
 | `src/state.rs`     | replicated state machine: `Command`s, **union locks**, semaphores, KV, … |
 | `src/locks.rs`     | multi-key union lock handlers                                        |
@@ -346,11 +369,12 @@ projects, users, API keys, audit, and billing—not the coordination store.
 ## Run locally
 
 ```bash
-cargo run          # listens on :8090 (override PORT)
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run  # listens on :8090 (override PORT)
 # Single node (default): leads every shard from t=0.
 # A real group:
-#   FIDUCIA_NODE_ID=node-a:8090 FIDUCIA_PEERS=node-b:8090,node-c:8090 cargo run
-curl localhost:8090/v1/status        # per-shard role / term / commit index
+#   FIDUCIA_INTERNAL_SECRET=shared-secret FIDUCIA_NODE_ID=node-a:9090 \
+#     FIDUCIA_PEERS=node-b:9090,node-c:9090 cargo run
+curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8090/v1/status
 ```
 
 ## Configuration & environment
@@ -366,6 +390,11 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Number of shards the keyspace is partitioned into (min `1`). |
 | `FIDUCIA_DATA_DIR` | string | `/var/lib/fiducia` | no | Directory for durable per-shard Raft state (log/meta/snapshot). Must be writable. |
 | `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` | integer | `1024` | no | Committed entries between snapshots and compaction; `0` disables. |
+| `FIDUCIA_RAFT_PEER_MAX_BODY_BYTES` | integer | `268435456` | no | Absolute serialized request-body ceiling shared by inbound and outbound Raft HTTP. Snapshot state above this bound cannot transfer until the value is raised consistently. |
+| `FIDUCIA_RAFT_APPEND_MAX_BYTES` | integer | `8388608` | no | Target serialized size for one response-driven AppendEntries batch, clamped to the peer body ceiling. |
+| `FIDUCIA_RAFT_APPEND_MAX_ENTRIES` | integer | `64` | no | Maximum log entries in one AppendEntries batch. |
+| `FIDUCIA_RAFT_RPC_TIMEOUT_MS` | integer | `10000` | no | Total timeout for vote and bounded AppendEntries HTTP requests. |
+| `FIDUCIA_RAFT_SNAPSHOT_TIMEOUT_MS` | integer | `120000` | no | Longer total timeout for InstallSnapshot HTTP requests. |
 | `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
 | `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Debug-build-only local-dev opt-out. Release binaries compile the bypass out. |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
@@ -420,7 +449,7 @@ schema, exports the resulting env map, then execs the command:
 # Build the pinned parser for this platform:
 make -B -C vendor/flags-2-env all
 # Derive FIDUCIA_* from flags, then run the node:
-scripts/with-flags2env.sh --node-id node-a --peers node-b:8090,node-c:8090 \
+scripts/with-flags2env.sh --node-id node-a:9090 --peers node-b:9090,node-c:9090 \
   --shard-count 16 -- cargo run
 # Audit the schema (also run in CI by .github/workflows/cli-flags.yml):
 vendor/flags-2-env/build/flags2env audit .cli-flags.toml
@@ -449,9 +478,13 @@ Trust-boundary and hardening posture applied to this crate:
 - **Split client/peer planes.** Client (`:8090`) and peer (`:9090`) listeners are
   separable at L4 so a NetworkPolicy can lock the client port in-namespace while
   the peer port stays cross-cluster reachable; both still require the secret at L7.
-- **Request-body cap.** All bodies are capped at 1 MiB (`RequestBodyLimitLayer`)
-  to reject memory-exhaustion payloads. Watch/long-poll streams are intentionally
-  exempt from any request timeout.
+- **Request-body caps.** Client-plane bodies are capped at 1 MiB. Authenticated
+  Raft peer bodies use a separately configurable 256 MiB default ceiling; both
+  tower-http and axum's built-in JSON cap enforce the same value. AppendEntries
+  is split into bounded 8 MiB/64-entry batches and immediately continues from
+  each successful reply. Snapshots get a 120-second request timeout, but remain
+  subject to the explicit peer-body ceiling (there is no chunked transfer yet).
+  Watch/long-poll streams are intentionally exempt from any request timeout.
 - **Panic containment.** `CatchPanicLayer` converts a handler panic into a 500
   instead of crashing the process.
 - **Fail-closed Raft durability.** Votes, log/snapshot acknowledgements, commit

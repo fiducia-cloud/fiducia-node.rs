@@ -27,6 +27,7 @@ mod locks;
 mod metrics;
 mod observe;
 mod org_scope;
+mod peer_config;
 mod persist;
 mod raft_api;
 mod rate_limit;
@@ -43,7 +44,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
@@ -62,6 +63,10 @@ const SERVICE: &str = "fiducia-node";
 /// `watch` streams and blocking lock acquires are long-lived by design.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+// The peer body cap is configured separately in `peer_config`. AppendEntries
+// stays well below it through bounded batches, while snapshots get a longer
+// request timeout and an explicit, documented operational ceiling. Peers are
+// authenticated by the internal-secret guard before JSON extraction.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
@@ -134,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new());
 
+    let max_peer_body_bytes = peer_config::max_body_bytes();
     let peer_app = Router::new()
         // A health route on the peer port too, so the peer listener can be probed.
         .route("/healthz", get(health))
@@ -143,7 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_state(node)
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // Both caps must be raised: tower-http's layer AND axum's built-in
+        // `DefaultBodyLimit` (2 MiB), which `Json` extraction enforces
+        // independently and which would otherwise 413 large snapshots.
+        .layer(RequestBodyLimitLayer::new(max_peer_body_bytes))
+        .layer(DefaultBodyLimit::max(max_peer_body_bytes))
         .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
@@ -174,14 +184,7 @@ async fn health() -> Json<Value> {
 
 async fn readiness(State(node): State<Arc<Node>>) -> Response {
     let status = node.status().await;
-    let storage_faulted_shards: Vec<_> = status
-        .shards
-        .iter()
-        .filter(|shard| !shard.storage_healthy)
-        .map(|shard| shard.shard_id)
-        .collect();
-    let all_shards_running = status.shards.len() == status.shard_count as usize;
-    let ready = all_shards_running && storage_faulted_shards.is_empty();
+    let (ready, all_shards_running, storage_faulted_shards) = readiness_state(&status);
     let status_code = if ready {
         StatusCode::OK
     } else {
@@ -193,10 +196,25 @@ async fn readiness(State(node): State<Arc<Node>>) -> Response {
             "status": if ready { "ok" } else { "unavailable" },
             "service": SERVICE,
             "all_shards_running": all_shards_running,
+            "unresponsive_shards": status.unresponsive_shards,
             "storage_faulted_shards": storage_faulted_shards,
         })),
     )
         .into_response()
+}
+
+fn readiness_state(status: &consensus::NodeStatus) -> (bool, bool, Vec<consensus::ShardId>) {
+    let storage_faulted_shards: Vec<_> = status
+        .shards
+        .iter()
+        .filter(|shard| !shard.storage_healthy)
+        .map(|shard| shard.shard_id)
+        .collect();
+    let all_shards_running = status.hosted_shards.len() == status.shard_count as usize
+        && status.unresponsive_shards.is_empty()
+        && status.shards.len() == status.hosted_shards.len();
+    let ready = all_shards_running && storage_faulted_shards.is_empty();
+    (ready, all_shards_running, storage_faulted_shards)
 }
 
 /// `GET /v1/status` — per-shard consensus status for this node.
@@ -256,5 +274,111 @@ mod test_support {
             .await
             .expect("response body");
         serde_json::from_slice(&body).expect("JSON response")
+    }
+}
+
+#[cfg(test)]
+mod peer_plane_limit_tests {
+    use std::future::IntoFuture;
+
+    use axum::Router;
+    use tower_http::limit::RequestBodyLimitLayer;
+
+    use crate::state::{Command, StateMachine};
+    use crate::transport::{InstallSnapshotReq, InstallSnapshotResp};
+
+    /// A snapshot install whose body exceeds the client-plane cap must still be
+    /// accepted on the peer plane. With the peer plane capped at
+    /// `MAX_BODY_BYTES`, any shard whose state outgrew 1 MiB could never again
+    /// bring a lagging follower up to date (every install would 413), so this
+    /// pins the regression with a real HTTP round trip through the same layer
+    /// stack `main` builds for the peer listener.
+    #[tokio::test]
+    async fn snapshot_install_larger_than_client_cap_is_accepted_on_peer_plane() {
+        let node = crate::test_support::node(1);
+        let app = Router::new()
+            .nest("/raft", crate::raft_api::router())
+            .with_state(node)
+            .layer(RequestBodyLimitLayer::new(
+                crate::peer_config::DEFAULT_MAX_BODY_BYTES,
+            ))
+            .layer(axum::extract::DefaultBodyLimit::max(
+                crate::peer_config::DEFAULT_MAX_BODY_BYTES,
+            ));
+
+        // Build a genuine >1 MiB state-machine image (a committed 2 MiB value).
+        let machine = StateMachine::new();
+        machine.apply(Command::KvPut {
+            key: "big".to_string(),
+            value: "v".repeat(2 * 1024 * 1024),
+            ttl_ms: None,
+            prev_revision: None,
+        });
+        let request = InstallSnapshotReq {
+            term: 1_000_000, // above any term the fresh test shard could reach
+            leader_id: "peer-test-leader".to_string(),
+            last_included_index: 5,
+            last_included_term: 1_000_000,
+            state: machine.snapshot().expect("snapshot serializes"),
+        };
+        let body = serde_json::to_vec(&request).expect("request serializes");
+        assert!(
+            body.len() > super::MAX_BODY_BYTES,
+            "test must exceed the client-plane cap to prove the peer cap differs"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/raft/0/snapshot"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("peer-plane request");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "oversized-for-client snapshot must not be rejected on the peer plane"
+        );
+        let resp: InstallSnapshotResp = response.json().await.expect("snapshot response");
+        assert!(resp.success, "follower must accept and ack the snapshot");
+        assert_eq!(resp.match_index, 5);
+
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    #[tokio::test]
+    async fn missing_or_storage_faulted_shards_are_not_ready() {
+        let node = crate::test_support::node(2);
+        let healthy = node.status().await;
+        assert_eq!(super::readiness_state(&healthy), (true, true, vec![]));
+
+        let mut missing = healthy.clone();
+        missing.shards.pop();
+        assert_eq!(super::readiness_state(&missing), (false, false, vec![]));
+
+        let mut unresponsive = healthy.clone();
+        unresponsive
+            .unresponsive_shards
+            .push(unresponsive.shards[0].shard_id);
+        assert_eq!(
+            super::readiness_state(&unresponsive),
+            (false, false, vec![])
+        );
+
+        let mut faulted = healthy;
+        faulted.shards[0].storage_healthy = false;
+        assert_eq!(
+            super::readiness_state(&faulted),
+            (false, true, vec![faulted.shards[0].shard_id])
+        );
     }
 }

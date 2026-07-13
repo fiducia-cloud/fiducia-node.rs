@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch "$INTERFACES_REF" \
     https://github.com/fiducia-cloud/fiducia-interfaces.git fiducia-interfaces
 COPY . fiducia-node.rs
 WORKDIR /build/fiducia-node.rs
-RUN cargo build --release && strip target/release/fiducia-node
+RUN cargo build --release --locked && strip target/release/fiducia-node
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build --chown=65532:65532 /build/fiducia-node.rs/target/release/fiducia-node /usr/local/bin/fiducia-node
