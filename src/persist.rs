@@ -50,13 +50,25 @@ struct Meta {
     commit_index: u64,
 }
 
-/// Raft state recovered from disk at boot. Empty (all-zero, empty log) for a
-/// fresh shard with no prior on-disk state.
+/// A state-machine snapshot at a log position: everything at or below
+/// `last_included_index` is folded into `state` and truncated from the log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSnapshot {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    /// The serialized state machine (see `StateMachine::snapshot`).
+    pub state: serde_json::Value,
+}
+
+/// Raft state recovered from disk at boot. Empty (all-zero, empty log, no
+/// snapshot) for a fresh shard with no prior on-disk state. When a snapshot is
+/// present, `log` holds only entries strictly after its `last_included_index`.
 #[derive(Debug, Default)]
 pub struct Recovered {
     pub current_term: u64,
     pub voted_for: Option<String>,
     pub commit_index: u64,
+    pub snapshot: Option<ShardSnapshot>,
     pub log: Vec<LogEntry>,
 }
 
