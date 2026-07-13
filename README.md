@@ -318,7 +318,7 @@ users, API keys, audit, billing — never the coordination store.)
 | `src/main.rs`      | axum wiring, router, health/status                                   |
 | `src/consensus.rs` | **multi-Raft core**: per-shard election, replication, quorum commit  |
 | `src/transport.rs` | peer transport (HTTP + in-process loopback) + Raft RPC wire types    |
-| `src/raft_api.rs`  | inbound `/raft/{shard}/{append,vote}` peer endpoints                  |
+| `src/raft_api.rs`  | inbound `/raft/{shard}/{append,vote,snapshot}` peer endpoints         |
 | `src/state.rs`     | replicated state machine: `Command`s, **union locks**, semaphores, KV, … |
 | `src/locks.rs`     | multi-key union lock handlers                                        |
 | `src/semaphore.rs` | counting-semaphore handlers                                          |
