@@ -1742,18 +1742,30 @@ impl ShardActor {
     }
 
     /// Apply every newly-committed entry in order, resolving client waiters and
-    /// publishing change events.
+    /// publishing change events, then compact the log if it has grown past the
+    /// threshold. Each entry is applied at its **stamped** time — identical on
+    /// every replica and on every restart replay.
     fn apply_committed(&mut self) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let i = self.last_applied;
-            let Some(entry) = self.log.get((i - 1) as usize) else {
+            let Some(pos) = self.log_pos(i) else {
                 break;
+            };
+            let entry = &self.log[pos];
+            // Entries written before stamping existed carry ts 0 and fall back
+            // to the local clock — the pre-fix behaviour, kept so an upgrade
+            // can't expire leases that were live at shutdown. Compaction folds
+            // such entries into a snapshot, so the fallback ages out.
+            let apply_at_ms = if entry.ts_ms > 0 {
+                entry.ts_ms
+            } else {
+                crate::state::now_ms()
             };
             let Some(command) = entry.command.clone() else {
                 continue; // no-op
             };
-            let applied = self.state.apply(command.clone());
+            let applied = self.state.apply_at(command.clone(), apply_at_ms);
             self.publish_change(&command, &applied.output, applied.revision);
             if let Some(pending) = self.pending.remove(&i) {
                 let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
