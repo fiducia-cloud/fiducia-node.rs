@@ -60,7 +60,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
-use crate::persist::{Recovered, ShardStore};
+use crate::persist::{Recovered, ShardSnapshot, ShardStore};
 use crate::state::{
     BarrierState, BudgetState, ClaimState, Command, CounterEntry, DecisionState, EffectState,
     ElectionEntry, HandoffState, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
