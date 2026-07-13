@@ -41,7 +41,14 @@ use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{middleware, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    middleware,
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
 use serde_json::{json, Value};
 use tower_http::{catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
@@ -109,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // was only on :8090, so cross-cluster AppendEntries to :9090 hit nothing.
     let client_app = Router::new()
         .route("/healthz", get(health))
-        .route("/readyz", get(health))
+        .route("/readyz", get(readiness))
         // Missing auth fails closed unless local dev explicitly opts out.
         .nest("/v1", v1.layer(middleware::from_fn(internal_auth::guard)))
         .with_state(node.clone())
@@ -155,6 +162,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
+}
+
+async fn readiness(State(node): State<Arc<Node>>) -> Response {
+    let status = node.status().await;
+    let storage_faulted_shards: Vec<_> = status
+        .shards
+        .iter()
+        .filter(|shard| !shard.storage_healthy)
+        .map(|shard| shard.shard_id)
+        .collect();
+    let all_shards_running = status.shards.len() == status.shard_count as usize;
+    let ready = all_shards_running && storage_faulted_shards.is_empty();
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status_code,
+        Json(json!({
+            "status": if ready { "ok" } else { "unavailable" },
+            "service": SERVICE,
+            "all_shards_running": all_shards_running,
+            "storage_faulted_shards": storage_faulted_shards,
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /v1/status` — per-shard consensus status for this node.

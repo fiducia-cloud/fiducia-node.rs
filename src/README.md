@@ -8,8 +8,11 @@ The modules fall into three layers:
 
 - **Consensus & replication** — `consensus.rs` (sharded/multi-Raft core,
   actor-per-shard), `transport.rs` and `raft_api.rs` (peer-to-peer Raft RPC),
-  `persist.rs` (crash-safe on-disk term/vote/log), `state.rs` (the replicated
-  state machine: every mutation is a `Command` applied in log order).
+  `persist.rs` (crash-safe on-disk term/vote/log/snapshot with strict recovery),
+  `state.rs` (the replicated state machine: every mutation is a `Command`
+  applied in log order). Persistence errors are returned to the shard actor;
+  the actor fails closed before granting a vote, acknowledging replication,
+  applying a new commit, or resolving a client proposal.
 - **Coordination primitives (client `/v1` API)** — one module per primitive:
   `locks`, `semaphore`, `idempotency`, `kv`, `rate_limit`, `counters`,
   `barriers`, `budgets`, `claims`, `decisions`, `effects`, `handoffs`, `tasks`,

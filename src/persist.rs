@@ -1,8 +1,9 @@
 //! Crash-safe Raft persistence for a single shard.
 //!
-//! Raft requires three pieces of state to survive a restart **before** the node
-//! acts on them, or its safety guarantees break: `current_term`, `voted_for`,
-//! and the replicated `log`. Without them a restarted member could vote twice in
+//! Raft requires its hard state and replicated data to survive a restart
+//! **before** the node acts on them, or its safety guarantees break:
+//! `current_term`, `voted_for`, the replicated `log`, and the latest
+//! state-machine snapshot. Without them a restarted member could vote twice in
 //! one term or forget an entry it had already acknowledged — and because this
 //! engine keeps its state machine in memory, a pod restart would otherwise drop
 //! every committed record, letting a "leader + one follower" group collapse to a
@@ -10,9 +11,9 @@
 //! that state, fsync'd before the caller treats the matching action as durable.
 //!
 //! We also persist `commit_index`. The Raft paper treats it as volatile, but it
-//! does so assuming a persisted state machine; here the state machine is rebuilt
-//! by **replaying the log up to `commit_index`** at boot, so the pointer has to
-//! survive too.
+//! does so assuming a persisted state machine; here the state machine is restored
+//! from a snapshot and replays the retained suffix up to `commit_index`, so the
+//! pointer has to survive too.
 //!
 //! Layout, under `<data_dir>/shard-<id>/`:
 //!   * `meta` — JSON `{current_term, voted_for, commit_index}`, written with the
@@ -21,21 +22,18 @@
 //!   * `log`  — newline-delimited JSON, one [`LogEntry`] per line, appended and
 //!     fsync'd. A trailing torn line (crash mid-append) is dropped on load and
 //!     the file is canonicalized so the next append starts from clean bytes.
-//!     With a snapshot present the log holds only entries **after** the
-//!     snapshot's `last_included_index`.
-//!   * `snapshot` — JSON [`ShardSnapshot`]: the serialized state machine at
-//!     `last_included_index`, written atomically like `meta`. Compaction writes
-//!     the snapshot **before** rewriting the log, so a crash between the two
-//!     leaves a log whose prefix merely duplicates the snapshot — recovery drops
-//!     any entry at or below the snapshot index.
+//!   * `snapshot` — atomic JSON state-machine image plus its last included
+//!     index/term. Once durable, the matching log prefix is removed.
 //!
 //! NOTE: fsync here is synchronous inside the shard actor's task — correctness
 //! over throughput for this build. A high-write deployment should move the log
 //! to a batched group-commit writer; the call sites are already the only places
 //! that touch the disk, so that change stays local.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -50,30 +48,26 @@ struct Meta {
     commit_index: u64,
 }
 
-/// A state-machine snapshot at a log position: everything at or below
-/// `last_included_index` is folded into `state` and truncated from the log.
+/// Durable state-machine image at one committed Raft index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardSnapshot {
+pub struct PersistedSnapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
-    /// The serialized state machine (see `StateMachine::snapshot`).
-    pub state: serde_json::Value,
+    pub state: Vec<u8>,
 }
 
-/// Raft state recovered from disk at boot. Empty (all-zero, empty log, no
-/// snapshot) for a fresh shard with no prior on-disk state. When a snapshot is
-/// present, `log` holds only entries strictly after its `last_included_index`.
+/// Raft state recovered from disk at boot. Empty (all-zero, empty log) for a
+/// fresh shard with no prior on-disk state.
 #[derive(Debug, Default)]
 pub struct Recovered {
     pub current_term: u64,
     pub voted_for: Option<String>,
     pub commit_index: u64,
-    pub snapshot: Option<ShardSnapshot>,
     pub log: Vec<LogEntry>,
+    pub snapshot: Option<PersistedSnapshot>,
 }
 
-/// A shard's durable store: the `meta` + `snapshot` files plus an append handle
-/// to `log`.
+/// A shard's durable store: the `meta` file plus an append handle to `log`.
 pub struct ShardStore {
     dir: PathBuf,
     log_path: PathBuf,
@@ -82,6 +76,17 @@ pub struct ShardStore {
     log_file: File,
     /// Number of log entries known to be on disk (so appends write only the tail).
     durable_len: usize,
+    #[cfg(test)]
+    fail_next: Cell<Option<PersistOp>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistOp {
+    Meta,
+    Append,
+    Rewrite,
+    Snapshot,
 }
 
 impl ShardStore {
@@ -96,55 +101,133 @@ impl ShardStore {
         let log_path = dir.join("log");
         let snapshot_path = dir.join("snapshot");
 
-        let meta: Meta = match fs::read(&meta_path) {
-            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            _ => Meta::default(),
-        };
+        let persisted_meta: Option<Meta> = read_optional_json(&meta_path, "raft meta")?;
+        let meta_was_missing = persisted_meta.is_none();
+        let meta = persisted_meta.unwrap_or_default();
+        if meta.current_term == 0 && meta.voted_for.is_some() {
+            return Err(invalid_data("raft meta contains a vote in term zero"));
+        }
 
-        // A snapshot is written atomically (tmp + rename), so it is either absent
-        // or complete. A present-but-corrupt one is fatal: the log below its
-        // index is gone, so no replay could rebuild that state — fail closed.
-        let snapshot: Option<ShardSnapshot> = match fs::read(&snapshot_path) {
-            Ok(bytes) if !bytes.is_empty() => Some(
-                serde_json::from_slice(&bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            ),
-            _ => None,
-        };
-        let base_index = snapshot
+        // Parse every complete JSON line. Only a malformed final fragment without
+        // a newline can be a torn append; malformed complete records are durable
+        // corruption and must abort recovery.
+        let snapshot: Option<PersistedSnapshot> =
+            read_optional_json(&snapshot_path, "raft snapshot")?;
+        let snapshot_index = snapshot
             .as_ref()
-            .map(|s| s.last_included_index)
+            .map(|value| value.last_included_index)
             .unwrap_or(0);
+        let snapshot_term = snapshot
+            .as_ref()
+            .map(|value| value.last_included_term)
+            .unwrap_or(0);
+        if (snapshot_index == 0) != (snapshot_term == 0) {
+            return Err(invalid_data(format!(
+                "snapshot index/term mismatch: index={snapshot_index}, term={snapshot_term}"
+            )));
+        }
 
-        // Parse every complete JSON line; stop at the first that fails to parse —
-        // that's a record torn by a crash mid-append, and everything after it.
-        // Entries at or below the snapshot index are already folded into the
-        // snapshot (a crash between snapshot write and log rewrite leaves them
-        // behind) and are dropped; so is anything after a gap in the indices,
-        // since a non-contiguous suffix could never be applied.
         let mut log: Vec<LogEntry> = Vec::new();
-        if let Ok(file) = File::open(&log_path) {
-            for line in BufReader::new(file).split(b'\n') {
-                let line = line?;
-                if line.is_empty() {
+        let log_bytes = match fs::read(&log_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let terminated = log_bytes.ends_with(b"\n");
+        let mut previous_index: Option<u64> = None;
+        let lines: Vec<&[u8]> = log_bytes.split(|byte| *byte == b'\n').collect();
+        for (line_number, line) in lines.iter().enumerate() {
+            let is_last = line_number + 1 == lines.len();
+            if line.is_empty() {
+                if is_last && (terminated || log_bytes.is_empty()) {
                     continue;
                 }
-                match serde_json::from_slice::<LogEntry>(&line) {
-                    Ok(entry) => {
-                        if entry.index <= base_index {
-                            continue;
-                        }
-                        let expected = base_index + log.len() as u64 + 1;
-                        if entry.index != expected {
-                            break;
-                        }
-                        log.push(entry);
-                    }
-                    Err(_) => break,
+                return Err(invalid_data(format!(
+                    "raft log contains an empty record at line {}",
+                    line_number + 1
+                )));
+            }
+            let entry = match serde_json::from_slice::<LogEntry>(line) {
+                Ok(entry) => entry,
+                Err(_) if is_last && !terminated => {
+                    // A crash can leave only the final, unterminated JSON fragment.
+                    // It was never acknowledged durable, so discard precisely that
+                    // fragment. A malformed newline-terminated record is corruption.
+                    break;
+                }
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "invalid raft log record at line {}: {error}",
+                        line_number + 1
+                    )));
+                }
+            };
+            if entry.index == 0 || entry.term == 0 {
+                return Err(invalid_data(format!(
+                    "raft log record at line {} has zero index or term",
+                    line_number + 1
+                )));
+            }
+            if let Some(previous) = previous_index {
+                let expected = previous
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("raft log index overflow"))?;
+                if entry.index != expected {
+                    return Err(invalid_data(format!(
+                        "raft log index gap at line {}: expected {}, found {}",
+                        line_number + 1,
+                        expected,
+                        entry.index
+                    )));
                 }
             }
+            previous_index = Some(entry.index);
+            if entry.index == snapshot_index && entry.term != snapshot_term {
+                return Err(invalid_data(format!(
+                    "raft log term {} at snapshot index {} disagrees with snapshot term {}",
+                    entry.term, snapshot_index, snapshot_term
+                )));
+            }
+            if entry.index > snapshot_index {
+                let expected = snapshot_index
+                    .checked_add(log.len() as u64)
+                    .and_then(|index| index.checked_add(1))
+                    .ok_or_else(|| invalid_data("raft log suffix index overflow"))?;
+                if entry.index != expected {
+                    return Err(invalid_data(format!(
+                        "raft log suffix gap after snapshot: expected index {expected}, found {}",
+                        entry.index
+                    )));
+                }
+                log.push(entry);
+            }
         }
+
+        let durable_tail = log
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(snapshot_index);
+        if meta_was_missing && (snapshot.is_some() || !log.is_empty()) {
+            return Err(invalid_data(
+                "raft meta is missing while durable snapshot/log state exists",
+            ));
+        }
+        let durable_term = meta.current_term.max(1);
+        if snapshot_term > durable_term || log.iter().any(|entry| entry.term > durable_term) {
+            return Err(invalid_data(format!(
+                "durable snapshot/log term exceeds persisted current term {durable_term}"
+            )));
+        }
+        if meta.commit_index > durable_tail {
+            return Err(invalid_data(format!(
+                "persisted commit index {} exceeds durable snapshot/log tail {durable_tail}",
+                meta.commit_index
+            )));
+        }
+        // A durable snapshot is itself proof that its included index committed.
+        // This can legitimately be newer than meta after a crash between the
+        // snapshot rename and the following meta rename, so recover upward only.
+        let recovered_commit = meta.commit_index.max(snapshot_index);
 
         let log_file = OpenOptions::new()
             .create(true)
@@ -158,34 +241,27 @@ impl ShardStore {
             snapshot_path,
             log_file,
             durable_len: 0,
+            #[cfg(test)]
+            fail_next: Cell::new(None),
         };
         // Canonicalize: rewrite the file to exactly the entries we trust.
         store.rewrite(&log)?;
+        if meta_was_missing {
+            // Establish a durable empty hard-state record before this store can
+            // subsequently acquire a vote, append a log entry, or install a
+            // snapshot. Future recovery can then distinguish a fresh shard from
+            // externally deleted/corrupt metadata.
+            store.save_meta(0, None, 0)?;
+        }
 
         let recovered = Recovered {
             current_term: meta.current_term,
             voted_for: meta.voted_for,
-            commit_index: meta.commit_index,
-            snapshot,
+            commit_index: recovered_commit,
             log,
+            snapshot,
         };
         Ok((store, recovered))
-    }
-
-    /// Durably record a state-machine snapshot. Atomic via tmp-file + rename +
-    /// dir fsync. Callers must write this **before** truncating the log at the
-    /// snapshot index (see the module docs for the crash-ordering argument).
-    pub fn save_snapshot(&self, snapshot: &ShardSnapshot) -> io::Result<()> {
-        let bytes = serde_json::to_vec(snapshot)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let tmp = self.snapshot_path.with_extension("tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.snapshot_path)?;
-        sync_dir(&self.dir)
     }
 
     /// Durably record the hard state. Atomic via tmp-file + rename + dir fsync.
@@ -195,6 +271,8 @@ impl ShardStore {
         voted_for: Option<&str>,
         commit_index: u64,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        self.maybe_fail(PersistOp::Meta)?;
         let meta = Meta {
             current_term,
             voted_for: voted_for.map(str::to_string),
@@ -219,6 +297,8 @@ impl ShardStore {
         if log.len() <= self.durable_len {
             return Ok(());
         }
+        #[cfg(test)]
+        self.maybe_fail(PersistOp::Append)?;
         let mut buf = Vec::new();
         for entry in &log[self.durable_len..] {
             serde_json::to_writer(&mut buf, entry)
@@ -235,6 +315,8 @@ impl ShardStore {
     /// conflicting suffix). Atomic via tmp-file + rename + dir fsync; reopens the
     /// append handle on the fresh inode.
     pub fn rewrite(&mut self, log: &[LogEntry]) -> io::Result<()> {
+        #[cfg(test)]
+        self.maybe_fail(PersistOp::Rewrite)?;
         let tmp = self.log_path.with_extension("tmp");
         {
             let mut f = File::create(&tmp)?;
@@ -257,6 +339,65 @@ impl ShardStore {
         self.durable_len = log.len();
         Ok(())
     }
+
+    /// Atomically persist a state-machine snapshot, then compact the log to the
+    /// suffix after it. Writing the snapshot first makes a crash between the two
+    /// steps safe: recovery filters the still-present prefix by snapshot index.
+    pub fn save_snapshot(
+        &mut self,
+        snapshot: &PersistedSnapshot,
+        remaining_log: &[LogEntry],
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        self.maybe_fail(PersistOp::Snapshot)?;
+        let tmp = self.snapshot_path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp)?;
+            serde_json::to_writer(&mut file, snapshot)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &self.snapshot_path)?;
+        sync_dir(&self.dir)?;
+        self.rewrite(remaining_log)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next(&self, operation: PersistOp) {
+        self.fail_next.set(Some(operation));
+    }
+
+    #[cfg(test)]
+    fn maybe_fail(&self, operation: PersistOp) -> io::Result<()> {
+        if self.fail_next.get() == Some(operation) {
+            self.fail_next.set(None);
+            return Err(io::Error::other(format!(
+                "injected {operation:?} persistence failure"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn read_optional_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    description: &str,
+) -> io::Result<Option<T>> {
+    match fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => Err(invalid_data(format!(
+            "{description} file is empty: {}",
+            path.display()
+        ))),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| invalid_data(format!("invalid {description}: {error}"))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 /// fsync a directory so a rename of one of its entries is itself durable.
@@ -273,7 +414,7 @@ mod tests {
         LogEntry {
             term,
             index,
-            ts_ms: 0,
+            proposed_at_ms: 1_000,
             command: Some(Command::KvPut {
                 key: key.to_string(),
                 value: "v".to_string(),
@@ -294,6 +435,13 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn open_error(root: &Path, shard: ShardId) -> io::Error {
+        match ShardStore::open(root, shard) {
+            Ok(_) => panic!("corrupt shard store unexpectedly opened"),
+            Err(error) => error,
+        }
     }
 
     #[test]
@@ -343,59 +491,13 @@ mod tests {
             .append_tail(&[entry(1, 1, "a"), entry(2, 1, "b")])
             .unwrap();
         // Truncate index 2 and replace it with a higher-term entry.
+        store.save_meta(5, None, 0).unwrap();
         store
             .rewrite(&[entry(1, 1, "a"), entry(2, 5, "c")])
             .unwrap();
         let (_s, rec) = ShardStore::open(&root, 0).unwrap();
         assert_eq!(rec.log.len(), 2);
         assert_eq!(rec.log[1].term, 5);
-    }
-
-    #[test]
-    fn snapshot_round_trips_and_stale_log_prefix_is_dropped() {
-        let root = tmpdir();
-        {
-            let (mut store, _) = ShardStore::open(&root, 4).unwrap();
-            store
-                .append_tail(&[entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")])
-                .unwrap();
-            // Compaction order: snapshot first. Simulate a crash BEFORE the log
-            // rewrite — the log still holds entries 1..=3, of which 1..=2 are now
-            // duplicated by the snapshot.
-            store
-                .save_snapshot(&ShardSnapshot {
-                    last_included_index: 2,
-                    last_included_term: 1,
-                    state: serde_json::json!({ "kv": { "a": "folded" } }),
-                })
-                .unwrap();
-        }
-        let (_store, rec) = ShardStore::open(&root, 4).unwrap();
-        let snap = rec.snapshot.expect("snapshot recovered");
-        assert_eq!(snap.last_included_index, 2);
-        assert_eq!(snap.last_included_term, 1);
-        assert_eq!(snap.state["kv"]["a"], "folded");
-        assert_eq!(
-            rec.log.len(),
-            1,
-            "entries at or below the snapshot index are dropped"
-        );
-        assert_eq!(rec.log[0].index, 3);
-    }
-
-    #[test]
-    fn non_contiguous_log_suffix_is_dropped_on_load() {
-        let root = tmpdir();
-        {
-            let (mut store, _) = ShardStore::open(&root, 5).unwrap();
-            // Index 3 with no index 2 before it: an unusable gap.
-            store
-                .append_tail(&[entry(1, 1, "a"), entry(3, 1, "c")])
-                .unwrap();
-        }
-        let (_store, rec) = ShardStore::open(&root, 5).unwrap();
-        assert_eq!(rec.log.len(), 1, "everything after a gap is unusable");
-        assert_eq!(rec.log[0].index, 1);
     }
 
     #[test]
@@ -415,5 +517,141 @@ mod tests {
         let (_store, rec) = ShardStore::open(&root, 9).unwrap();
         assert_eq!(rec.log.len(), 1, "torn record must be dropped");
         assert_eq!(rec.log[0].index, 1);
+    }
+
+    #[test]
+    fn newline_terminated_corruption_is_rejected_instead_of_truncated() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 10).unwrap();
+            store.append_tail(&[entry(1, 1, "a")]).unwrap();
+        }
+        let log_path = root.join("shard-10").join("log");
+        let mut file = OpenOptions::new().append(true).open(log_path).unwrap();
+        file.write_all(b"not-json\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let error = open_error(&root, 10);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn gapped_log_is_rejected_instead_of_reindexed_by_vector_length() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 11).unwrap();
+            store
+                .rewrite(&[entry(1, 1, "a"), entry(3, 1, "missing-two")])
+                .unwrap();
+        }
+
+        let error = open_error(&root, 11);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("index gap"));
+    }
+
+    #[test]
+    fn commit_beyond_durable_tail_is_rejected_instead_of_clamped_down() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 12).unwrap();
+            store.append_tail(&[entry(1, 1, "a")]).unwrap();
+            store.save_meta(1, Some("node-a"), 2).unwrap();
+        }
+
+        let error = open_error(&root, 12);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("commit index 2"));
+    }
+
+    #[test]
+    fn missing_meta_with_existing_log_is_rejected() {
+        let root = tmpdir();
+        let shard_dir = root.join("shard-13");
+        fs::create_dir_all(&shard_dir).unwrap();
+        let mut log = File::create(shard_dir.join("log")).unwrap();
+        serde_json::to_writer(&mut log, &entry(1, 1, "orphaned")).unwrap();
+        log.write_all(b"\n").unwrap();
+        log.sync_all().unwrap();
+
+        let error = open_error(&root, 13);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("meta is missing"));
+    }
+
+    #[test]
+    fn log_term_ahead_of_persisted_term_is_rejected() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 14).unwrap();
+            store.save_meta(1, None, 0).unwrap();
+            store.append_tail(&[entry(1, 2, "future")]).unwrap();
+        }
+
+        let error = open_error(&root, 14);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("term exceeds"));
+    }
+
+    #[test]
+    fn snapshot_compacts_log_and_survives_reopen() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 4).unwrap();
+            store
+                .append_tail(&[
+                    entry(1, 2, "old-a"),
+                    entry(2, 2, "old-b"),
+                    entry(3, 3, "tail"),
+                ])
+                .unwrap();
+            store.save_meta(3, Some("node-a"), 3).unwrap();
+            store
+                .save_snapshot(
+                    &PersistedSnapshot {
+                        last_included_index: 2,
+                        last_included_term: 2,
+                        state: br#"{"revision":2}"#.to_vec(),
+                    },
+                    &[entry(3, 3, "tail")],
+                )
+                .unwrap();
+        }
+        let (_store, recovered) = ShardStore::open(&root, 4).unwrap();
+        let snapshot = recovered.snapshot.unwrap();
+        assert_eq!(snapshot.last_included_index, 2);
+        assert_eq!(snapshot.last_included_term, 2);
+        assert_eq!(recovered.log.len(), 1);
+        assert_eq!(recovered.log[0].index, 3);
+    }
+
+    #[test]
+    fn snapshot_is_a_commit_floor_after_interrupted_meta_update() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 5).unwrap();
+            store.save_meta(2, None, 0).unwrap();
+            store
+                .append_tail(&[entry(1, 1, "a"), entry(2, 2, "b")])
+                .unwrap();
+            store
+                .save_snapshot(
+                    &PersistedSnapshot {
+                        last_included_index: 2,
+                        last_included_term: 2,
+                        state: br#"{"revision":2}"#.to_vec(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            // Deliberately omit save_meta: this models a crash after the atomic
+            // snapshot rename but before the commit pointer rename.
+        }
+
+        let (_store, recovered) = ShardStore::open(&root, 5).unwrap();
+        assert_eq!(recovered.commit_index, 2);
+        assert_eq!(recovered.snapshot.unwrap().last_included_index, 2);
     }
 }

@@ -29,7 +29,9 @@ All over HTTP (`/v1`):
 | **Service discovery** | `/v1/services/*`   | TTL-health registry of live service instances (Consul/etcd).   |
 
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
-internal `/raft/{shard}/{append,vote}` peer endpoints.
+internal `/raft/{shard}/{append,vote}` peer endpoints. `/healthz` is process
+liveness; `/readyz` returns 503 if any shard actor is missing or has tripped its
+durable-storage fail-closed state.
 
 ## B2B coordination flows
 
@@ -275,6 +277,7 @@ FIDUCIA_RAFT_HEARTBEAT_MS=100
 FIDUCIA_RAFT_ELECTION_MIN_MS=1000
 FIDUCIA_RAFT_ELECTION_JITTER_MS=500
 FIDUCIA_RAFT_COMMIT_WAIT_MS=10000
+FIDUCIA_RAFT_SNAPSHOT_THRESHOLD=1024 # committed entries between snapshots; 0 disables
 ```
 
 `/v1/status` reports the active timing and per-shard metrics including append
@@ -292,24 +295,38 @@ database: the **replicated log + the deterministic state machine** are the store
 - **Durability = replication.** A write is durable once a **quorum** of the
   shard's Raft group has it in their logs. Losing a minority of replicas loses no
   committed data; a new leader is elected from the up-to-date majority.
-- **Recovery = replay.** A restarted/replacement replica catches up by replaying
-  the log (tail via `AppendEntries`, or a snapshot + tail once the leader has
-  compacted).
+- **Recovery = snapshot + deterministic replay.** Every log entry carries the
+  leader-stamped proposal time used by all replicas. Restart replay therefore
+  cannot refresh a lock, idempotency record, election, service registration, or
+  other TTL. Legacy entries without a timestamp are conservatively epoch-anchored
+  and expire instead of resurrecting.
+- **Compaction is automatic.** After
+  `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` newly applied entries (default 1024), the
+  complete state machine is atomically snapshotted and the committed log prefix
+  is removed. A lagging follower whose required prefix was compacted receives
+  `InstallSnapshot`, then resumes with the retained log suffix.
+- **Each shard is persisted under `FIDUCIA_DATA_DIR`** (default
+  `/var/lib/fiducia`): atomic `meta`, newline-delimited `log`, and atomic
+  `snapshot` files. The node fsyncs before acknowledging durability. Kubernetes
+  deployments must mount this directory on stable persistent storage.
+- **A persistence error takes the shard out of service.** The actor immediately
+  steps down, refuses votes and replication acknowledgements, fails pending and
+  new proposals as unavailable, and refuses linearizable reads until restart.
+  In particular, the commit pointer is fsynced *before* applying a command or
+  resolving its client waiter; logging an fsync error and continuing is never
+  treated as durability.
+- **Recovery is strict.** Newline-terminated malformed records, non-contiguous
+  log indices, missing hard-state metadata beside durable data, term rollback,
+  snapshot/log term disagreement, and a persisted `commit_index` beyond the
+  durable snapshot/log tail abort shard startup. Only a final
+  unterminated JSON fragment (a torn append that was never acknowledged) may be
+  discarded. Recovery never clamps a committed index downward.
 
-The standard Raft durability stack (WAL → snapshot → compaction) is implemented:
-
-| Piece | Status |
-|-------|--------|
-| Raft log + `commit_index`/`voted_for` | crash-safe on-disk per shard (`persist.rs`): fsync'd append-only log + atomic `meta`, under `FIDUCIA_DATA_DIR` |
-| State machine | in-memory, rebuilt at boot from **snapshot + log-tail replay**; every entry replays at its proposer-stamped `ts_ms`, so lease expiry is deterministic (an expired lease can't resurrect on restart) |
-| Log growth | bounded by **snapshot + compaction** (`FIDUCIA_RAFT_COMPACT_THRESHOLD`, default 1024 live entries): the applied prefix is folded into an atomic `snapshot` file and truncated; a follower behind the compacted base is caught up via `InstallSnapshot` |
-
-None of it changes the API or the state-machine semantics above. A single
-embedded engine can still plug in behind that seam — see
-[`docs/storage.md`](docs/storage.md) for the RocksDB design (column families for
-the Raft log/meta, applied coordination state, watch indexes, and snapshots).
-(Postgres/Supabase stay the *business*/control-plane database — orgs, projects,
-users, API keys, audit, billing — never the coordination store.)
+`/v1/status` exposes `snapshot_index` and `retained_log_entries` per shard so
+operators can verify compaction rather than inferring it from disk usage. It
+also exposes `storage_healthy` and, only after a fault, `storage_error`.
+Postgres/Supabase remain the business/control-plane database for organizations,
+projects, users, API keys, audit, and billing—not the coordination store.
 
 ## Layout
 
@@ -428,6 +445,10 @@ Trust-boundary and hardening posture applied to this crate:
   exempt from any request timeout.
 - **Panic containment.** `CatchPanicLayer` converts a handler panic into a 500
   instead of crashing the process.
+- **Fail-closed Raft durability.** Votes, log/snapshot acknowledgements, commit
+  application, and client success all depend on successful durable writes. A
+  faulted shard remains unavailable and visible through `/readyz`, `/v1/status`,
+  and `/v1/observe/shards` until it restarts and validates its on-disk state.
 
 **Dependency advisories:** `cargo audit` is clean — 0 advisories across the
 dependency tree (171 crates), reconfirmed at the latest scan. No known or
