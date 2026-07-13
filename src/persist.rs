@@ -352,6 +352,53 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trips_and_stale_log_prefix_is_dropped() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 4).unwrap();
+            store
+                .append_tail(&[entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")])
+                .unwrap();
+            // Compaction order: snapshot first. Simulate a crash BEFORE the log
+            // rewrite — the log still holds entries 1..=3, of which 1..=2 are now
+            // duplicated by the snapshot.
+            store
+                .save_snapshot(&ShardSnapshot {
+                    last_included_index: 2,
+                    last_included_term: 1,
+                    state: serde_json::json!({ "kv": { "a": "folded" } }),
+                })
+                .unwrap();
+        }
+        let (_store, rec) = ShardStore::open(&root, 4).unwrap();
+        let snap = rec.snapshot.expect("snapshot recovered");
+        assert_eq!(snap.last_included_index, 2);
+        assert_eq!(snap.last_included_term, 1);
+        assert_eq!(snap.state["kv"]["a"], "folded");
+        assert_eq!(
+            rec.log.len(),
+            1,
+            "entries at or below the snapshot index are dropped"
+        );
+        assert_eq!(rec.log[0].index, 3);
+    }
+
+    #[test]
+    fn non_contiguous_log_suffix_is_dropped_on_load() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 5).unwrap();
+            // Index 3 with no index 2 before it: an unusable gap.
+            store
+                .append_tail(&[entry(1, 1, "a"), entry(3, 1, "c")])
+                .unwrap();
+        }
+        let (_store, rec) = ShardStore::open(&root, 5).unwrap();
+        assert_eq!(rec.log.len(), 1, "everything after a gap is unusable");
+        assert_eq!(rec.log[0].index, 1);
+    }
+
+    #[test]
     fn torn_trailing_record_is_dropped_on_load() {
         let root = tmpdir();
         {
