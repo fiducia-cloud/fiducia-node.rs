@@ -38,6 +38,7 @@ use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
