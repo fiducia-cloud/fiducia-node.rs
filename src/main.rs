@@ -270,3 +270,72 @@ mod test_support {
         serde_json::from_slice(&body).expect("JSON response")
     }
 }
+
+#[cfg(test)]
+mod peer_plane_limit_tests {
+    use axum::Router;
+    use tower_http::limit::RequestBodyLimitLayer;
+
+    use crate::state::{Command, StateMachine};
+    use crate::transport::{InstallSnapshotReq, InstallSnapshotResp};
+
+    /// A snapshot install whose body exceeds the client-plane cap must still be
+    /// accepted on the peer plane. With the peer plane capped at
+    /// `MAX_BODY_BYTES`, any shard whose state outgrew 1 MiB could never again
+    /// bring a lagging follower up to date (every install would 413), so this
+    /// pins the regression with a real HTTP round trip through the same layer
+    /// stack `main` builds for the peer listener.
+    #[tokio::test]
+    async fn snapshot_install_larger_than_client_cap_is_accepted_on_peer_plane() {
+        let node = crate::test_support::node(1);
+        let app = Router::new()
+            .nest("/raft", crate::raft_api::router())
+            .with_state(node)
+            .layer(RequestBodyLimitLayer::new(super::MAX_PEER_BODY_BYTES));
+
+        // Build a genuine >1 MiB state-machine image (a committed 2 MiB value).
+        let machine = StateMachine::new();
+        machine.apply(Command::KvPut {
+            key: "big".to_string(),
+            value: "v".repeat(2 * 1024 * 1024),
+            ttl_ms: None,
+            prev_revision: None,
+        });
+        let request = InstallSnapshotReq {
+            term: 1_000_000, // above any term the fresh test shard could reach
+            leader_id: "peer-test-leader".to_string(),
+            last_included_index: 5,
+            last_included_term: 1_000_000,
+            state: machine.snapshot().expect("snapshot serializes"),
+        };
+        let body = serde_json::to_vec(&request).expect("request serializes");
+        assert!(
+            body.len() > super::MAX_BODY_BYTES,
+            "test must exceed the client-plane cap to prove the peer cap differs"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/raft/0/snapshot"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("peer-plane request");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "oversized-for-client snapshot must not be rejected on the peer plane"
+        );
+        let resp: InstallSnapshotResp = response.json().await.expect("snapshot response");
+        assert!(resp.success, "follower must accept and ack the snapshot");
+        assert_eq!(resp.match_index, 5);
+
+        server.abort();
+    }
+}
