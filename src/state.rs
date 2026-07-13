@@ -2218,6 +2218,15 @@ impl Store {
         self.next_fencing_token
     }
 
+    /// Mint a fencing token strictly greater than `floor`, advancing this shard's
+    /// counter so every later token also exceeds it. Used by handoffs, whose new
+    /// owner's token must beat the `from_token` the previous owner presented even
+    /// when that token was minted on a different shard's counter.
+    fn mint_token_above(&mut self, floor: u64) -> u64 {
+        self.next_fencing_token = self.next_fencing_token.max(floor).saturating_add(1);
+        self.next_fencing_token
+    }
+
     fn expire_due(&mut self, now: u64) {
         self.kv.retain(|_, entry| {
             entry
