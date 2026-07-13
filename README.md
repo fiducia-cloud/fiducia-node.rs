@@ -29,7 +29,9 @@ All over HTTP (`/v1`):
 | **Service discovery** | `/v1/services/*`   | TTL-health registry of live service instances (Consul/etcd).   |
 
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
-internal `/raft/{shard}/{append,vote}` peer endpoints.
+internal `/raft/{shard}/{append,vote}` peer endpoints. `/healthz` is process
+liveness; `/readyz` returns 503 if any shard actor is missing or has tripped its
+durable-storage fail-closed state.
 
 ## B2B coordination flows
 
@@ -307,9 +309,22 @@ database: the **replicated log + the deterministic state machine** are the store
   `/var/lib/fiducia`): atomic `meta`, newline-delimited `log`, and atomic
   `snapshot` files. The node fsyncs before acknowledging durability. Kubernetes
   deployments must mount this directory on stable persistent storage.
+- **A persistence error takes the shard out of service.** The actor immediately
+  steps down, refuses votes and replication acknowledgements, fails pending and
+  new proposals as unavailable, and refuses linearizable reads until restart.
+  In particular, the commit pointer is fsynced *before* applying a command or
+  resolving its client waiter; logging an fsync error and continuing is never
+  treated as durability.
+- **Recovery is strict.** Newline-terminated malformed records, non-contiguous
+  log indices, missing hard-state metadata beside durable data, term rollback,
+  snapshot/log term disagreement, and a persisted `commit_index` beyond the
+  durable snapshot/log tail abort shard startup. Only a final
+  unterminated JSON fragment (a torn append that was never acknowledged) may be
+  discarded. Recovery never clamps a committed index downward.
 
 `/v1/status` exposes `snapshot_index` and `retained_log_entries` per shard so
-operators can verify compaction rather than inferring it from disk usage.
+operators can verify compaction rather than inferring it from disk usage. It
+also exposes `storage_healthy` and, only after a fault, `storage_error`.
 Postgres/Supabase remain the business/control-plane database for organizations,
 projects, users, API keys, audit, and billing—not the coordination store.
 
@@ -430,6 +445,10 @@ Trust-boundary and hardening posture applied to this crate:
   exempt from any request timeout.
 - **Panic containment.** `CatchPanicLayer` converts a handler panic into a 500
   instead of crashing the process.
+- **Fail-closed Raft durability.** Votes, log/snapshot acknowledgements, commit
+  application, and client success all depend on successful durable writes. A
+  faulted shard remains unavailable and visible through `/readyz`, `/v1/status`,
+  and `/v1/observe/shards` until it restarts and validates its on-disk state.
 
 **Dependency advisories:** `cargo audit` is clean — 0 advisories across the
 dependency tree (171 crates), reconfirmed at the latest scan. No known or

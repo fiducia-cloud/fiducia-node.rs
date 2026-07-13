@@ -38,6 +38,7 @@ use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
 
 use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -66,18 +67,27 @@ pub fn router() -> Router<Arc<Node>> {
 /// `GET /v1/kv` — read a key, watch a key/prefix, or list a prefix, by query.
 async fn get_or_list(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KvParams>,
 ) -> Response {
     if q.watch.unwrap_or(false) {
         return match (q.key, q.prefix) {
-            (Some(key), _) => watch(node, key, false).await,
-            (None, Some(prefix)) => watch(node, prefix, true).await,
+            (Some(key), _) => watch(node, org.scope(&key), false, org).await,
+            (None, Some(prefix)) => watch(node, org.scope(&prefix), true, org).await,
             (None, None) => bad_request("watch requires `key` or `prefix`"),
         };
     }
     match q.key {
-        Some(key) => match node.query(ReadRequest::Kv { key: key.clone() }).await {
+        // The caller's key is namespaced into their org before it reaches the
+        // state machine; the response echoes the caller-facing key, not the scoped
+        // one, so the isolation is invisible to the client.
+        Some(key) => match node
+            .query(ReadRequest::Kv {
+                key: org.scope(&key),
+            })
+            .await
+        {
             Ok(ReadResponse::Kv(Some(entry))) => {
                 Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
             }
@@ -87,13 +97,14 @@ async fn get_or_list(
             Err(err) => read_error_response(err, &uri),
             _ => Json(json!({ "error": "unavailable" })).into_response(),
         },
-        None => list(node, q.prefix.unwrap_or_default()).await,
+        None => list(node, org, q.prefix.unwrap_or_default()).await,
     }
 }
 
 /// `PUT /v1/kv?key=K` — upsert (optionally compare-and-swap). Value in the body.
 async fn put_key(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KvParams>,
     Json(body): Json<PutBody>,
@@ -103,7 +114,7 @@ async fn put_key(
     };
     let result = node
         .propose(Command::KvPut {
-            key,
+            key: org.scope(&key),
             value: body.value,
             ttl_ms: body.ttl_ms,
             prev_revision: body.prev_revision,
@@ -115,23 +126,37 @@ async fn put_key(
 /// `DELETE /v1/kv?key=K` — remove a key.
 async fn delete_key(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KvParams>,
 ) -> Response {
     let Some(key) = q.key else {
         return bad_request("missing `key`");
     };
-    let result = node.propose(Command::KvDelete { key }).await;
+    let result = node
+        .propose(Command::KvDelete {
+            key: org.scope(&key),
+        })
+        .await;
     propose_response(result, &uri)
 }
 
-/// `GET /v1/kv?prefix=...` — list live keys under a prefix.
-///
-/// A prefix can span shards, so this fans the range read out across every shard
-/// (a serializable per-shard read each) and merges the results, sorted by key.
-/// An empty prefix lists the whole keyspace.
-async fn list(node: Arc<Node>, prefix: String) -> Response {
-    let keys = node.list_kv(&prefix).await;
+/// `GET /v1/kv?prefix=...` — list live keys under a prefix, scoped to the caller's
+/// org. The caller's prefix is namespaced, and every returned key is un-namespaced
+/// back to the caller-facing form; keys outside the org's space are filtered out
+/// (they never share the prefix), which is what makes the list read tenant-safe.
+async fn list(node: Arc<Node>, org: OrgScope, prefix: String) -> Response {
+    let scoped_prefix = org.scope(&prefix);
+    let keys: Vec<_> = node
+        .list_kv(&scoped_prefix)
+        .await
+        .into_iter()
+        .filter_map(|mut item| {
+            let unscoped = org.unscope(&item.key)?.to_string();
+            item.key = unscoped;
+            Some(item)
+        })
+        .collect();
     Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response()
 }
 
@@ -140,44 +165,32 @@ async fn list(node: Arc<Node>, prefix: String) -> Response {
 /// Subscribes to the owning shard's change broadcast and pushes one SSE event per
 /// committed put/delete that matches. The connection is long-lived (no request
 /// timeout layer) with periodic keep-alive comments.
-async fn watch(node: Arc<Node>, key: String, prefix: bool) -> Response {
+async fn watch(node: Arc<Node>, key: String, prefix: bool, org: OrgScope) -> Response {
     if prefix {
-        return watch_prefix(node, key).await;
+        return watch_prefix(node, key, org).await;
     }
     let Some(rx) = node.watch(&key).await else {
-        return Json(json!({ "error": "unavailable", "op": "kv.watch", "key": key }))
-            .into_response();
+        return Json(json!({ "error": "unavailable", "op": "kv.watch" })).into_response();
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications
         if event.scope != "kv" {
             return None; // ignore election/service changes on the shared shard stream
         }
-        let matches = if prefix {
-            event.key.starts_with(&key)
-        } else {
-            event.key == key
-        };
-        if !matches {
+        if event.key != key {
             return None;
         }
-        Some(Ok::<Event, Infallible>(
-            Event::default()
-                .event(event.kind)
-                .json_data(&event)
-                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
-        ))
+        Some(Ok::<Event, Infallible>(unscoped_change_event(&event, &org)))
     });
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
 }
 
-async fn watch_prefix(node: Arc<Node>, prefix: String) -> Response {
+async fn watch_prefix(node: Arc<Node>, prefix: String, org: OrgScope) -> Response {
     let receivers = node.watch_all().await;
     if receivers.is_empty() {
-        return Json(json!({ "error": "unavailable", "op": "kv.watch", "prefix": prefix }))
-            .into_response();
+        return Json(json!({ "error": "unavailable", "op": "kv.watch" })).into_response();
     }
 
     let mut streams = StreamMap::new();
@@ -189,17 +202,33 @@ async fn watch_prefix(node: Arc<Node>, prefix: String) -> Response {
         if !is_kv_change(event.kind) || !event.key.starts_with(&prefix) {
             return None;
         }
-        Some(Ok::<Event, Infallible>(
-            Event::default()
-                .event(event.kind)
-                .json_data(&event)
-                .unwrap_or_else(|_| Event::default().comment("serialize-error")),
-        ))
+        Some(Ok::<Event, Infallible>(unscoped_change_event(&event, &org)))
     });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// Emit a KV change event with its key un-namespaced back to the caller-facing
+/// form, so a watcher never sees another org's key or the internal prefix.
+fn unscoped_change_event<T: serde::Serialize>(event: &T, org: &OrgScope) -> Event {
+    let mut value = match serde_json::to_value(event) {
+        Ok(v) => v,
+        Err(_) => return Event::default().comment("serialize-error"),
+    };
+    if let Some(scoped) = value.get("key").and_then(|k| k.as_str()) {
+        match org.unscope(scoped) {
+            Some(caller_key) => value["key"] = json!(caller_key),
+            None => return Event::default().comment("out-of-scope"),
+        }
+    }
+    let kind = value
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("change")
+        .to_string();
+    Event::default().event(kind).data(value.to_string())
 }
 
 fn is_kv_change(kind: &str) -> bool {

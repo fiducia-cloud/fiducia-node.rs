@@ -91,6 +91,12 @@ async fn shards(State(node): State<Arc<Node>>) -> Response {
         .filter(|s| s.role == Role::Leader && !s.has_quorum)
         .map(|s| s.shard_id)
         .collect();
+    let storage_faulted: Vec<_> = status
+        .shards
+        .iter()
+        .filter(|s| !s.storage_healthy)
+        .map(|s| s.shard_id)
+        .collect();
 
     Json(json!({
         "node_id": status.node_id,
@@ -101,6 +107,8 @@ async fn shards(State(node): State<Arc<Node>>) -> Response {
             "leaderless_shards": leaderless,
             "at_risk_led_shards": at_risk,
             "all_led_shards_have_quorum": at_risk.is_empty(),
+            "storage_faulted_shards": storage_faulted,
+            "all_shard_storage_healthy": storage_faulted.is_empty(),
         },
         "shards": status.shards,
     }))

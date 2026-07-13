@@ -600,6 +600,9 @@ struct ShardActor {
     last_applied: u64,
     /// Durable backing for term/vote/log, or `None` for an in-memory shard.
     store: Option<ShardStore>,
+    /// First durable-storage failure observed by this actor. Once set, the shard
+    /// remains fail-closed until process restart and successful recovery.
+    storage_fault: Option<String>,
 
     // --- candidate state ---
     votes: HashSet<String>,
@@ -664,8 +667,28 @@ impl ShardActor {
             .as_ref()
             .map(|snapshot| snapshot.state.clone())
             .unwrap_or_default();
-        let recovered_tail = snapshot_index.saturating_add(recovered.log.len() as u64);
-        let recovered_commit = recovered.commit_index.clamp(snapshot_index, recovered_tail);
+        for (offset, entry) in recovered.log.iter().enumerate() {
+            let expected = snapshot_index
+                .checked_add(offset as u64)
+                .and_then(|index| index.checked_add(1))
+                .expect("recovered log index overflow");
+            assert_eq!(
+                entry.index, expected,
+                "invalid recovered state for shard {shard_id}: expected log index {expected}, found {}",
+                entry.index
+            );
+        }
+        let recovered_tail = recovered
+            .log
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(snapshot_index);
+        assert!(
+            recovered.commit_index <= recovered_tail,
+            "invalid recovered state for shard {shard_id}: commit index {} exceeds durable tail {recovered_tail}",
+            recovered.commit_index
+        );
+        let recovered_commit = recovered.commit_index.max(snapshot_index);
         let state = StateMachine::new();
         if let Some(snapshot) = recovered.snapshot.as_ref() {
             if let Err(error) = state.restore(&snapshot.state) {
@@ -693,6 +716,7 @@ impl ShardActor {
             commit_index: recovered_commit,
             last_applied: snapshot_index,
             store,
+            storage_fault: None,
             votes: HashSet::new(),
             pre_votes: HashSet::new(),
             pre_vote_term: 0,
@@ -791,6 +815,9 @@ impl ShardActor {
     /// Periodic tick: leaders heartbeat; everyone else campaigns once their
     /// election timeout elapses without hearing from a leader.
     fn on_tick(&mut self) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         let now = Instant::now();
         match self.role {
             Role::Leader => {
@@ -859,6 +886,9 @@ impl ShardActor {
     /// what stops a partitioned node — whose term has run ahead while it was
     /// isolated — from forcing a healthy leader to step down when it reconnects.
     fn start_pre_election(&mut self) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         // Run the straw poll strictly as a follower: abandon any failed candidacy
         // so a late vote-reply from the prior term can't complete a stale election
         // while this pre-poll is in flight. The term is *not* bumped here.
@@ -885,6 +915,9 @@ impl ShardActor {
     }
 
     fn start_election(&mut self) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         self.current_term += 1;
         self.role = Role::Candidate;
         tracing::info!(
@@ -900,7 +933,10 @@ impl ShardActor {
         self.votes.insert(self.node_id.clone());
         self.reset_election_deadline();
         // Durable before we ask anyone for a vote in this term.
-        self.persist_hard_state();
+        if let Err(error) = self.persist_hard_state() {
+            self.fail_storage("persisting election term and self-vote", error);
+            return;
+        }
 
         if self.votes.len() >= self.majority() {
             // Single-member group: we already have a majority.
@@ -941,6 +977,9 @@ impl ShardActor {
     }
 
     fn handle_vote_reply(&mut self, from: String, pre_vote: bool, resp: RequestVoteResp) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         // A higher term anywhere means we're behind: adopt it and stand down.
         if resp.term > self.current_term {
             self.step_down(resp.term, None);
@@ -973,6 +1012,9 @@ impl ShardActor {
     }
 
     fn become_leader(&mut self) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         self.record_leader_transfer(self.role, Role::Leader, "became_leader");
         self.role = Role::Leader;
         self.leader_id = Some(self.node_id.clone());
@@ -1011,7 +1053,10 @@ impl ShardActor {
             command: None,
         });
         // Durable before this entry can count toward a commit.
-        self.persist_log_append();
+        if let Err(error) = self.persist_log_append() {
+            self.fail_storage("persisting leader no-op", error);
+            return;
+        }
 
         self.heartbeat_deadline = Instant::now() + self.timing.heartbeat;
         self.maybe_advance_commit(); // single-node commits the no-op immediately
@@ -1038,7 +1083,10 @@ impl ShardActor {
         if leader.is_some() {
             self.leader_id = leader;
         }
-        self.persist_hard_state();
+        if let Err(error) = self.persist_hard_state() {
+            self.fail_storage("persisting higher term while stepping down", error);
+            return;
+        }
         self.reset_election_deadline();
         self.fail_pending();
     }
@@ -1047,36 +1095,54 @@ impl ShardActor {
 
     /// Persist `current_term`, `voted_for`, and `commit_index`. Call after any
     /// change to them and **before** the action that relies on them (granting a
-    /// vote, campaigning, committing). A persist failure is logged, not hidden —
-    /// it means we may be running without the durability the caller assumes.
-    fn persist_hard_state(&mut self) {
+    /// vote, campaigning, committing). Failures must be propagated to the caller;
+    /// the shard cannot safely keep participating after one.
+    fn persist_hard_state(&self) -> std::io::Result<()> {
+        self.persist_hard_state_at(self.commit_index)
+    }
+
+    fn persist_hard_state_at(&self, commit_index: u64) -> std::io::Result<()> {
         if let Some(store) = self.store.as_ref() {
-            if let Err(e) = store.save_meta(
-                self.current_term,
-                self.voted_for.as_deref(),
-                self.commit_index,
-            ) {
-                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist hard state");
-            }
+            store.save_meta(self.current_term, self.voted_for.as_deref(), commit_index)?;
         }
+        Ok(())
     }
 
     /// Persist newly-appended tail entries (pure-append path).
-    fn persist_log_append(&mut self) {
+    fn persist_log_append(&mut self) -> std::io::Result<()> {
         if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store.append_tail(&self.log) {
-                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log append");
-            }
+            store.append_tail(&self.log)?;
         }
+        Ok(())
     }
 
     /// Persist the full log after a conflicting suffix was truncated/replaced.
-    fn persist_log_rewrite(&mut self) {
+    fn persist_log_rewrite(&mut self) -> std::io::Result<()> {
         if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store.rewrite(&self.log) {
-                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log rewrite");
-            }
+            store.rewrite(&self.log)?;
         }
+        Ok(())
+    }
+
+    fn fail_storage(&mut self, operation: &'static str, error: std::io::Error) {
+        let detail = format!("{operation}: {error}");
+        if self.storage_fault.is_none() {
+            tracing::error!(
+                shard = ?self.shard_id,
+                node = %self.node_id,
+                %operation,
+                error = %error,
+                "raft: durable storage failed; shard is now fail-closed until restart"
+            );
+            self.storage_fault = Some(detail);
+        }
+        self.record_leader_transfer(self.role, Role::Follower, "storage_fault");
+        self.role = Role::Follower;
+        self.leader_id = None;
+        self.leader = None;
+        self.votes.clear();
+        self.pre_votes.clear();
+        self.fail_pending_unavailable();
     }
 
     fn fail_pending(&mut self) {
@@ -1085,6 +1151,14 @@ impl ShardActor {
             let _ = pending.resp.send(Err(ProposeError::NotLeader {
                 shard: self.shard_id,
                 leader: leader.clone(),
+            }));
+        }
+    }
+
+    fn fail_pending_unavailable(&mut self) {
+        for (_, pending) in self.pending.drain() {
+            let _ = pending.resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
             }));
         }
     }
@@ -1179,6 +1253,9 @@ impl ShardActor {
         rtt_ms: Option<u64>,
         resp: Option<AppendEntriesResp>,
     ) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         if let Some(ls) = self.leader.as_mut() {
             ls.in_flight.insert(from.clone(), false);
         }
@@ -1236,6 +1313,9 @@ impl ShardActor {
         up_to: u64,
         resp: Option<InstallSnapshotResp>,
     ) {
+        if self.storage_fault.is_some() {
+            return;
+        }
         if let Some(leader) = self.leader.as_mut() {
             leader.in_flight.insert(from.clone(), false);
         }
@@ -1262,7 +1342,7 @@ impl ShardActor {
     /// Advance `commit_index` to the highest index replicated on a majority that
     /// is **from the current term** (Raft's commit rule), then apply.
     fn maybe_advance_commit(&mut self) {
-        if self.role != Role::Leader {
+        if self.role != Role::Leader || self.storage_fault.is_some() {
             return;
         }
         let mut matches: Vec<u64> = Vec::with_capacity(self.members);
@@ -1275,9 +1355,14 @@ impl ShardActor {
         matches.sort_unstable_by(|a, b| b.cmp(a)); // descending
         let n = matches[self.majority() - 1]; // highest index on ≥ majority
         if n > self.commit_index && self.term_at(n) == self.current_term {
+            // Persist the new commit pointer before applying or resolving any
+            // client waiter. A successful apply must always be restartable.
+            if let Err(error) = self.persist_hard_state_at(n) {
+                self.fail_storage("persisting leader commit index", error);
+                return;
+            }
             self.commit_index = n;
             self.apply_committed();
-            self.persist_hard_state(); // record the advanced commit pointer
         }
     }
 
@@ -1354,6 +1439,13 @@ impl ShardActor {
     // --- replication (follower side) --------------------------------------
 
     fn handle_install_snapshot(&mut self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        if self.storage_fault.is_some() {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.commit_index,
+            };
+        }
         if req.term < self.current_term {
             return InstallSnapshotResp {
                 term: self.current_term,
@@ -1364,6 +1456,30 @@ impl ShardActor {
         if req.term > self.current_term {
             self.current_term = req.term;
             self.voted_for = None;
+            if let Err(error) = self.persist_hard_state() {
+                self.fail_storage("persisting higher term from snapshot leader", error);
+                return InstallSnapshotResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.commit_index,
+                };
+            }
+        }
+        if (req.last_included_index == 0) != (req.last_included_term == 0)
+            || req.last_included_term > req.term
+        {
+            tracing::warn!(
+                shard = ?self.shard_id,
+                snapshot_index = req.last_included_index,
+                snapshot_term = req.last_included_term,
+                leader_term = req.term,
+                "raft: rejected snapshot with invalid index/term metadata"
+            );
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index(),
+            };
         }
         self.become_follower_of(req.leader_id);
         if req.last_included_index <= self.snapshot_index {
@@ -1371,6 +1487,16 @@ impl ShardActor {
                 term: self.current_term,
                 success: true,
                 match_index: self.snapshot_index,
+            };
+        }
+        if req.last_included_index <= self.commit_index {
+            // This follower already has committed state at least as new as the
+            // offered snapshot. Installing it could roll the materialized state
+            // backward, so acknowledge our newer durable position instead.
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: true,
+                match_index: self.last_log_index(),
             };
         }
 
@@ -1400,22 +1526,30 @@ impl ShardActor {
         };
         if let Some(store) = self.store.as_mut() {
             if let Err(error) = store.save_snapshot(&snapshot, &remaining) {
-                tracing::error!(shard = ?self.shard_id, %error, "raft: failed to persist installed snapshot");
+                self.fail_storage("persisting installed snapshot", error);
                 return InstallSnapshotResp {
                     term: self.current_term,
                     success: false,
-                    match_index: self.last_log_index(),
+                    match_index: self.commit_index,
                 };
             }
+        }
+        let new_commit_index = self.commit_index.max(req.last_included_index);
+        if let Err(error) = self.persist_hard_state_at(new_commit_index) {
+            self.fail_storage("persisting installed snapshot commit index", error);
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.commit_index,
+            };
         }
         self.state = restored;
         self.snapshot_index = req.last_included_index;
         self.snapshot_term = req.last_included_term;
         self.snapshot_state = req.state;
         self.log = remaining;
-        self.commit_index = self.commit_index.max(self.snapshot_index);
+        self.commit_index = new_commit_index;
         self.last_applied = self.snapshot_index;
-        self.persist_hard_state();
         InstallSnapshotResp {
             term: self.current_term,
             success: true,
@@ -1424,6 +1558,13 @@ impl ShardActor {
     }
 
     fn handle_append_entries(&mut self, req: AppendEntriesReq) -> AppendEntriesResp {
+        if self.storage_fault.is_some() {
+            return AppendEntriesResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.commit_index,
+            };
+        }
         // Reject a stale leader.
         if req.term < self.current_term {
             return AppendEntriesResp {
@@ -1437,7 +1578,49 @@ impl ShardActor {
             self.current_term = req.term;
             self.voted_for = None;
             // Durable before we answer this RPC (even the reject path below).
-            self.persist_hard_state();
+            if let Err(error) = self.persist_hard_state() {
+                self.fail_storage("persisting higher term from append leader", error);
+                return AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.commit_index,
+                };
+            }
+        }
+
+        // The vector position is not the log index: reject a malformed/gapped
+        // leader payload rather than storing entries under the wrong offsets.
+        if req.prev_log_term > req.term {
+            return AppendEntriesResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index(),
+            };
+        }
+        let mut expected_index = req.prev_log_index;
+        for entry in &req.entries {
+            let Some(next) = expected_index.checked_add(1) else {
+                return AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                };
+            };
+            if entry.index != next || entry.term == 0 || entry.term > req.term {
+                tracing::warn!(
+                    shard = ?self.shard_id,
+                    expected_index = next,
+                    entry_index = entry.index,
+                    entry_term = entry.term,
+                    "raft: rejected malformed/gapped AppendEntries payload"
+                );
+                return AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                };
+            }
+            expected_index = next;
         }
         self.become_follower_of(req.leader_id.clone());
 
@@ -1466,6 +1649,19 @@ impl ShardActor {
             match self.log.get(offset) {
                 Some(existing) if existing.term == entry.term => {} // already have it
                 Some(_) => {
+                    if idx <= self.commit_index {
+                        tracing::error!(
+                            shard = ?self.shard_id,
+                            conflict_index = idx,
+                            commit_index = self.commit_index,
+                            "raft: rejected AppendEntries that would overwrite committed state"
+                        );
+                        return AppendEntriesResp {
+                            term: self.current_term,
+                            success: false,
+                            match_index: self.commit_index,
+                        };
+                    }
                     self.log.truncate(offset);
                     self.log.push(entry);
                     truncated = true;
@@ -1478,16 +1674,43 @@ impl ShardActor {
         }
         // Persist the log change before acking success: a full rewrite if we
         // truncated a conflicting suffix, otherwise just the appended tail.
-        if truncated {
-            self.persist_log_rewrite();
+        let persisted = if truncated {
+            self.persist_log_rewrite()
         } else if grew {
-            self.persist_log_append();
+            self.persist_log_append()
+        } else {
+            Ok(())
+        };
+        if let Err(error) = persisted {
+            self.fail_storage("persisting follower log update", error);
+            return AppendEntriesResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.commit_index,
+            };
         }
 
         if req.leader_commit > self.commit_index {
-            self.commit_index = req.leader_commit.min(self.last_log_index());
-            self.apply_committed();
-            self.persist_hard_state(); // record the advanced commit pointer
+            let new_commit_index = req.leader_commit.min(self.last_log_index());
+            if new_commit_index > self.commit_index {
+                if let Err(error) = self.persist_hard_state_at(new_commit_index) {
+                    self.fail_storage("persisting follower commit index", error);
+                    return AppendEntriesResp {
+                        term: self.current_term,
+                        success: false,
+                        match_index: self.commit_index,
+                    };
+                }
+                self.commit_index = new_commit_index;
+                self.apply_committed();
+                if self.storage_fault.is_some() {
+                    return AppendEntriesResp {
+                        term: self.current_term,
+                        success: false,
+                        match_index: self.commit_index,
+                    };
+                }
+            }
         }
 
         AppendEntriesResp {
@@ -1526,6 +1749,18 @@ impl ShardActor {
     }
 
     fn handle_request_vote(&mut self, req: RequestVoteReq) -> RequestVoteResp {
+        if self.storage_fault.is_some() {
+            return RequestVoteResp {
+                term: self.current_term,
+                granted: false,
+            };
+        }
+        if req.last_log_term > req.term {
+            return RequestVoteResp {
+                term: self.current_term,
+                granted: false,
+            };
+        }
         // PreVote is answered without mutating any Raft state (no term bump, no
         // `voted_for`, no deadline reset) — that read-only-ness is the whole point.
         if req.pre_vote {
@@ -1539,6 +1774,12 @@ impl ShardActor {
         }
         if req.term > self.current_term {
             self.step_down(req.term, None);
+            if self.storage_fault.is_some() {
+                return RequestVoteResp {
+                    term: self.current_term,
+                    granted: false,
+                };
+            }
         }
 
         let log_ok = (req.last_log_term > self.last_log_term())
@@ -1554,7 +1795,13 @@ impl ShardActor {
             self.voted_for = Some(req.candidate_id.clone());
             self.reset_election_deadline();
             // Durable before we tell the candidate it has our vote.
-            self.persist_hard_state();
+            if let Err(error) = self.persist_hard_state() {
+                self.fail_storage("persisting granted vote", error);
+                return RequestVoteResp {
+                    term: self.current_term,
+                    granted: false,
+                };
+            }
             RequestVoteResp {
                 term: self.current_term,
                 granted: true,
@@ -1602,6 +1849,12 @@ impl ShardActor {
         command: Command,
         resp: oneshot::Sender<Result<ProposeOutcome, ProposeError>>,
     ) {
+        if self.storage_fault.is_some() {
+            let _ = resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            }));
+            return;
+        }
         if self.role != Role::Leader {
             let _ = resp.send(Err(ProposeError::NotLeader {
                 shard: self.shard_id,
@@ -1609,7 +1862,12 @@ impl ShardActor {
             }));
             return;
         }
-        let index = self.last_log_index() + 1;
+        let Some(index) = self.last_log_index().checked_add(1) else {
+            let _ = resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            }));
+            return;
+        };
         self.log.push(LogEntry {
             term: self.current_term,
             index,
@@ -1617,7 +1875,13 @@ impl ShardActor {
             command: Some(command),
         });
         // Durable before this entry can count toward a commit / be acked.
-        self.persist_log_append();
+        if let Err(error) = self.persist_log_append() {
+            self.fail_storage("persisting proposed log entry", error);
+            let _ = resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            }));
+            return;
+        }
         // Block the client on this index committing.
         self.pending.insert(
             index,
@@ -1629,9 +1893,12 @@ impl ShardActor {
 
         if self.members == 1 {
             // One-member quorum: commit (and apply, which resolves the waiter) now.
+            if let Err(error) = self.persist_hard_state_at(index) {
+                self.fail_storage("persisting single-member commit index", error);
+                return;
+            }
             self.commit_index = index;
             self.apply_committed();
-            self.persist_hard_state(); // record the advanced commit pointer
         } else {
             self.broadcast_append_entries();
         }
@@ -1640,36 +1907,71 @@ impl ShardActor {
     /// Apply every newly-committed entry in order, resolving client waiters and
     /// publishing change events.
     fn apply_committed(&mut self) {
+        let mut completed: Vec<(u64, PendingProposal, u64, Value)> = Vec::new();
         while self.last_applied < self.commit_index {
-            self.last_applied += 1;
-            let i = self.last_applied;
-            let Some(entry) = self.log.get((i - self.snapshot_index - 1) as usize) else {
-                break;
+            let Some(i) = self.last_applied.checked_add(1) else {
+                self.fail_storage(
+                    "advancing applied index",
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "applied index overflow"),
+                );
+                self.fail_completed(completed);
+                return;
             };
+            let offset = i
+                .checked_sub(self.snapshot_index)
+                .and_then(|relative| relative.checked_sub(1))
+                .and_then(|relative| usize::try_from(relative).ok());
+            let Some(entry) = offset.and_then(|offset| self.log.get(offset)) else {
+                self.fail_storage(
+                    "applying committed log",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("missing durable entry at committed index {i}"),
+                    ),
+                );
+                self.fail_completed(completed);
+                return;
+            };
+            self.last_applied = i;
             let Some(command) = entry.command.clone() else {
                 continue; // no-op
             };
             let applied = self.state.apply_at(command.clone(), entry.proposed_at_ms);
             self.publish_change(&command, &applied.output, applied.revision);
             if let Some(pending) = self.pending.remove(&i) {
-                let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
-                self.metrics.quorum_rtt_ms_last = Some(quorum_rtt_ms);
-                tracing::info!(
-                    metric.name = "fiducia.raft.quorum_rtt_ms",
-                    shard = self.shard_id,
-                    log_index = i,
-                    quorum_rtt_ms,
-                    "proposal committed on quorum"
-                );
-                let _ = pending.resp.send(Ok(ProposeOutcome {
-                    shard: self.shard_id,
-                    log_index: i,
-                    revision: applied.revision,
-                    output: applied.output,
-                }));
+                completed.push((i, pending, applied.revision, applied.output));
             }
         }
         self.maybe_compact();
+        if self.storage_fault.is_some() {
+            self.fail_completed(completed);
+            return;
+        }
+        for (index, pending, revision, output) in completed {
+            let quorum_rtt_ms = duration_millis(pending.started_at.elapsed());
+            self.metrics.quorum_rtt_ms_last = Some(quorum_rtt_ms);
+            tracing::info!(
+                metric.name = "fiducia.raft.quorum_rtt_ms",
+                shard = self.shard_id,
+                log_index = index,
+                quorum_rtt_ms,
+                "proposal committed on quorum"
+            );
+            let _ = pending.resp.send(Ok(ProposeOutcome {
+                shard: self.shard_id,
+                log_index: index,
+                revision,
+                output,
+            }));
+        }
+    }
+
+    fn fail_completed(&self, completed: Vec<(u64, PendingProposal, u64, Value)>) {
+        for (_, pending, _, _) in completed {
+            let _ = pending.resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            }));
+        }
     }
 
     fn maybe_compact(&mut self) {
@@ -1695,7 +1997,7 @@ impl ShardActor {
         };
         if let Some(store) = self.store.as_mut() {
             if let Err(error) = store.save_snapshot(&snapshot, &remaining) {
-                tracing::error!(shard = ?self.shard_id, %error, "raft: failed to persist snapshot");
+                self.fail_storage("persisting compacted snapshot", error);
                 return;
             }
         }
@@ -1792,6 +2094,11 @@ impl ShardActor {
     /// spans shards, so it is served from this node's locally committed shard
     /// snapshots and merged by [`Node::query_kv_prefix`].
     fn handle_query(&self, request: ReadRequest) -> Result<ReadResponse, ProposeError> {
+        if self.storage_fault.is_some() {
+            return Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            });
+        }
         if !matches!(&request, ReadRequest::KvPrefix { .. }) && self.role != Role::Leader {
             return Err(ProposeError::NotLeader {
                 shard: self.shard_id,
@@ -1969,6 +2276,8 @@ impl ShardActor {
             last_log_index: self.last_log_index(),
             snapshot_index: self.snapshot_index,
             retained_log_entries: self.log.len(),
+            storage_healthy: self.storage_fault.is_none(),
+            storage_error: self.storage_fault.clone(),
             healthy_replicas,
             has_quorum,
             replication,
@@ -2490,6 +2799,12 @@ pub struct ShardStatus {
     pub snapshot_index: u64,
     /// Log suffix still retained after compaction.
     pub retained_log_entries: usize,
+    /// False after a durable write failure. The shard then refuses votes,
+    /// replication acknowledgements, linearizable reads, and proposals until a
+    /// restart successfully reopens and validates its store.
+    pub storage_healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<String>,
     /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
     pub healthy_replicas: usize,
     /// Whether a majority of the group is caught up — i.e. the shard can survive
@@ -2629,6 +2944,7 @@ fn leader_location(leader: &str, uri: &Uri) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persist::PersistOp;
     use axum::body::to_bytes;
 
     // --- response-shaping unit test (no cluster) --------------------------
@@ -3466,6 +3782,298 @@ mod tests {
             None,
             Recovered::default(),
         )
+    }
+
+    fn durable_actor(peers: Vec<String>) -> ShardActor {
+        static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fiducia-consensus-fault-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let (store, recovered) = ShardStore::open(&root, 0).unwrap();
+        let reg = LoopbackRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        ShardActor::new(
+            0,
+            "a".to_string(),
+            peers,
+            Arc::new(Transport::loopback(reg)),
+            tx,
+            RaftTiming::default(),
+            Some(store),
+            recovered,
+        )
+    }
+
+    #[test]
+    fn vote_is_refused_and_shard_faults_when_vote_cannot_be_persisted() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Meta);
+
+        let response = actor.handle_request_vote(RequestVoteReq {
+            term: actor.current_term,
+            candidate_id: "b".to_string(),
+            last_log_index: 0,
+            last_log_term: 0,
+            pre_vote: false,
+        });
+
+        assert!(
+            !response.granted,
+            "an unpersisted vote must never be granted"
+        );
+        assert!(actor.storage_fault.is_some());
+        assert_eq!(actor.role, Role::Follower);
+        assert!(!actor.status().storage_healthy);
+    }
+
+    #[test]
+    fn append_is_not_acknowledged_when_log_fsync_fails() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Append);
+
+        let response = actor.handle_append_entries(AppendEntriesReq {
+            term: actor.current_term,
+            leader_id: "b".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: actor.current_term,
+                index: 1,
+                proposed_at_ms: 1_000,
+                command: Some(put("unsafe", "value")),
+            }],
+            leader_commit: 1,
+        });
+
+        assert!(!response.success);
+        assert_eq!(actor.commit_index, 0);
+        assert_eq!(actor.last_applied, 0);
+        assert!(actor.state.kv_get("unsafe").is_none());
+        assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn conflicting_append_is_not_acknowledged_when_log_rewrite_fails() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        actor.log.push(LogEntry {
+            term: actor.current_term,
+            index: 1,
+            proposed_at_ms: 1_000,
+            command: Some(put("old", "value")),
+        });
+        let log = actor.log.clone();
+        actor.store.as_mut().unwrap().append_tail(&log).unwrap();
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Rewrite);
+
+        let response = actor.handle_append_entries(AppendEntriesReq {
+            term: actor.current_term + 1,
+            leader_id: "b".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: actor.current_term + 1,
+                index: 1,
+                proposed_at_ms: 2_000,
+                command: Some(put("new", "value")),
+            }],
+            leader_commit: 0,
+        });
+
+        assert!(!response.success);
+        assert_eq!(actor.commit_index, 0);
+        assert_eq!(actor.last_applied, 0);
+        assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn append_cannot_overwrite_an_already_committed_entry() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        actor.log.push(LogEntry {
+            term: actor.current_term,
+            index: 1,
+            proposed_at_ms: 1_000,
+            command: Some(put("protected", "old")),
+        });
+        let log = actor.log.clone();
+        actor.store.as_mut().unwrap().append_tail(&log).unwrap();
+        actor
+            .store
+            .as_ref()
+            .unwrap()
+            .save_meta(actor.current_term, None, 1)
+            .unwrap();
+        actor.commit_index = 1;
+        actor.apply_committed();
+
+        let response = actor.handle_append_entries(AppendEntriesReq {
+            term: actor.current_term + 1,
+            leader_id: "b".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: actor.current_term + 1,
+                index: 1,
+                proposed_at_ms: 2_000,
+                command: Some(put("protected", "new")),
+            }],
+            leader_commit: 1,
+        });
+
+        assert!(!response.success);
+        assert_eq!(actor.log[0].term, 1);
+        assert_eq!(actor.state.kv_get("protected").unwrap().value, "old");
+        assert!(actor.storage_fault.is_none());
+    }
+
+    #[test]
+    fn malformed_gapped_append_is_rejected_without_mutating_the_log() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        let response = actor.handle_append_entries(AppendEntriesReq {
+            term: actor.current_term,
+            leader_id: "b".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: actor.current_term,
+                index: 2,
+                proposed_at_ms: 1_000,
+                command: Some(put("gap", "value")),
+            }],
+            leader_commit: 0,
+        });
+
+        assert!(!response.success);
+        assert!(actor.log.is_empty());
+        assert!(actor.storage_fault.is_none());
+    }
+
+    #[test]
+    fn follower_commit_is_not_applied_when_commit_meta_fsync_fails() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        actor.log.push(LogEntry {
+            term: actor.current_term,
+            index: 1,
+            proposed_at_ms: 1_000,
+            command: Some(put("committed", "must-not-apply")),
+        });
+        let log = actor.log.clone();
+        actor.store.as_mut().unwrap().append_tail(&log).unwrap();
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Meta);
+
+        let response = actor.handle_append_entries(AppendEntriesReq {
+            term: actor.current_term,
+            leader_id: "b".to_string(),
+            prev_log_index: 1,
+            prev_log_term: actor.current_term,
+            entries: vec![],
+            leader_commit: 1,
+        });
+
+        assert!(!response.success);
+        assert_eq!(actor.commit_index, 0);
+        assert_eq!(actor.last_applied, 0);
+        assert!(actor.state.kv_get("committed").is_none());
+        assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn proposal_is_unavailable_when_its_log_append_cannot_be_persisted() {
+        let mut actor = durable_actor(Vec::new());
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Append);
+        let (response, mut received) = oneshot::channel();
+
+        actor.on_propose(put("proposal", "unsafe"), response);
+
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Err(ProposeError::Unavailable { .. })
+        ));
+        assert_eq!(actor.commit_index, 0);
+        assert_eq!(actor.last_applied, 0);
+        assert!(actor.state.kv_get("proposal").is_none());
+        assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn proposal_is_not_applied_or_acknowledged_before_commit_meta_is_durable() {
+        let mut actor = durable_actor(Vec::new());
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Meta);
+        let (response, mut received) = oneshot::channel();
+
+        actor.on_propose(put("proposal", "must-not-apply"), response);
+
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Err(ProposeError::Unavailable { .. })
+        ));
+        assert_eq!(
+            actor.log.len(),
+            1,
+            "the uncommitted durable entry is retained"
+        );
+        assert_eq!(actor.commit_index, 0);
+        assert_eq!(actor.last_applied, 0);
+        assert!(actor.state.kv_get("proposal").is_none());
+        assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn installed_snapshot_is_not_acknowledged_when_snapshot_fsync_fails() {
+        let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Snapshot);
+        let state = StateMachine::new();
+
+        let response = actor.handle_install_snapshot(InstallSnapshotReq {
+            term: actor.current_term,
+            leader_id: "b".to_string(),
+            last_included_index: 5,
+            last_included_term: actor.current_term,
+            state: state.snapshot().unwrap(),
+        });
+
+        assert!(!response.success);
+        assert_eq!(actor.snapshot_index, 0);
+        assert_eq!(actor.commit_index, 0);
+        assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn proposal_success_waits_for_required_compaction_snapshot_persistence() {
+        let mut actor = durable_actor(Vec::new());
+        actor.log = (1..=1024)
+            .map(|index| LogEntry {
+                term: actor.current_term,
+                index,
+                proposed_at_ms: 1_000 + index,
+                command: (index == 1024).then(|| put("snapshot-boundary", "value")),
+            })
+            .collect();
+        actor.commit_index = 1024;
+        actor.last_applied = 1023;
+        let (response, mut received) = oneshot::channel();
+        actor.pending.insert(
+            1024,
+            PendingProposal {
+                started_at: Instant::now(),
+                resp: response,
+            },
+        );
+        actor.store.as_ref().unwrap().fail_next(PersistOp::Snapshot);
+
+        actor.apply_committed();
+
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Err(ProposeError::Unavailable { .. })
+        ));
+        assert_eq!(actor.last_applied, 1024);
+        assert!(actor.storage_fault.is_some());
     }
 
     /// A 3-member actor forced into the leader role with empty replication state,

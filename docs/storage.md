@@ -25,34 +25,22 @@ public contract follows the production path:
 Reads come from leader-applied state. Followers return a `not_leader` response
 with the leader address so the load balancer can reroute.
 
-## Production Engine
+## Durable Engine
 
-Use an embedded RocksDB database on every `fiducia-node` process.
+The current engine uses a small fsync-backed store per shard under
+`FIDUCIA_DATA_DIR` (default `/var/lib/fiducia`):
 
-Default path:
+| File | Contents and update rule |
+|------|--------------------------|
+| `meta` | Current term, vote, and commit index. Written to a temporary file, fsynced, atomically renamed, then followed by a directory fsync. |
+| `log` | Newline-delimited `LogEntry` records. Pure tails are appended and fsynced; conflict replacement uses an atomic full rewrite. |
+| `snapshot` | State-machine image plus last included index/term. Atomically replaced and fsynced before the compacted log prefix is removed. |
 
-```text
-FIDUCIA_NODE_DATA_DIR=/var/lib/fiducia-node
-```
-
-RocksDB is the right default for this layer because Fiducia needs low-latency
-append-heavy Raft logs, prefix scans, compaction, snapshots, and a mature crash
-recovery story. The database is local to one node. The distributed source of
-truth remains Raft quorum, not the local database by itself.
-
-Recommended column-family layout:
-
-| Column family | Contents |
-|---------------|----------|
-| `raft_log` | Per-shard log entries keyed by `{shard_id, index}`. |
-| `raft_meta` | Per-shard hard state, conf state, current term, vote, commit index, and applied index. |
-| `state_kv` | Applied config KV entries keyed by `{shard_id, key}` with revision and optional expiry. |
-| `state_locks` | Applied mutex, semaphore, multi-key lock, election lease state, and fencing-token counters. |
-| `state_limits` | Applied rate-limit buckets/windows keyed by `{shard_id, tenant, key}`. |
-| `state_schedules` | Schedule definitions, run history, retry state, and exactly-once fire IDs. |
-| `state_services` | Service-discovery registrations and heartbeat leases. |
-| `watch_index` | Recent committed revisions and key/prefix fanout cursors for SSE/WebSocket watches. |
-| `snapshots` | Compact point-in-time shard snapshots used for replay and learner catch-up. |
+The applied state machine remains in memory and is deterministically rebuilt
+from snapshot plus committed log suffix. The local files make one replica
+crash-safe; the Raft quorum remains the distributed source of truth. A future
+embedded-engine migration may change the physical layout, but must preserve the
+ordering and recovery invariants below.
 
 ## Write Path
 
@@ -60,13 +48,17 @@ For each committed mutation:
 
 1. Persist the Raft log entry before it can be considered durable.
 2. Advance `commit_index` once a majority has stored the entry.
-3. Apply the command exactly once to the shard state machine.
-4. Persist the resulting applied-state update and `applied_index`.
-5. Emit watch events after the applied index advances.
+3. Persist that replica's new `commit_index` before applying it locally.
+4. Apply the command exactly once to the shard state machine.
+5. Emit watch events and resolve the client waiter after the applied index
+   advances.
 
 The response can be acknowledged only after the command is durably committed by
-a quorum. The local RocksDB write makes one replica crash-safe; the Raft quorum
-makes the operation fleet-safe.
+a quorum and the local commit pointer is durable. If any term/vote/log/meta or
+required snapshot write fails, that shard permanently enters a fail-closed state
+for the lifetime of the process: it steps down, rejects votes and Raft success
+acknowledgements, fails proposals as unavailable, and serves no linearizable
+reads. `/readyz` then returns 503 and the fault is visible in shard status.
 
 Lock writes include single-key mutexes, capped semaphores, and bounded
 multi-key union locks. A multi-key grant stores the same `lock_id` under every
@@ -76,10 +68,23 @@ partial release window.
 
 ## Recovery
 
-On restart, a node opens RocksDB, loads `raft_meta`, restores the newest
-snapshot for each hosted shard, and replays log entries after the snapshot's
-last included index. Expired TTL data may be discarded during replay, but only
-according to the committed timestamps in the log/snapshot.
+On restart, a node opens each shard directory, restores the newest snapshot,
+and replays the contiguous log suffix through the durable commit index. Expired
+TTL data may be discarded during replay, but only according to the committed
+timestamps in the log/snapshot.
+
+Recovery is intentionally fail-closed. It rejects malformed complete records,
+blank records, duplicate or gapped indices, invalid zero index/term values,
+missing hard-state metadata beside non-empty durable data, snapshot/log terms
+ahead of the persisted current term, snapshot/log term disagreement, and a
+`commit_index` beyond the durable tail. Those conditions require operator
+repair or restoration; silently shortening the log would discard an entry
+already recorded as committed. The sole
+repairable append artifact is a malformed final record without a terminating
+newline, which proves the append was torn before it could be acknowledged; that
+fragment is discarded and the validated log is canonicalized. A durable
+snapshot may raise an older meta commit pointer to its included index after a
+crash between the two atomic renames, but recovery never lowers a commit index.
 
 ## Compaction And Retention
 
