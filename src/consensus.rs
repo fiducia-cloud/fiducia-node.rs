@@ -462,7 +462,11 @@ impl ReadRequest {
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
-            ReadRequest::Service { service } => service,
+            // Service discovery lives on the single SERVICE_DOMAIN shard — writes
+            // route every register/heartbeat/deregister there (see Command::routing_key).
+            // A per-service read must hit that same shard, NOT shard_for(service_name),
+            // or it reads a different (empty) shard than the one holding the instances.
+            ReadRequest::Service { .. } => crate::state::SERVICE_DOMAIN,
             // Lock/semaphore inventory shares the single lock-coordinator shard.
             ReadRequest::LockInventory | ReadRequest::SemaphoreInventory => {
                 crate::state::LOCK_DOMAIN
