@@ -1174,6 +1174,12 @@ impl ShardActor {
             return;
         }
         let next = *ls.next_index.get(peer).unwrap_or(&1);
+        // The peer needs an entry we have already compacted away → ship the
+        // state-machine snapshot instead of log entries it can no longer get.
+        if next <= self.snapshot_base_index {
+            self.send_snapshot_to(peer);
+            return;
+        }
         ls.in_flight.insert(peer.to_string(), true);
 
         let prev_log_index = next - 1;
@@ -1181,7 +1187,7 @@ impl ShardActor {
         let entries: Vec<LogEntry> = self
             .log
             .iter()
-            .skip(prev_log_index as usize)
+            .skip((prev_log_index - self.snapshot_base_index) as usize)
             .cloned()
             .collect();
         let up_to = self.last_log_index();
