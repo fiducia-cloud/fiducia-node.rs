@@ -1,7 +1,8 @@
 //! Inbound peer Raft RPC endpoints (the server side of [`crate::transport`]).
 //!
-//! A leader/candidate on another node posts `AppendEntries` / `RequestVote` here
-//! for a specific shard; we demux to that shard's actor and return its reply.
+//! A leader/candidate on another node posts `AppendEntries` / `RequestVote` /
+//! `InstallSnapshot` here for a specific shard; we demux to that shard's actor
+//! and return its reply.
 //! These are **internal** (node↔node) and mounted at the top level (`/raft/…`),
 //! not under `/v1`, so they're distinct from the client coordination API.
 
