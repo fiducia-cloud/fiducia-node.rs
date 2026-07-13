@@ -1606,7 +1606,7 @@ pub struct ClaimState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaimRecord {
     subject: String,
     predicate: String,
