@@ -744,9 +744,21 @@ impl ShardActor {
             metrics: ShardMetrics::default(),
         };
         actor.reset_election_deadline();
-        // Rebuild the in-memory state machine from the recovered log up to the
-        // committed point (the state machine itself is not persisted).
-        if actor.commit_index > 0 {
+        // Rebuild the in-memory state machine: restore the snapshot (the applied
+        // state at the compaction base), then replay the remaining recovered log
+        // up to the committed point. Replay applies each entry at its **stamped**
+        // time, so leases that expired before the restart stay expired.
+        if let Some(state) = snapshot_state {
+            if let Err(e) = actor.state.restore(state) {
+                // Fail closed, matching the bootstrap contract: silently starting
+                // from an empty state machine would resurrect released locks.
+                panic!(
+                    "fiducia-node: shard {shard_id} snapshot is unusable \
+                     (cannot restore state machine): {e}"
+                );
+            }
+        }
+        if actor.commit_index > actor.last_applied {
             actor.apply_committed();
         }
         actor
