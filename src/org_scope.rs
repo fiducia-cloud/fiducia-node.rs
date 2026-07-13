@@ -62,14 +62,10 @@ impl OrgScope {
     /// Recover the caller-facing key from a namespaced one, if it belongs to this
     /// org (used to un-prefix keys in list/prefix responses). `None` for keys
     /// outside this org's space — which is also the isolation filter for list reads.
+    /// `scope("")` yields this org's list-prefix, so a prefix scan is just
+    /// `scope(&caller_prefix)`.
     pub fn unscope<'a>(&self, scoped: &'a str) -> Option<&'a str> {
         scoped.strip_prefix(&format!("{DELIM}{}{DELIM}", self.0))
-    }
-
-    /// The list-prefix for this org (used to scope a `KvList`/prefix scan to only
-    /// this org's keys).
-    pub fn prefix(&self) -> String {
-        format!("{DELIM}{}{DELIM}", self.0)
     }
 }
 
