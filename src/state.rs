@@ -1080,7 +1080,7 @@ impl TaskRecord {
 /// The lifecycle of an approval-escrow effect. Preparing, authorizing, and
 /// executing a dangerous action are separated so a risky side effect cannot be
 /// performed until it is approved, and is committed at most once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectStatus {
     Prepared,
