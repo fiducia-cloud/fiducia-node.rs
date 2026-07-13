@@ -2094,6 +2094,7 @@ impl ShardActor {
             commit_index: self.commit_index,
             last_applied: self.last_applied,
             last_log_index: self.last_log_index(),
+            snapshot_base_index: self.snapshot_base_index,
             healthy_replicas,
             has_quorum,
             replication,
