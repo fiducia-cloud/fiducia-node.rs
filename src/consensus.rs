@@ -698,9 +698,10 @@ impl ShardActor {
         // The persisted commit pointer can never be below the snapshot base
         // (compaction only folds applied ≤ committed entries), but clamp both
         // ways so corrupt meta can't point outside the recovered log.
-        let recovered_commit = recovered
-            .commit_index
-            .clamp(snapshot_base_index, snapshot_base_index + recovered.log.len() as u64);
+        let recovered_commit = recovered.commit_index.clamp(
+            snapshot_base_index,
+            snapshot_base_index + recovered.log.len() as u64,
+        );
         let last_entry_ts = recovered.log.iter().map(|e| e.ts_ms).max().unwrap_or(0);
         let snapshot_state = recovered.snapshot.map(|s| s.state);
         let mut actor = ShardActor {
@@ -2339,7 +2340,9 @@ impl Node {
     ) -> Option<InstallSnapshotResp> {
         let tx = self.sender(shard)?;
         let (resp, rx) = oneshot::channel();
-        tx.send(ShardMsg::InstallSnapshot { req, resp }).await.ok()?;
+        tx.send(ShardMsg::InstallSnapshot { req, resp })
+            .await
+            .ok()?;
         rx.await.ok()
     }
 

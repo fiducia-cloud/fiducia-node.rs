@@ -296,25 +296,20 @@ database: the **replicated log + the deterministic state machine** are the store
   the log (tail via `AppendEntries`, or a snapshot + tail once the leader has
   compacted).
 
-Today the per-shard log and state machine are **in-memory** (durability comes
-from replication across nodes). That is not enough for production Kubernetes
-unless every Raft member has stable persistent storage: losing a pod's ephemeral
-disk can silently erase one of the durable copies. The seam to add on-disk
-durability is narrow and deliberate:
+The standard Raft durability stack (WAL → snapshot → compaction) is implemented:
 
-| Piece | Status | On-disk path |
-|-------|--------|--------------|
-| Raft log + `commit_index`/`voted_for` | in-memory `Vec<LogEntry>` per shard | append-only WAL with periodic `fsync` (one shared engine batches fsync across shards) |
-| State machine | in-memory maps | rebuilt from the log; bounded by **snapshots** |
-| Log growth | unbounded | **snapshot + compaction**: persist a state-machine snapshot, truncate the log before it |
+| Piece | Status |
+|-------|--------|
+| Raft log + `commit_index`/`voted_for` | crash-safe on-disk per shard (`persist.rs`): fsync'd append-only log + atomic `meta`, under `FIDUCIA_DATA_DIR` |
+| State machine | in-memory, rebuilt at boot from **snapshot + log-tail replay**; every entry replays at its proposer-stamped `ts_ms`, so lease expiry is deterministic (an expired lease can't resurrect on restart) |
+| Log growth | bounded by **snapshot + compaction** (`FIDUCIA_RAFT_COMPACT_THRESHOLD`, default 1024 live entries): the applied prefix is folded into an atomic `snapshot` file and truncated; a follower behind the compacted base is caught up via `InstallSnapshot` |
 
-This is the standard Raft durability stack (WAL → snapshot → compaction); none of
-it changes the API or the state-machine semantics above. A single embedded engine
-plugs in behind that seam — see [`docs/storage.md`](docs/storage.md) for the
-concrete design: embedded RocksDB under `FIDUCIA_NODE_DATA_DIR`, with column
-families for the Raft log/meta, applied coordination state, watch indexes, and
-snapshots. (Postgres/Supabase stay the *business*/control-plane database — orgs,
-projects, users, API keys, audit, billing — never the coordination store.)
+None of it changes the API or the state-machine semantics above. A single
+embedded engine can still plug in behind that seam — see
+[`docs/storage.md`](docs/storage.md) for the RocksDB design (column families for
+the Raft log/meta, applied coordination state, watch indexes, and snapshots).
+(Postgres/Supabase stay the *business*/control-plane database — orgs, projects,
+users, API keys, audit, billing — never the coordination store.)
 
 ## Layout
 
