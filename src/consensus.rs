@@ -68,8 +68,8 @@ use crate::state::{
     ServiceSummary, StateMachine, TaskState,
 };
 use crate::transport::{
-    AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
-    Transport,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LoopbackRegistry,
+    RequestVoteReq, RequestVoteResp, Transport,
 };
 
 /// Identifier of a shard (one independent Raft group). Re-exported from the
