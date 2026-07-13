@@ -978,7 +978,7 @@ struct ScheduleRecord {
 }
 
 /// One registered service instance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceInstance {
     pub instance_id: String,
     pub address: String,
