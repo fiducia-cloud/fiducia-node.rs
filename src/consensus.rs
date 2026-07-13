@@ -1785,6 +1785,40 @@ impl ShardActor {
                 }));
             }
         }
+        self.maybe_compact();
+    }
+
+    // --- log compaction -----------------------------------------------------
+
+    /// Once the live log passes the compaction threshold, fold the applied
+    /// prefix into a state-machine snapshot and truncate it from the log. This
+    /// is what bounds a shard's storage and boot-replay time; without it every
+    /// lease renew and idempotency body lives in the log forever. A follower
+    /// whose `next_index` later falls below the new base is caught up via
+    /// [`Self::send_snapshot_to`].
+    fn maybe_compact(&mut self) {
+        if self.compact_threshold == 0 || self.log.len() < self.compact_threshold {
+            return;
+        }
+        let applied_live = (self.last_applied - self.snapshot_base_index) as usize;
+        if applied_live == 0 {
+            return; // nothing applied beyond the current base yet
+        }
+        self.snapshot_base_term = self.term_at(self.last_applied);
+        self.snapshot_base_index = self.last_applied;
+        self.log.drain(..applied_live);
+        // Durable order: snapshot first, then the truncated log. A crash between
+        // the two leaves a log whose prefix duplicates the snapshot; recovery
+        // drops entries at or below the snapshot index.
+        self.persist_snapshot();
+        self.persist_log_rewrite();
+        tracing::info!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            snapshot_base_index = self.snapshot_base_index,
+            live_entries = self.log.len(),
+            "raft: compacted log into state-machine snapshot"
+        );
     }
 
     fn publish_change(&self, command: &Command, output: &serde_json::Value, revision: u64) {
