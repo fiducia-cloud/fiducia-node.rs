@@ -17,6 +17,18 @@
 //!
 //! Read-only node introspection (`/v1/status`, `/v1/observe/*`) is *not* tenant
 //! data and is exempt.
+//!
+//! ## Status — enforcement live, per-primitive isolation in progress
+//!
+//! [`require_org`] is wired on `/v1`, so **no coordination request without a
+//! valid org is accepted**. Full data isolation additionally requires every
+//! primitive handler to route its key through [`OrgScope::scope`] (and
+//! [`OrgScope::unscope`] on list/watch responses), plus scoping the inventory
+//! reads (`LockInventory`, `ServiceList`, `KvList`, …) that today fan out across
+//! all orgs. That wiring is being rolled out primitive-by-primitive; until a
+//! given primitive calls `scope`, it is gated (org required) but not yet
+//! namespaced. Do **not** treat the plane as fully isolated until every
+//! primitive is scoped and covered by a cross-org test.
 
 use axum::{
     extract::{FromRequestParts, Request},
