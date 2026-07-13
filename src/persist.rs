@@ -72,11 +72,13 @@ pub struct Recovered {
     pub log: Vec<LogEntry>,
 }
 
-/// A shard's durable store: the `meta` file plus an append handle to `log`.
+/// A shard's durable store: the `meta` + `snapshot` files plus an append handle
+/// to `log`.
 pub struct ShardStore {
     dir: PathBuf,
     log_path: PathBuf,
     meta_path: PathBuf,
+    snapshot_path: PathBuf,
     log_file: File,
     /// Number of log entries known to be on disk (so appends write only the tail).
     durable_len: usize,
