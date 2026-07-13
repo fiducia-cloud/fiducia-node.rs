@@ -2049,10 +2049,17 @@ impl StateMachine {
         self.store.lock().unwrap().revision
     }
 
+    // Reads are **pure**: they filter expired state at view time (local wall
+    // clock) but never mutate the store. Actual removal — and, crucially, waiter
+    // promotion, which mints fencing tokens — happens only in `apply_at`'s
+    // `expire_due`, driven by the replicated, leader-stamped entry time. A read
+    // that mutated off the local clock would make replica state depend on who
+    // got queried when, which no log replay could ever reproduce.
+
     pub fn kv_get(&self, key: &str) -> Option<KvEntry> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.kv.get(key).cloned()
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
+        store.kv.get(key).filter(|e| kv_live(e, now)).cloned()
     }
 
     /// Read a counter's current value and revision. Counters do not expire.
