@@ -680,6 +680,7 @@ impl ShardActor {
         transport: Arc<Transport>,
         self_tx: mpsc::Sender<ShardMsg>,
         timing: RaftTiming,
+        compact_threshold: usize,
         store: Option<ShardStore>,
         recovered: Recovered,
     ) -> Self {
@@ -689,7 +690,19 @@ impl ShardActor {
         // Seed from disk when we have it. A fresh shard recovers `term == 0`; this
         // engine numbers terms from 1, so keep the floor at 1 for a clean start.
         let current_term = recovered.current_term.max(1);
-        let recovered_commit = recovered.commit_index.min(recovered.log.len() as u64);
+        let (snapshot_base_index, snapshot_base_term) = recovered
+            .snapshot
+            .as_ref()
+            .map(|s| (s.last_included_index, s.last_included_term))
+            .unwrap_or((0, 0));
+        // The persisted commit pointer can never be below the snapshot base
+        // (compaction only folds applied ≤ committed entries), but clamp both
+        // ways so corrupt meta can't point outside the recovered log.
+        let recovered_commit = recovered
+            .commit_index
+            .clamp(snapshot_base_index, snapshot_base_index + recovered.log.len() as u64);
+        let last_entry_ts = recovered.log.iter().map(|e| e.ts_ms).max().unwrap_or(0);
+        let snapshot_state = recovered.snapshot.map(|s| s.state);
         let mut actor = ShardActor {
             shard_id,
             node_id: node_id.clone(),
