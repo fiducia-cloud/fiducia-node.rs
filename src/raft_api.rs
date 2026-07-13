@@ -49,3 +49,16 @@ async fn vote(
         None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
+
+/// `POST /raft/{shard}/snapshot` — install the leader's state-machine snapshot
+/// (this replica fell behind the leader's compacted log base).
+async fn snapshot(
+    State(node): State<Arc<Node>>,
+    Path(shard): Path<ShardId>,
+    Json(req): Json<InstallSnapshotReq>,
+) -> Response {
+    match node.install_snapshot(shard, req).await {
+        Some(resp) => Json(resp).into_response(),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
