@@ -1442,7 +1442,7 @@ pub struct BudgetState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReservationRecord {
     holder: String,
     reserved: BudgetAmount,
