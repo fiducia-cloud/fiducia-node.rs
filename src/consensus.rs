@@ -2331,6 +2331,18 @@ impl Node {
         rx.await.ok()
     }
 
+    /// Deliver an inbound `InstallSnapshot` to the owning shard actor.
+    pub async fn install_snapshot(
+        &self,
+        shard: ShardId,
+        req: InstallSnapshotReq,
+    ) -> Option<InstallSnapshotResp> {
+        let tx = self.sender(shard)?;
+        let (resp, rx) = oneshot::channel();
+        tx.send(ShardMsg::InstallSnapshot { req, resp }).await.ok()?;
+        rx.await.ok()
+    }
+
     /// Subscribe to the change stream of the shard owning `key` (for a watch).
     /// Works for any primitive routed by name: a KV key, an election name, or a
     /// service name all hash to one shard, and the caller filters by scope+key.
