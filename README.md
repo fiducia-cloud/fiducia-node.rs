@@ -270,11 +270,12 @@ committed write, and p99s jump when that normally-fast follower has jitter.
 Tune Raft timing from measured inter-cloud RTT:
 
 ```bash
-FIDUCIA_RAFT_RTT_MS=95              # optional helper: election >= 10x RTT
+FIDUCIA_RAFT_TICK_MS=20
 FIDUCIA_RAFT_HEARTBEAT_MS=100
 FIDUCIA_RAFT_ELECTION_MIN_MS=1000
 FIDUCIA_RAFT_ELECTION_JITTER_MS=500
-FIDUCIA_RAFT_COMMIT_WAIT_MS=10000
+FIDUCIA_RAFT_PREVOTE=true
+FIDUCIA_RAFT_CHECK_QUORUM=true
 FIDUCIA_RAFT_SNAPSHOT_THRESHOLD=1024 # committed entries between snapshots; 0 disables
 ```
 
@@ -337,6 +338,16 @@ cargo run          # listens on :8090 (override PORT)
 #   FIDUCIA_NODE_ID=node-a:8090 FIDUCIA_PEERS=node-b:8090,node-c:8090 cargo run
 curl localhost:8090/v1/status        # per-shard role / term / commit index
 ```
+
+For audited non-secret flags, use the pinned launcher:
+
+```bash
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh --port=8090 --node-id=node-a:9090 --shard-count=16 -- cargo run --locked
+```
+
+The internal authentication secret and its local-development escape hatch remain
+environment-only.
 
 ## Related
 
