@@ -870,22 +870,48 @@ impl ShardActor {
     // --- elections --------------------------------------------------------
 
     fn last_log_index(&self) -> u64 {
-        self.log.len() as u64
+        self.snapshot_base_index + self.log.len() as u64
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.snapshot_base_term)
     }
 
-    fn term_at(&self, index: u64) -> u64 {
-        if index == 0 {
-            0
-        } else {
-            self.log
-                .get((index - 1) as usize)
-                .map(|e| e.term)
-                .unwrap_or(0)
+    /// Slab position of 1-based log `index` within the live (post-snapshot) log,
+    /// or `None` if it is compacted away or beyond the tail.
+    fn log_pos(&self, index: u64) -> Option<usize> {
+        if index <= self.snapshot_base_index {
+            return None;
         }
+        let pos = (index - self.snapshot_base_index - 1) as usize;
+        (pos < self.log.len()).then_some(pos)
+    }
+
+    /// Term of the entry at 1-based `index`: the snapshot's term at the
+    /// compaction boundary, the entry's term within the live log, and `0` for
+    /// index 0, a compacted index, or one beyond the tail. Callers must treat
+    /// indices **below** the base as always-consistent committed prefix (they
+    /// are identical on every member by the snapshot's construction) rather
+    /// than reading a term here.
+    fn term_at(&self, index: u64) -> u64 {
+        if index == self.snapshot_base_index {
+            self.snapshot_base_term
+        } else {
+            self.log_pos(index).map(|p| self.log[p].term).unwrap_or(0)
+        }
+    }
+
+    /// Wall-clock stamp for the next entry this leader appends, forced to be
+    /// monotonically non-decreasing along the shard's log so apply time can
+    /// never run backwards (even across a leader change to a slow clock, since
+    /// election guarantees the new leader has the old entries — and their stamps).
+    fn stamp_next_entry(&mut self) -> u64 {
+        let ts = crate::state::now_ms().max(self.last_entry_ts);
+        self.last_entry_ts = ts;
+        ts
     }
 
     fn majority(&self) -> usize {
