@@ -971,7 +971,7 @@ pub struct ScheduleRun {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScheduleRecord {
     definition: Schedule,
     history: Vec<ScheduleRun>,
