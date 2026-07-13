@@ -99,6 +99,7 @@ async fn get_or_list(
 /// `PUT /v1/kv?key=K` — upsert (optionally compare-and-swap). Value in the body.
 async fn put_key(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KvParams>,
     Json(body): Json<PutBody>,
@@ -108,7 +109,7 @@ async fn put_key(
     };
     let result = node
         .propose(Command::KvPut {
-            key,
+            key: org.scope(&key),
             value: body.value,
             ttl_ms: body.ttl_ms,
             prev_revision: body.prev_revision,
@@ -120,23 +121,33 @@ async fn put_key(
 /// `DELETE /v1/kv?key=K` — remove a key.
 async fn delete_key(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KvParams>,
 ) -> Response {
     let Some(key) = q.key else {
         return bad_request("missing `key`");
     };
-    let result = node.propose(Command::KvDelete { key }).await;
+    let result = node.propose(Command::KvDelete { key: org.scope(&key) }).await;
     propose_response(result, &uri)
 }
 
-/// `GET /v1/kv?prefix=...` — list live keys under a prefix.
-///
-/// A prefix can span shards, so this fans the range read out across every shard
-/// (a serializable per-shard read each) and merges the results, sorted by key.
-/// An empty prefix lists the whole keyspace.
-async fn list(node: Arc<Node>, prefix: String) -> Response {
-    let keys = node.list_kv(&prefix).await;
+/// `GET /v1/kv?prefix=...` — list live keys under a prefix, scoped to the caller's
+/// org. The caller's prefix is namespaced, and every returned key is un-namespaced
+/// back to the caller-facing form; keys outside the org's space are filtered out
+/// (they never share the prefix), which is what makes the list read tenant-safe.
+async fn list(node: Arc<Node>, org: OrgScope, prefix: String) -> Response {
+    let scoped_prefix = org.scope(&prefix);
+    let keys: Vec<_> = node
+        .list_kv(&scoped_prefix)
+        .await
+        .into_iter()
+        .filter_map(|mut item| {
+            let unscoped = org.unscope(&item.key)?.to_string();
+            item.key = unscoped;
+            Some(item)
+        })
+        .collect();
     Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response()
 }
 
