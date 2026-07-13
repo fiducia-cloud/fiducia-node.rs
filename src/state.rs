@@ -829,7 +829,7 @@ struct SemaphoreSlot {
     lease_expires_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueuedPermit {
     holder: String,
     ttl_ms: u64,
