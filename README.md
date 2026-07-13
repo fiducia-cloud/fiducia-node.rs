@@ -460,6 +460,27 @@ vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 the CLI schema. Configure them only through the environment or deployment
 configuration so neither can be enabled or exposed casually through argv.
 
+## Reproducible build inputs
+
+The source build is intentionally closed over immutable inputs:
+
+- Rust is pinned to 1.95.0 in `rust-toolchain.toml`, CI, and the container
+  builder; Cargo build, clippy, and test commands use the committed lockfile.
+- CI and Docker resolve `fiducia-interfaces` at
+  `bbd8b52ce729ec34b0a9bff4dda6d0a448181797` and `fiducia-routing.rs` at
+  `f0c86c2736b61cf3af7fa298a092fa435069cd64`. The image build verifies each
+  fetched checkout before compiling instead of following either repository's
+  moving `main` branch.
+- GitHub Actions use full commit SHAs. CI installs cargo-audit 0.21.2 from its
+  locked dependency graph, while Dependabot covers Cargo, Actions, and Docker
+  inputs so upgrades arrive as reviewable changes.
+- The final image contains only the release binary and runs as distroless uid
+  and gid 65532. The image exposes the client and Raft peer ports, but production
+  still must provide a writable `FIDUCIA_DATA_DIR` and the internal secret.
+
+For a local release-equivalent check, use `cargo build --release --locked`.
+`docker build .` additionally fetches the two pinned public sibling commits.
+
 ## Security
 
 Trust-boundary and hardening posture applied to this crate:

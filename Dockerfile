@@ -4,16 +4,24 @@
 # The crate has path dependencies on sibling Fiducia crates, so the build stage
 # clones those siblings before compiling. This keeps the local path-dependency
 # workflow intact while producing a self-contained image.
-FROM rust:1-slim-bookworm AS build
+FROM rust:1.95.0-slim-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
-ARG ROUTING_REF=main
-ARG INTERFACES_REF=main
-RUN git clone --depth 1 --branch "$ROUTING_REF" \
-    https://github.com/fiducia-cloud/fiducia-routing.rs.git fiducia-routing.rs
-RUN git clone --depth 1 --branch "$INTERFACES_REF" \
-    https://github.com/fiducia-cloud/fiducia-interfaces.git fiducia-interfaces
+ARG ROUTING_REF=f0c86c2736b61cf3af7fa298a092fa435069cd64
+ARG INTERFACES_REF=bbd8b52ce729ec34b0a9bff4dda6d0a448181797
+RUN git init fiducia-routing.rs \
+    && cd fiducia-routing.rs \
+    && git remote add origin https://github.com/fiducia-cloud/fiducia-routing.rs.git \
+    && git fetch --depth 1 origin "$ROUTING_REF" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$ROUTING_REF"
+RUN git init fiducia-interfaces \
+    && cd fiducia-interfaces \
+    && git remote add origin https://github.com/fiducia-cloud/fiducia-interfaces.git \
+    && git fetch --depth 1 origin "$INTERFACES_REF" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$INTERFACES_REF"
 COPY . fiducia-node.rs
 WORKDIR /build/fiducia-node.rs
 RUN cargo build --release --locked && strip target/release/fiducia-node

@@ -30,5 +30,7 @@ jobs:
           KUBE_CONFIG_TEST: ${{ secrets.KUBE_CONFIG_TEST }}
         run: |
           if [ -z "$KUBE_CONFIG_TEST" ]; then echo "no KUBE_CONFIG_TEST secret — skipping test deploy (validation-only)"; exit 0; fi
-          echo "$KUBE_CONFIG_TEST" | base64 -d > /tmp/kubeconfig; export KUBECONFIG=/tmp/kubeconfig
-          kubectl -n fiducia-test set image deploy/fiducia-node fiducia-node=ghcr.io/fiducia-cloud/fiducia-node:${{ github.sha }} --record || echo "deploy target not found — first-time apply is a manual step"
+          umask 077
+          printf '%s' "$KUBE_CONFIG_TEST" | base64 -d > /tmp/kubeconfig
+          export KUBECONFIG=/tmp/kubeconfig
+          kubectl -n fiducia-test set image deploy/fiducia-node fiducia-node=ghcr.io/fiducia-cloud/fiducia-node:${{ github.sha }} --record
