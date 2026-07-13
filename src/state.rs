@@ -3965,12 +3965,15 @@ impl Store {
         json!({ "deregistered": removed, "service": service, "instance_id": instance_id })
     }
 
-    fn lock_snapshot(&self, key: &str) -> LockState {
+    /// Read view of one lock member key at `now`. Pure: an expired grant is shown
+    /// as free but stays in the store until the next `apply_at` expires it.
+    fn lock_snapshot(&self, key: &str, now: u64) -> LockState {
         let grant = self
             .locks
             .held
             .get(key)
-            .and_then(|token| self.locks.grants.get(token));
+            .and_then(|token| self.locks.grants.get(token))
+            .filter(|g| g.lease_expires_ms > now);
         let wait_queue = self
             .locks
             .queue
