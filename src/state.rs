@@ -782,7 +782,7 @@ struct LockGrant {
 }
 
 /// One queued union-lock request awaiting its whole key set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueuedLock {
     holder: String,
     keys: Vec<String>,
