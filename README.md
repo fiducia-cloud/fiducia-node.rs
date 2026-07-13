@@ -467,8 +467,8 @@ The source build is intentionally closed over immutable inputs:
 - Rust is pinned to 1.95.0 in `rust-toolchain.toml`, CI, and the container
   builder; Cargo build, clippy, and test commands use the committed lockfile.
 - CI and Docker resolve `fiducia-interfaces` at
-  `5f2c5279ee19941024455b2843256872485bac82` and `fiducia-routing.rs` at
-  `1615b208d3765df1f69f0b3ec26180b263ef7aad`. The image build verifies each
+  `487e470c45ab5851e8f6f3b1dc048fe067fbf408` and `fiducia-routing.rs` at
+  `6106b4f79a5559699a64c931dbcb472f42274266`. The image build verifies each
   fetched checkout before compiling instead of following either repository's
   moving `main` branch.
 - GitHub Actions use full commit SHAs. CI installs cargo-audit 0.21.2 from its
