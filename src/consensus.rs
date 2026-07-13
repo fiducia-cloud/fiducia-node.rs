@@ -622,7 +622,20 @@ struct ShardActor {
     current_term: u64,
     voted_for: Option<String>,
     leader_id: Option<String>,
+    /// Live log entries **after** `snapshot_base_index`. Entry `i` (1-based log
+    /// position) lives at `log[i - snapshot_base_index - 1]`.
     log: Vec<LogEntry>,
+    /// Index of the last entry folded into the state-machine snapshot (0 = none
+    /// compacted yet; the log still starts at index 1).
+    snapshot_base_index: u64,
+    /// Term of the entry at `snapshot_base_index`.
+    snapshot_base_term: u64,
+    /// Live-log length that triggers a compaction (0 = disabled).
+    compact_threshold: usize,
+    /// Highest `ts_ms` ever appended to this shard's log — the monotonic floor
+    /// for stamping the next entry, so a leader clock step-back can never make
+    /// apply time run backwards.
+    last_entry_ts: u64,
     commit_index: u64,
     last_applied: u64,
     /// Durable backing for term/vote/log, or `None` for an in-memory shard.
