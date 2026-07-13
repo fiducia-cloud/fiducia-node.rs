@@ -26,6 +26,18 @@
 //! and linearizable reads gated to the leader. Client writes block until their
 //! entry commits (the `pending` waiters).
 //!
+//! **Log compaction**: once a shard's live log passes a threshold, the applied
+//! prefix is folded into a state-machine snapshot and truncated
+//! ([`ShardActor::maybe_compact`]), bounding both storage and replay time at
+//! boot. A follower that has fallen behind the compacted base is caught up with
+//! an `InstallSnapshot` RPC instead of log entries it can no longer receive.
+//!
+//! **Deterministic time**: every log entry is stamped with the proposing
+//! leader's wall clock ([`LogEntry::ts_ms`], kept monotonic per shard), and the
+//! state machine applies at that committed stamp — never the local clock — so
+//! lease expiry is identical on every replica and on every restart replay (an
+//! expired lease can not resurrect because the log was replayed later).
+//!
 //! ## Fixed-membership simplification
 //!
 //! Every node hosts every shard, so a shard's Raft group is `self + peers`
