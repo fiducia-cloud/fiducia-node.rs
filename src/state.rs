@@ -837,7 +837,7 @@ struct QueuedPermit {
 }
 
 /// A counting semaphore: up to `limit` permits, plus a FIFO queue for the rest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Semaphore {
     limit: u32,
     holders: Vec<SemaphoreSlot>,
