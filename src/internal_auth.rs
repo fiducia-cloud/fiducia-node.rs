@@ -15,8 +15,9 @@
 //! **closed** — every internal request is rejected — so a node that boots without
 //! its secret (a misconfigured prod deploy) refuses forged `x-fiducia-*` headers
 //! and forged `AppendEntries` instead of silently trusting them. Local single-node
-//! dev opts out explicitly with `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` (logged loudly
-//! once at boot). It is a coarse "are you inside the trust boundary" gate,
+//! debug build may opt out explicitly with `FIDUCIA_ALLOW_INSECURE_INTERNAL=1`
+//! (logged loudly once at boot). Release binaries compile this escape hatch out.
+//! It is a coarse "are you inside the trust boundary" gate,
 //! **not** a replacement for the LB's user-level auth; it is the cheap, deployable
 //! complement to a proper mTLS / NetworkPolicy posture (see future-work #1).
 
@@ -53,11 +54,13 @@ pub fn secret() -> Option<&'static str> {
 }
 
 /// Whether the operator has explicitly opted out of the trust boundary for local
-/// dev via `FIDUCIA_ALLOW_INSECURE_INTERNAL` (`1`/`true`). Read once. This is the
-/// *only* way an unset secret is allowed to serve internal traffic; without it,
-/// an unset secret fails closed.
+/// dev via `FIDUCIA_ALLOW_INSECURE_INTERNAL` (`1`/`true`). This state and its
+/// environment read exist only in debug builds; release builds always return
+/// false and fail closed when the secret is absent.
+#[cfg(debug_assertions)]
 static ALLOW_INSECURE: OnceLock<bool> = OnceLock::new();
 
+#[cfg(debug_assertions)]
 fn allow_insecure() -> bool {
     *ALLOW_INSECURE.get_or_init(|| {
         std::env::var("FIDUCIA_ALLOW_INSECURE_INTERNAL")
@@ -69,6 +72,11 @@ fn allow_insecure() -> bool {
     })
 }
 
+#[cfg(not(debug_assertions))]
+fn allow_insecure() -> bool {
+    false
+}
+
 /// Force-initialize the secret and log the resulting posture once at startup, so
 /// an operator can see whether the node is enforcing the trust boundary.
 pub fn init_and_log() {
@@ -78,13 +86,13 @@ pub fn init_and_log() {
         tracing::warn!(
             "internal-auth: FIDUCIA_INTERNAL_SECRET is unset and FIDUCIA_ALLOW_INSECURE_INTERNAL \
              is set — the trust boundary is DISABLED: /v1 and /raft accept traffic from ANY \
-             caller. This is for local single-node dev ONLY; NEVER set it in production."
+             caller. This is available in debug builds for local single-node dev ONLY."
         );
     } else {
         tracing::warn!(
             "internal-auth: FIDUCIA_INTERNAL_SECRET is unset — failing CLOSED: /v1 and /raft \
              will REJECT every request. Set FIDUCIA_INTERNAL_SECRET (shared with the load \
-             balancer and peer nodes) to enforce the trust boundary, or set \
+             balancer and peer nodes) to enforce the trust boundary. Debug builds may set \
              FIDUCIA_ALLOW_INSECURE_INTERNAL=1 for local single-node dev."
         );
     }
@@ -113,11 +121,11 @@ pub async fn guard(request: Request, next: Next) -> Response {
 /// be unit-tested without env/process state).
 ///
 /// * `expected = None`  → no secret configured: fail **closed** (reject) unless
-///   `allow_insecure` is set, which is the explicit local-dev opt-out.
+///   this is a debug build and `allow_insecure` is the explicit local-dev opt-out.
 /// * `expected = Some`  → `provided` must be present and constant-time-equal.
 pub fn authorized(expected: Option<&str>, provided: Option<&str>, allow_insecure: bool) -> bool {
     match expected {
-        None => allow_insecure,
+        None => cfg!(debug_assertions) && allow_insecure,
         Some(secret) => provided
             .map(|p| constant_time_eq(p.as_bytes(), secret.as_bytes()))
             .unwrap_or(false),
@@ -149,11 +157,19 @@ mod tests {
         assert!(!authorized(None, Some("whatever"), false));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn unset_secret_allows_only_with_insecure_optout() {
         // The explicit local-dev opt-out re-enables the old no-op behavior.
         assert!(authorized(None, None, true));
         assert!(authorized(None, Some("whatever"), true));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_compiles_out_insecure_optout() {
+        assert!(!authorized(None, None, true));
+        assert!(!authorized(None, Some("whatever"), true));
     }
 
     #[test]

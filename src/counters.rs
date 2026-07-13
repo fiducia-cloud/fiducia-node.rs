@@ -27,7 +27,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -60,52 +61,64 @@ pub fn router() -> Router<Arc<Node>> {
 /// `GET /v1/counters?key=K` — read the current value and revision (absent = 0).
 async fn get_counter(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KeyParam>,
 ) -> Response {
     match node
-        .query(ReadRequest::Counter { key: q.key.clone() })
+        .query(ReadRequest::Counter {
+            key: org.scope(&q.key),
+        })
         .await
     {
-        Ok(ReadResponse::Counter(entry)) => Json(json!({
+        Ok(ReadResponse::Counter(entry)) => org.response(json!({
             "key": q.key,
             "found": entry.is_some(),
             "counter": entry,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
 /// `POST /v1/counters/add` — atomically add `delta` (creating the counter at 0).
-async fn add(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<AddBody>) -> Response {
+async fn add(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<AddBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::counter(&body.key) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::CounterAdd {
-            key: body.key,
+            key: org.scope(&body.key),
             delta: body.delta,
             prev_revision: body.prev_revision,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/counters/set` — write an absolute value (e.g. reset to 0).
-async fn set(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<SetBody>) -> Response {
+async fn set(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<SetBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::counter(&body.key) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::CounterSet {
-            key: body.key,
+            key: org.scope(&body.key),
             value: body.value,
             prev_revision: body.prev_revision,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

@@ -34,7 +34,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -103,55 +104,70 @@ pub fn router() -> Router<Arc<Node>> {
         .route("/cancel", post(cancel))
 }
 
-async fn get_task(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<NameParam>) -> Response {
+async fn get_task(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Query(q): Query<NameParam>,
+) -> Response {
     match node
         .query(ReadRequest::Task {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Task(task)) => Json(json!({
+        Ok(ReadResponse::Task(task)) => org.response(json!({
             "name": q.name,
             "found": task.is_some(),
             "task": task,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
-async fn create(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<CreateBody>) -> Response {
+async fn create(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<CreateBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::task(&body.name, None) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::TaskCreate {
-            name: body.name,
+            name: org.scope(&body.name),
             task_type: body.task_type,
             payload: body.payload,
             deadline_ms: body.deadline_ms,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn claim(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ClaimBody>) -> Response {
+async fn claim(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<ClaimBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::task(&body.name, Some(&body.worker)) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::TaskClaim {
-            name: body.name,
+            name: org.scope(&body.name),
             worker: body.worker,
             ttl_ms: body.ttl_ms.unwrap_or(60_000),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn progress(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ProgressBody>,
 ) -> Response {
@@ -160,18 +176,19 @@ async fn progress(
     }
     let result = node
         .propose(Command::TaskProgress {
-            name: body.name,
+            name: org.scope(&body.name),
             worker: body.worker,
             fencing_token: body.fencing_token,
             percent: body.percent,
             checkpoint: body.checkpoint,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn complete(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<CompleteBody>,
 ) -> Response {
@@ -180,36 +197,50 @@ async fn complete(
     }
     let result = node
         .propose(Command::TaskComplete {
-            name: body.name,
+            name: org.scope(&body.name),
             worker: body.worker,
             fencing_token: body.fencing_token,
             result: body.result,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn fail(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<FailBody>) -> Response {
+async fn fail(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<FailBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::task(&body.name, Some(&body.worker)) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::TaskFail {
-            name: body.name,
+            name: org.scope(&body.name),
             worker: body.worker,
             fencing_token: body.fencing_token,
             retryable: body.retryable,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn cancel(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<CancelBody>) -> Response {
+async fn cancel(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<CancelBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::task(&body.name, None) {
         return rejection.into_response();
     }
-    let result = node.propose(Command::TaskCancel { name: body.name }).await;
-    propose_response(result, &uri)
+    let result = node
+        .propose(Command::TaskCancel {
+            name: org.scope(&body.name),
+        })
+        .await;
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

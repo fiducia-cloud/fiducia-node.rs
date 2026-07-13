@@ -228,3 +228,33 @@ mod interface_contract_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod test_support {
+    use std::sync::Arc;
+
+    use axum::{body::to_bytes, response::Response};
+
+    use crate::consensus::{Node, NodeConfig};
+    use crate::transport::{LoopbackRegistry, Transport};
+
+    pub fn node(shard_count: u32) -> Arc<Node> {
+        let registry = LoopbackRegistry::new();
+        Arc::new(Node::bootstrap(
+            NodeConfig {
+                node_id: "org-isolation-test".to_string(),
+                peers: Vec::new(),
+                shard_count,
+                data_dir: None,
+            },
+            Transport::loopback(registry),
+        ))
+    }
+
+    pub async fn json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&body).expect("JSON response")
+    }
+}

@@ -12,23 +12,12 @@
 //!   2. [`OrgScope::scope`] / [`OrgScope::unscope`] namespace a caller's key into
 //!      a private keyspace (`\x01<org>\x01<key>`) and back, so the state machine
 //!      stores every org's data under a disjoint prefix. The delimiter is the SOH
-//!      control byte, which valid keys can never contain (the validators reject
-//!      control characters), so no caller key can forge another org's prefix.
+//!      control byte. Even if a caller key contains SOH, the trusted prefix is
+//!      prepended first, so it still cannot escape into another org.
 //!
-//! Read-only node introspection (`/v1/status`, `/v1/observe/*`) is *not* tenant
-//! data and is exempt.
-//!
-//! ## Status — enforcement live, per-primitive isolation in progress
-//!
-//! [`require_org`] is wired on `/v1`, so **no coordination request without a
-//! valid org is accepted**. Full data isolation additionally requires every
-//! primitive handler to route its key through [`OrgScope::scope`] (and
-//! [`OrgScope::unscope`] on list/watch responses), plus scoping the inventory
-//! reads (`LockInventory`, `ServiceList`, `KvList`, …) that today fan out across
-//! all orgs. That wiring is being rolled out primitive-by-primitive; until a
-//! given primitive calls `scope`, it is gated (org required) but not yet
-//! namespaced. Do **not** treat the plane as fully isolated until every
-//! primitive is scoped and covered by a cross-org test.
+//! Only read-only node introspection without tenant state (`/v1/status`,
+//! `/v1/observe/shards`, and `/v1/observe/metrics`) is exempt. Tenant
+//! inventories require an org and are filtered before serialization.
 
 use axum::{
     extract::{FromRequestParts, Request},
@@ -37,7 +26,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde_json::{json, Value};
+
+use crate::consensus::{propose_response, ProposeError, ProposeOutcome};
 
 /// Header carrying the caller's org, injected by the trusted LB hop.
 pub const ORG_HEADER: &str = "x-fiducia-org-id";
@@ -45,12 +36,12 @@ pub const ORG_HEADER: &str = "x-fiducia-org-id";
 /// Max bytes for an org id (matches the `orgs.slug`/id column bounds).
 const MAX_ORG_BYTES: usize = 128;
 
-/// SOH byte — a control char no valid key/name may contain, used to fence the
-/// org prefix so a caller can never craft a key that lands in another org's space.
+/// SOH byte used to fence the trusted org prefix. Caller input is always appended
+/// after the complete prefix, so even an input containing SOH cannot escape it.
 const DELIM: char = '\u{1}';
 
 /// A validated org scope, attached to every state-touching `/v1` request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgScope(pub String);
 
 impl OrgScope {
@@ -67,6 +58,98 @@ impl OrgScope {
     pub fn unscope<'a>(&self, scoped: &'a str) -> Option<&'a str> {
         scoped.strip_prefix(&format!("{DELIM}{}{DELIM}", self.0))
     }
+
+    pub fn scope_all(&self, keys: impl IntoIterator<Item = String>) -> Vec<String> {
+        keys.into_iter().map(|key| self.scope(&key)).collect()
+    }
+
+    pub fn unscope_value(&self, value: &mut Value) -> bool {
+        unscope_value(self, value, false)
+    }
+
+    pub fn response(&self, mut value: Value) -> Response {
+        if self.unscope_value(&mut value) {
+            Json(value).into_response()
+        } else {
+            scope_violation()
+        }
+    }
+
+    pub fn propose_response(
+        &self,
+        result: Result<ProposeOutcome, ProposeError>,
+        uri: &axum::http::Uri,
+    ) -> Response {
+        match result {
+            Ok(mut outcome) => {
+                if !self.unscope_value(&mut outcome.output) {
+                    return scope_violation();
+                }
+                propose_response(Ok(outcome), uri)
+            }
+            Err(err) => propose_response(Err(err), uri),
+        }
+    }
+}
+
+const IDENTITY_FIELDS: &[&str] = &[
+    "key",
+    "keys",
+    "held_keys",
+    "conflicts",
+    "name",
+    "tenant",
+    "service",
+    "holder",
+    "superseded_by",
+    "idempotency_key",
+];
+
+const OPAQUE_FIELDS: &[&str] = &[
+    "value",
+    "payload",
+    "result",
+    "context",
+    "checkpoint",
+    "metadata",
+    "evidence",
+    "target",
+];
+
+fn unscope_value(org: &OrgScope, value: &mut Value, identity: bool) -> bool {
+    match value {
+        Value::String(text) if identity => {
+            if text.starts_with(DELIM) {
+                let Some(caller_value) = org.unscope(text) else {
+                    return false;
+                };
+                *text = caller_value.to_string();
+            }
+            true
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .all(|item| unscope_value(org, item, identity)),
+        Value::Object(fields) => fields.iter_mut().all(|(field, child)| {
+            if OPAQUE_FIELDS.contains(&field.as_str()) {
+                true
+            } else {
+                unscope_value(org, child, IDENTITY_FIELDS.contains(&field.as_str()))
+            }
+        }),
+        _ => true,
+    }
+}
+
+fn scope_violation() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "org_scope_violation",
+            "detail": "a response contained an identity outside the caller org"
+        })),
+    )
+        .into_response()
 }
 
 /// Reject `x-fiducia-org-id` values that are empty, oversized, or contain control
@@ -88,7 +171,10 @@ fn reject(code: &str, detail: &str) -> Response {
 /// Paths under `/v1` that are node introspection, not tenant data, and so do not
 /// require an org. Matched against the full request path.
 fn is_exempt(path: &str) -> bool {
-    path == "/v1/status" || path.starts_with("/v1/observe")
+    matches!(
+        path,
+        "/v1/status" | "/v1/observe/shards" | "/v1/observe/metrics"
+    )
 }
 
 /// Middleware: require a valid org on every state-touching `/v1` request and make
@@ -182,7 +268,38 @@ mod tests {
     fn introspection_paths_are_exempt() {
         assert!(is_exempt("/v1/status"));
         assert!(is_exempt("/v1/observe/metrics"));
+        assert!(is_exempt("/v1/observe/shards"));
+        assert!(!is_exempt("/v1/observe/locks"));
+        assert!(!is_exempt("/v1/observe/semaphores"));
+        assert!(!is_exempt("/v1/observe/elections"));
         assert!(!is_exempt("/v1/kv"));
         assert!(!is_exempt("/v1/locks/acquire"));
+    }
+
+    #[test]
+    fn response_identity_fields_are_unscoped_but_opaque_payloads_are_untouched() {
+        let org = org();
+        let mut value = json!({
+            "key": org.scope("visible"),
+            "lock": { "keys": [org.scope("a"), org.scope("b")] },
+            "idempotency_key": org.scope("effect-once"),
+            "payload": { "key": org.scope("application-data") },
+        });
+
+        assert!(org.unscope_value(&mut value));
+        assert_eq!(value["key"], "visible");
+        assert_eq!(value["lock"]["keys"], json!(["a", "b"]));
+        assert_eq!(value["idempotency_key"], "effect-once");
+        assert_eq!(
+            value["payload"]["key"],
+            org.scope("application-data"),
+            "opaque application payloads are never rewritten"
+        );
+    }
+
+    #[test]
+    fn response_rejects_a_different_orgs_scoped_identity() {
+        let mut value = json!({ "key": OrgScope("other".into()).scope("secret") });
+        assert!(!org().unscope_value(&mut value));
     }
 }

@@ -25,7 +25,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -62,16 +63,17 @@ pub fn router() -> Router<Arc<Node>> {
 /// `GET /v1/semaphores?key=K` — inspect permits, holders, and the wait queue.
 async fn get_semaphore(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KeyParam>,
 ) -> Response {
     match node
-        .query(ReadRequest::Semaphore { key: q.key.clone() })
+        .query(ReadRequest::Semaphore {
+            key: org.scope(&q.key),
+        })
         .await
     {
-        Ok(ReadResponse::Semaphore(sem)) => {
-            Json(json!({ "key": q.key, "semaphore": sem })).into_response()
-        }
+        Ok(ReadResponse::Semaphore(sem)) => org.response(json!({ "key": q.key, "semaphore": sem })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
@@ -80,6 +82,7 @@ async fn get_semaphore(
 /// `POST /v1/semaphores/acquire` — take a permit of `key` or join the FIFO queue.
 async fn acquire(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<AcquireBody>,
 ) -> Response {
@@ -88,32 +91,34 @@ async fn acquire(
     {
         return rejection.into_response();
     }
+    let holder = body.holder.unwrap_or_else(|| "anonymous".to_string());
     let result = node
         .propose(Command::SemaphoreAcquire {
-            key: body.key,
-            holder: body.holder.unwrap_or_else(|| "anonymous".to_string()),
+            key: org.scope(&body.key),
+            holder: org.scope(&holder),
             limit: body.limit,
             ttl_ms: body.ttl_ms.unwrap_or(30_000),
             wait: body.wait.unwrap_or(false),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/semaphores/release` — return one permit of `key` (admits the next waiter).
 async fn release(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ReleaseBody>,
 ) -> Response {
     let result = node
         .propose(Command::SemaphoreRelease {
-            key: body.key,
-            holder: body.holder,
+            key: org.scope(&body.key),
+            holder: org.scope(&body.holder),
             fencing_token: body.fencing_token,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

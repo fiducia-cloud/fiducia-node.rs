@@ -37,7 +37,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
 use crate::org_scope::OrgScope;
 use crate::state::Command;
 
@@ -120,7 +120,7 @@ async fn put_key(
             prev_revision: body.prev_revision,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `DELETE /v1/kv?key=K` — remove a key.
@@ -138,7 +138,7 @@ async fn delete_key(
             key: org.scope(&key),
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `GET /v1/kv?prefix=...` — list live keys under a prefix, scoped to the caller's

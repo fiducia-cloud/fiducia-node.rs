@@ -30,7 +30,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::Command;
 
 #[derive(Debug, Deserialize)]
@@ -84,21 +85,21 @@ pub fn router() -> Router<Arc<Node>> {
 
 async fn get_effect(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
     match node
         .query(ReadRequest::Effect {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Effect(effect)) => Json(json!({
+        Ok(ReadResponse::Effect(effect)) => org.response(json!({
             "name": q.name,
             "found": effect.is_some(),
             "effect": effect,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
@@ -106,6 +107,7 @@ async fn get_effect(
 
 async fn prepare(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<PrepareBody>,
 ) -> Response {
@@ -114,19 +116,20 @@ async fn prepare(
     }
     let result = node
         .propose(Command::EffectPrepare {
-            name: body.name,
+            name: org.scope(&body.name),
             effect_type: body.effect_type,
             payload: body.payload,
             risk: body.risk,
-            idempotency_key: body.idempotency_key,
+            idempotency_key: org.scope(&body.idempotency_key),
             required_approvals: body.required_approvals,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 async fn approve(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Json(body): Json<ApproveBody>,
 ) -> Response {
@@ -135,32 +138,46 @@ async fn approve(
     }
     let result = node
         .propose(Command::EffectApprove {
-            name: body.name,
+            name: org.scope(&body.name),
             principal: body.principal,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn commit(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<CommitBody>) -> Response {
+async fn commit(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<CommitBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::effect(&body.name, None) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::EffectCommit {
-            name: body.name,
+            name: org.scope(&body.name),
             result: body.result,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
-async fn abort(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<NameBody>) -> Response {
+async fn abort(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<NameBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::effect(&body.name, None) {
         return rejection.into_response();
     }
-    let result = node.propose(Command::EffectAbort { name: body.name }).await;
-    propose_response(result, &uri)
+    let result = node
+        .propose(Command::EffectAbort {
+            name: org.scope(&body.name),
+        })
+        .await;
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

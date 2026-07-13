@@ -28,7 +28,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::consensus::{propose_response, read_error_response, Node, ReadRequest, ReadResponse};
+use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
+use crate::org_scope::OrgScope;
 use crate::state::{BarrierPolicy, Command};
 
 #[derive(Debug, Deserialize)]
@@ -74,56 +75,66 @@ pub fn router() -> Router<Arc<Node>> {
 /// `GET /v1/barriers?name=N` — inspect arrivals and the resolution status.
 async fn get_barrier(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
     match node
         .query(ReadRequest::Barrier {
-            name: q.name.clone(),
+            name: org.scope(&q.name),
         })
         .await
     {
-        Ok(ReadResponse::Barrier(barrier)) => Json(json!({
+        Ok(ReadResponse::Barrier(barrier)) => org.response(json!({
             "name": q.name,
             "found": barrier.is_some(),
             "barrier": barrier,
-        }))
-        .into_response(),
+        })),
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
 }
 
 /// `POST /v1/barriers/create` — define a barrier with a resolution policy.
-async fn create(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<CreateBody>) -> Response {
+async fn create(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<CreateBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::barrier(&body.name) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::BarrierCreate {
-            name: body.name,
+            name: org.scope(&body.name),
             policy: body.policy,
             expected: body.expected,
             deadline_ms: body.deadline_ms,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 /// `POST /v1/barriers/arrive` — record a participant's arrival or veto.
-async fn arrive(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ArriveBody>) -> Response {
+async fn arrive(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    uri: Uri,
+    Json(body): Json<ArriveBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::barrier_arrive(&body.name, &body.participant) {
         return rejection.into_response();
     }
     let result = node
         .propose(Command::BarrierArrive {
-            name: body.name,
+            name: org.scope(&body.name),
             participant: body.participant,
             weight: body.weight,
             veto: body.veto,
         })
         .await;
-    propose_response(result, &uri)
+    org.propose_response(result, &uri)
 }
 
 #[cfg(test)]

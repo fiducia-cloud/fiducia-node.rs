@@ -367,7 +367,7 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_DATA_DIR` | string | `/var/lib/fiducia` | no | Directory for durable per-shard Raft state (log/meta/snapshot). Must be writable. |
 | `FIDUCIA_RAFT_COMPACT_THRESHOLD` | integer | `1024` | no | Live log-entry count that triggers snapshot + compaction; `0` disables. |
 | `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
-| `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Explicit local-dev opt-out of the trust boundary. **Never set in production.** |
+| `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Debug-build-only local-dev opt-out. Release binaries compile the bypass out. |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
 | `FIDUCIA_RAFT_CHECK_QUORUM` | bool | `true` | no | Leader steps down without a quorum of live followers. Disable with `0`/`false`/`off`. |
 | `FIDUCIA_RAFT_TICK_MS` | integer | `20` | no | Timer granularity; clamped ≤ heartbeat. |
@@ -391,9 +391,9 @@ with a shared cluster secret and **fails closed**:
 - `FIDUCIA_INTERNAL_SECRET` **unset** and no opt-out → the guard **rejects every
   internal request** (HTTP 401), and logs a loud `warn`. A prod node that boots
   without its secret refuses forged `x-fiducia-*` headers instead of trusting them.
-- `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` with the secret unset → the boundary is
-  **disabled** (any caller accepted); logged loudly at `warn` on every boot. This
-  is the *only* way an unset secret serves traffic, and is for local dev only.
+- `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` with the secret unset in a **debug build**
+  → the boundary is disabled and logged loudly. Release binaries ignore this
+  escape hatch and continue rejecting every internal request.
 
 ### Run a single node safely (local dev)
 
@@ -431,9 +431,13 @@ vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 Trust-boundary and hardening posture applied to this crate:
 
 - **Fail-closed internal auth.** `FIDUCIA_INTERNAL_SECRET` guards both `/v1` and
-  `/raft`; an unset secret rejects all internal traffic unless
-  `FIDUCIA_ALLOW_INSECURE_INTERNAL=1` is set explicitly for local dev (logged
-  loudly). See [`src/internal_auth.rs`](src/internal_auth.rs).
+  `/raft`; an unset secret rejects all internal traffic. Debug builds alone may
+  opt out with `FIDUCIA_ALLOW_INSECURE_INTERNAL=1`; release binaries compile
+  that bypass out. See [`src/internal_auth.rs`](src/internal_auth.rs).
+- **Per-org coordination keyspaces.** Every stateful `/v1` key, name, service,
+  tenant, list, and watch is namespaced by the validated
+  `x-fiducia-org-id`. Responses remove the internal prefix, and global lock,
+  semaphore, service, and election inventories filter out other orgs.
 - **Constant-time secret comparison.** The shared secret is compared with a
   length-checked, non-short-circuiting byte compare, so it can't be recovered a
   byte at a time via response timing.

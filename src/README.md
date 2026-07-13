@@ -19,6 +19,7 @@ The modules fall into three layers:
   `election`, `discovery`, plus scheduling (`schedule`, `schedule_runner`,
   `cron`).
 - **Cross-cutting** — `internal_auth` (trusted-hop secret on internal planes),
+  `org_scope` (mandatory per-org state namespaces and response filtering),
   `validate` (pre-Raft input bounds), `metrics` + `observe` (in-process metrics
   and the read-only operator surface), `indexed_queue` (O(1)-by-key FIFO wait
   queue used by locks/semaphores).
