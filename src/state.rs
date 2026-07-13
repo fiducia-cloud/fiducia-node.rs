@@ -643,7 +643,7 @@ impl BarrierStatus {
 }
 
 /// One participant's arrival at a barrier.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BarrierArrival {
     pub participant: String,
     pub weight: u64,
