@@ -187,8 +187,10 @@ async fn deregister(
 /// surface on the next read/registration rather than as a push event.)
 async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
     let Some(rx) = node.watch(&service).await else {
-        return Json(json!({ "error": "unavailable", "op": "discovery.watch", "service": service }))
-            .into_response();
+        return Json(
+            json!({ "error": "unavailable", "op": "discovery.watch", "service": service }),
+        )
+        .into_response();
     };
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let event = item.ok()?; // drop lag/closed notifications

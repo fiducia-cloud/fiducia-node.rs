@@ -376,7 +376,11 @@ mod tests {
             q.push_back(n, n);
         }
         let expected: Vec<i32> = (50..150).collect();
-        assert_eq!(drain_order(q), expected, "FIFO order holds across slot reuse");
+        assert_eq!(
+            drain_order(q),
+            expected,
+            "FIFO order holds across slot reuse"
+        );
     }
 
     #[test]
@@ -386,7 +390,11 @@ mod tests {
             q.push_back(n, n);
         }
         let seen: Vec<i32> = q.iter().map(|(_, v)| *v).collect();
-        assert_eq!(seen, vec![3, 1, 2], "iteration follows links, not key hashes");
+        assert_eq!(
+            seen,
+            vec![3, 1, 2],
+            "iteration follows links, not key hashes"
+        );
     }
 
     #[test]

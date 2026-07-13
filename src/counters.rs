@@ -63,7 +63,10 @@ async fn get_counter(
     uri: Uri,
     Query(q): Query<KeyParam>,
 ) -> Response {
-    match node.query(ReadRequest::Counter { key: q.key.clone() }).await {
+    match node
+        .query(ReadRequest::Counter { key: q.key.clone() })
+        .await
+    {
         Ok(ReadResponse::Counter(entry)) => Json(json!({
             "key": q.key,
             "found": entry.is_some(),

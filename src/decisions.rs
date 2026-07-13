@@ -77,7 +77,12 @@ async fn get_decision(
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
-    match node.query(ReadRequest::Decision { name: q.name.clone() }).await {
+    match node
+        .query(ReadRequest::Decision {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Decision(decision)) => Json(json!({
             "name": q.name,
             "found": decision.is_some(),
@@ -89,7 +94,11 @@ async fn get_decision(
     }
 }
 
-async fn propose(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ProposeBody>) -> Response {
+async fn propose(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ProposeBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::decision(&body.name, None) {
         return rejection.into_response();
     }
@@ -143,7 +152,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(body.options.len(), 3);
-        assert!(matches!(body.policy, DecisionPolicy::Plurality { min_votes: 3 }));
+        assert!(matches!(
+            body.policy,
+            DecisionPolicy::Plurality { min_votes: 3 }
+        ));
     }
 
     #[test]

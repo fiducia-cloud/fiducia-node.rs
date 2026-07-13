@@ -712,7 +712,11 @@ impl BarrierRecord {
 
     fn view(&self, name: &str, now: u64) -> BarrierState {
         let mut arrivals: Vec<BarrierArrival> = self.arrivals.values().cloned().collect();
-        arrivals.sort_by(|a, b| a.arrived_ms.cmp(&b.arrived_ms).then(a.participant.cmp(&b.participant)));
+        arrivals.sort_by(|a, b| {
+            a.arrived_ms
+                .cmp(&b.arrived_ms)
+                .then(a.participant.cmp(&b.participant))
+        });
         let arrived_count = arrivals.iter().filter(|a| !a.veto).count() as u32;
         let arrived_weight = arrivals.iter().filter(|a| !a.veto).map(|a| a.weight).sum();
         BarrierState {
@@ -996,7 +1000,10 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
     }
 }
 
@@ -1298,10 +1305,17 @@ impl DecisionRecord {
             return (DecisionStatus::Vetoed, None);
         }
         let tallies = self.tallies();
-        let cast = self.votes.values().filter(|v| !v.veto && v.option.is_some()).count() as u32;
+        let cast = self
+            .votes
+            .values()
+            .filter(|v| !v.veto && v.option.is_some())
+            .count() as u32;
         let deadline_passed = self.deadline_ms.is_some_and(|deadline| now >= deadline);
         // Highest-weight option, ties → smallest option name (tallies are sorted).
-        let top = tallies.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).cloned();
+        let top = tallies
+            .iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+            .cloned();
 
         match &self.policy {
             DecisionPolicy::Plurality { min_votes } => {
@@ -1317,7 +1331,9 @@ impl DecisionRecord {
                 }
             }
             DecisionPolicy::Threshold { required_weight } => {
-                let met = tallies.iter().find(|(_, weight)| *weight >= *required_weight);
+                let met = tallies
+                    .iter()
+                    .find(|(_, weight)| *weight >= *required_weight);
                 if let Some((option, _)) = met {
                     (DecisionStatus::Resolved, Some(option.clone()))
                 } else if deadline_passed {
@@ -1395,7 +1411,11 @@ pub struct BudgetAmount {
 
 impl BudgetAmount {
     fn zero() -> Self {
-        BudgetAmount { usd_micros: Some(0), tokens: Some(0), tool_calls: Some(0) }
+        BudgetAmount {
+            usd_micros: Some(0),
+            tokens: Some(0),
+            tool_calls: Some(0),
+        }
     }
 }
 
@@ -1454,7 +1474,10 @@ impl BudgetRecord {
     /// committed ones consume only what was actually spent; released free it.
     fn consumed(&self) -> BudgetAmount {
         let sum = |axis: fn(&BudgetAmount) -> Option<u64>| -> u64 {
-            self.reservations.values().map(|r| r.consumed_on(axis)).sum()
+            self.reservations
+                .values()
+                .map(|r| r.consumed_on(axis))
+                .sum()
         };
         BudgetAmount {
             usd_micros: Some(sum(|b| b.usd_micros)),
@@ -1486,9 +1509,16 @@ impl BudgetRecord {
             None => true, // unlimited axis
             Some(cap) => current.unwrap_or(0).saturating_add(add.unwrap_or(0)) <= cap,
         };
-        axis_ok(self.limit.usd_micros, consumed.usd_micros, amount.usd_micros)
-            && axis_ok(self.limit.tokens, consumed.tokens, amount.tokens)
-            && axis_ok(self.limit.tool_calls, consumed.tool_calls, amount.tool_calls)
+        axis_ok(
+            self.limit.usd_micros,
+            consumed.usd_micros,
+            amount.usd_micros,
+        ) && axis_ok(self.limit.tokens, consumed.tokens, amount.tokens)
+            && axis_ok(
+                self.limit.tool_calls,
+                consumed.tool_calls,
+                amount.tool_calls,
+            )
     }
 
     fn available(&self) -> BudgetAmount {
@@ -1542,7 +1572,10 @@ pub enum ClaimStatus {
 
 impl ClaimStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, ClaimStatus::Accepted | ClaimStatus::Rejected | ClaimStatus::Superseded)
+        matches!(
+            self,
+            ClaimStatus::Accepted | ClaimStatus::Rejected | ClaimStatus::Superseded
+        )
     }
 }
 
@@ -1769,9 +1802,8 @@ impl StateMachine {
                 from_token,
                 context,
                 ttl_ms,
-            } => store.apply_handoff_offer(
-                now, name, resource, from, to, from_token, context, ttl_ms,
-            ),
+            } => store
+                .apply_handoff_offer(now, name, resource, from, to, from_token, context, ttl_ms),
             Command::HandoffAccept { name, to } => store.apply_handoff_accept(now, name, to),
             Command::HandoffReject { name, to } => store.apply_handoff_reject(now, name, to),
             Command::DecisionPropose {
@@ -1789,9 +1821,8 @@ impl StateMachine {
                 weight,
                 veto,
                 evidence,
-            } => store.apply_decision_vote(
-                now, name, voter, option, confidence, weight, veto, evidence,
-            ),
+            } => store
+                .apply_decision_vote(now, name, voter, option, confidence, weight, veto, evidence),
             Command::BudgetSet { name, limit } => store.apply_budget_set(name, limit),
             Command::BudgetReserve {
                 name,
@@ -1818,16 +1849,26 @@ impl StateMachine {
                 evidence,
                 valid_until_ms,
             } => store.apply_claim_assert(
-                name, subject, predicate, value, confidence, author, evidence, valid_until_ms,
+                name,
+                subject,
+                predicate,
+                value,
+                confidence,
+                author,
+                evidence,
+                valid_until_ms,
             ),
             Command::ClaimSupport { name, agent } => store.apply_claim_support(name, agent),
-            Command::ClaimContest { name, agent, reason } => {
-                store.apply_claim_contest(name, agent, reason)
-            }
+            Command::ClaimContest {
+                name,
+                agent,
+                reason,
+            } => store.apply_claim_contest(name, agent, reason),
             Command::ClaimResolve { name, accepted } => store.apply_claim_resolve(name, accepted),
-            Command::ClaimSupersede { name, superseded_by } => {
-                store.apply_claim_supersede(name, superseded_by)
-            }
+            Command::ClaimSupersede {
+                name,
+                superseded_by,
+            } => store.apply_claim_supersede(name, superseded_by),
             Command::LockAcquire {
                 keys,
                 holder,
@@ -1886,8 +1927,15 @@ impl StateMachine {
                 ttl_ms,
                 retention_ms,
                 metadata,
-            } => store
-                .apply_idempotency_claim(revision, now, key, owner, ttl_ms, retention_ms, metadata),
+            } => store.apply_idempotency_claim(
+                revision,
+                now,
+                key,
+                owner,
+                ttl_ms,
+                retention_ms,
+                metadata,
+            ),
             Command::IdempotencyComplete {
                 key,
                 owner,
@@ -1994,39 +2042,68 @@ impl StateMachine {
     /// Read a barrier's current state, with its status derived at `now`.
     pub fn barrier_get(&self, name: &str) -> Option<BarrierState> {
         let store = self.store.lock().unwrap();
-        store.barriers.get(name).map(|record| record.view(name, now_ms()))
+        store
+            .barriers
+            .get(name)
+            .map(|record| record.view(name, now_ms()))
     }
 
     /// Read a durable task's current state.
     pub fn task_get(&self, name: &str) -> Option<TaskState> {
-        self.store.lock().unwrap().tasks.get(name).map(|record| record.view(name))
+        self.store
+            .lock()
+            .unwrap()
+            .tasks
+            .get(name)
+            .map(|record| record.view(name))
     }
 
     /// Read an approval-escrow effect's current state.
     pub fn effect_get(&self, name: &str) -> Option<EffectState> {
-        self.store.lock().unwrap().effects.get(name).map(|record| record.view(name))
+        self.store
+            .lock()
+            .unwrap()
+            .effects
+            .get(name)
+            .map(|record| record.view(name))
     }
 
     /// Read an ownership handoff's current state.
     pub fn handoff_get(&self, name: &str) -> Option<HandoffState> {
         let store = self.store.lock().unwrap();
-        store.handoffs.get(name).map(|record| record.view(name, now_ms()))
+        store
+            .handoffs
+            .get(name)
+            .map(|record| record.view(name, now_ms()))
     }
 
     /// Read a decision's current state, with its outcome derived at `now`.
     pub fn decision_get(&self, name: &str) -> Option<DecisionState> {
         let store = self.store.lock().unwrap();
-        store.decisions.get(name).map(|record| record.view(name, now_ms()))
+        store
+            .decisions
+            .get(name)
+            .map(|record| record.view(name, now_ms()))
     }
 
     /// Read a budget's ceiling, consumption, and reservations.
     pub fn budget_get(&self, name: &str) -> Option<BudgetState> {
-        self.store.lock().unwrap().budgets.get(name).map(|record| record.view(name))
+        self.store
+            .lock()
+            .unwrap()
+            .budgets
+            .get(name)
+            .map(|record| record.view(name))
     }
 
     /// Read a claim's current state.
     pub fn claim_get(&self, name: &str) -> Option<ClaimState> {
-        self.store.lock().unwrap().claims.get(name).map(|record| record.view(name))
+        self.store
+            .lock()
+            .unwrap()
+            .claims
+            .get(name)
+            .map(|record| record.view(name))
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
@@ -2791,11 +2868,14 @@ impl Store {
     }
 
     fn apply_budget_set(&mut self, name: String, limit: BudgetAmount) -> Value {
-        let record = self.budgets.entry(name.clone()).or_insert_with(|| BudgetRecord {
-            limit,
-            reservations: std::collections::BTreeMap::new(),
-            generation: 0,
-        });
+        let record = self
+            .budgets
+            .entry(name.clone())
+            .or_insert_with(|| BudgetRecord {
+                limit,
+                reservations: std::collections::BTreeMap::new(),
+                generation: 0,
+            });
         record.limit = limit;
         record.generation += 1;
         json!({ "ok": true, "budget": record.view(&name) })
@@ -3692,8 +3772,17 @@ impl Store {
             return json!({ "recorded": false, "reason": "not_found", "name": name });
         };
         let fire_id = fire_id_ms.to_string();
-        if let Some(run) = record.history.iter_mut().rev().find(|r| r.fire_id == fire_id) {
-            run.status = if delivered { RunStatus::Delivered } else { RunStatus::Failed };
+        if let Some(run) = record
+            .history
+            .iter_mut()
+            .rev()
+            .find(|r| r.fire_id == fire_id)
+        {
+            run.status = if delivered {
+                RunStatus::Delivered
+            } else {
+                RunStatus::Failed
+            };
             run.attempts = attempts;
             run.error = error;
             json!({ "recorded": true, "name": name, "fire_id_ms": fire_id_ms, "delivered": delivered })
@@ -5008,7 +5097,10 @@ mod tests {
             weight: 1,
             veto: true,
         });
-        assert_eq!(sm.barrier_get("deploy/safety").unwrap().status, BarrierStatus::Vetoed);
+        assert_eq!(
+            sm.barrier_get("deploy/safety").unwrap().status,
+            BarrierStatus::Vetoed
+        );
     }
 
     #[test]
@@ -5026,14 +5118,20 @@ mod tests {
             weight: 3,
             veto: false,
         });
-        assert_eq!(sm.barrier_get("vote").unwrap().status, BarrierStatus::Pending);
+        assert_eq!(
+            sm.barrier_get("vote").unwrap().status,
+            BarrierStatus::Pending
+        );
         sm.apply(Command::BarrierArrive {
             name: "vote".to_string(),
             participant: "generalist".to_string(),
             weight: 2,
             veto: false,
         });
-        assert_eq!(sm.barrier_get("vote").unwrap().status, BarrierStatus::Satisfied);
+        assert_eq!(
+            sm.barrier_get("vote").unwrap().status,
+            BarrierStatus::Satisfied
+        );
     }
 
     #[test]
@@ -5240,7 +5338,10 @@ mod tests {
         });
         assert_eq!(offer.output["ok"], true);
         // While offered, ownership has not moved.
-        assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Offered);
+        assert_eq!(
+            sm.handoff_get("ticket-482/handoff").unwrap().status,
+            HandoffStatus::Offered
+        );
 
         // Only the offered recipient may accept.
         let wrong = sm.apply(Command::HandoffAccept {
@@ -5256,8 +5357,14 @@ mod tests {
         });
         assert_eq!(accept.output["ok"], true);
         let to_token = accept.output["to_token"].as_u64().unwrap();
-        assert!(to_token > from_token, "new owner's token must exceed the old owner's");
-        assert_eq!(sm.handoff_get("ticket-482/handoff").unwrap().status, HandoffStatus::Accepted);
+        assert!(
+            to_token > from_token,
+            "new owner's token must exceed the old owner's"
+        );
+        assert_eq!(
+            sm.handoff_get("ticket-482/handoff").unwrap().status,
+            HandoffStatus::Accepted
+        );
 
         // A second accept on the resolved handoff is rejected.
         let again = sm.apply(Command::HandoffAccept {
@@ -5318,7 +5425,10 @@ mod tests {
         vote("deploy/safe", "a", Some("approve"), 1, false);
         vote("deploy/safe", "b", Some("reject"), 1, false);
         // Not enough votes yet (min_votes = 3).
-        assert_eq!(sm.decision_get("deploy/safe").unwrap().status, DecisionStatus::Open);
+        assert_eq!(
+            sm.decision_get("deploy/safe").unwrap().status,
+            DecisionStatus::Open
+        );
         // A heavier third vote for approve resolves it to approve.
         vote("deploy/safe", "c", Some("approve"), 5, false);
         let resolved = sm.decision_get("deploy/safe").unwrap();
@@ -5332,7 +5442,10 @@ mod tests {
         // Any veto aborts a separate decision.
         propose("release/gate");
         vote("release/gate", "compliance", None, 1, true);
-        assert_eq!(sm.decision_get("release/gate").unwrap().status, DecisionStatus::Vetoed);
+        assert_eq!(
+            sm.decision_get("release/gate").unwrap().status,
+            DecisionStatus::Vetoed
+        );
     }
 
     #[test]
@@ -5352,7 +5465,11 @@ mod tests {
                 name: "org/acme/wf/42".to_string(),
                 reservation_id: id.to_string(),
                 holder: format!("agent-{id}"),
-                amount: BudgetAmount { usd_micros: Some(usd), tokens: None, tool_calls: None },
+                amount: BudgetAmount {
+                    usd_micros: Some(usd),
+                    tokens: None,
+                    tool_calls: None,
+                },
             })
         };
 
@@ -5366,7 +5483,11 @@ mod tests {
         sm.apply(Command::BudgetCommit {
             name: "org/acme/wf/42".to_string(),
             reservation_id: "a".to_string(),
-            actual: BudgetAmount { usd_micros: Some(200_000), tokens: None, tool_calls: None },
+            actual: BudgetAmount {
+                usd_micros: Some(200_000),
+                tokens: None,
+                tool_calls: None,
+            },
         });
         let budget = sm.budget_get("org/acme/wf/42").unwrap();
         assert_eq!(budget.spent.usd_micros, Some(200_000));
@@ -5380,7 +5501,13 @@ mod tests {
             name: "org/acme/wf/42".to_string(),
             reservation_id: "b".to_string(),
         });
-        assert_eq!(sm.budget_get("org/acme/wf/42").unwrap().available.usd_micros, Some(800_000));
+        assert_eq!(
+            sm.budget_get("org/acme/wf/42")
+                .unwrap()
+                .available
+                .usd_micros,
+            Some(800_000)
+        );
     }
 
     #[test]
@@ -5401,7 +5528,10 @@ mod tests {
         assert_eq!(sm.claim_get(&name).unwrap().status, ClaimStatus::Asserted);
 
         // Another agent supports, then a third contests it.
-        sm.apply(Command::ClaimSupport { name: name.clone(), agent: "audit-agent".to_string() });
+        sm.apply(Command::ClaimSupport {
+            name: name.clone(),
+            agent: "audit-agent".to_string(),
+        });
         sm.apply(Command::ClaimContest {
             name: name.clone(),
             agent: "fraud-agent".to_string(),
@@ -5428,9 +5558,15 @@ mod tests {
 
         // An authorized process resolves it (accepted, terminal). Further
         // mutations are rejected.
-        sm.apply(Command::ClaimResolve { name: name.clone(), accepted: true });
+        sm.apply(Command::ClaimResolve {
+            name: name.clone(),
+            accepted: true,
+        });
         assert_eq!(sm.claim_get(&name).unwrap().status, ClaimStatus::Accepted);
-        let late = sm.apply(Command::ClaimSupport { name: name.clone(), agent: "x".to_string() });
+        let late = sm.apply(Command::ClaimSupport {
+            name: name.clone(),
+            agent: "x".to_string(),
+        });
         assert_eq!(late.output["reason"], "terminal");
     }
 

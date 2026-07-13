@@ -75,8 +75,17 @@ pub fn router() -> Router<Arc<Node>> {
         .route("/release", post(release))
 }
 
-async fn get_budget(State(node): State<Arc<Node>>, uri: Uri, Query(q): Query<NameParam>) -> Response {
-    match node.query(ReadRequest::Budget { name: q.name.clone() }).await {
+async fn get_budget(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Query(q): Query<NameParam>,
+) -> Response {
+    match node
+        .query(ReadRequest::Budget {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Budget(budget)) => Json(json!({
             "name": q.name,
             "found": budget.is_some(),
@@ -101,7 +110,11 @@ async fn set(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<SetBody>)
     propose_response(result, &uri)
 }
 
-async fn reserve(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ReserveBody>) -> Response {
+async fn reserve(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ReserveBody>,
+) -> Response {
     if let Err(rejection) =
         crate::validate::budget(&body.name, Some(&body.reservation_id), Some(&body.holder))
     {
@@ -132,7 +145,11 @@ async fn commit(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<Commit
     propose_response(result, &uri)
 }
 
-async fn release(State(node): State<Arc<Node>>, uri: Uri, Json(body): Json<ReleaseBody>) -> Response {
+async fn release(
+    State(node): State<Arc<Node>>,
+    uri: Uri,
+    Json(body): Json<ReleaseBody>,
+) -> Response {
     if let Err(rejection) = crate::validate::budget(&body.name, Some(&body.reservation_id), None) {
         return rejection.into_response();
     }

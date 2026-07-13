@@ -50,10 +50,10 @@ use tokio::time::{Duration, Instant};
 
 use crate::persist::{Recovered, ShardStore};
 use crate::state::{
-    BarrierState, Command, CounterEntry, ElectionEntry, IdempotencyRecord, KvEntry, KvListItem,
-    Leadership, LockInventory, LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState,
-    ServiceInstance, TaskState, EffectState, HandoffState, DecisionState, BudgetState, ClaimState,
-    ServiceSummary, StateMachine,
+    BarrierState, BudgetState, ClaimState, Command, CounterEntry, DecisionState, EffectState,
+    ElectionEntry, HandoffState, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
+    LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState, ServiceInstance,
+    ServiceSummary, StateMachine, TaskState,
 };
 use crate::transport::{
     AppendEntriesReq, AppendEntriesResp, LoopbackRegistry, RequestVoteReq, RequestVoteResp,
@@ -146,11 +146,21 @@ impl RaftTiming {
             election_jitter_ms: ms("FIDUCIA_RAFT_ELECTION_JITTER_MS", d.election_jitter_ms),
             pre_vote: std::env::var("FIDUCIA_RAFT_PREVOTE")
                 .ok()
-                .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+                .map(|s| {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off"
+                    )
+                })
                 .unwrap_or(d.pre_vote),
             check_quorum: std::env::var("FIDUCIA_RAFT_CHECK_QUORUM")
                 .ok()
-                .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+                .map(|s| {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off"
+                    )
+                })
                 .unwrap_or(d.check_quorum),
         }
         .sanitized()
@@ -356,28 +366,67 @@ pub enum ShardMsg {
 /// A read routed to its owning shard, except prefix reads which are fanned out
 /// across every hosted shard by [`Node::query_kv_prefix`].
 pub enum ReadRequest {
-    Kv { key: String },
+    Kv {
+        key: String,
+    },
     #[allow(dead_code)]
-    KvPrefix { prefix: String },
-    Counter { key: String },
-    Barrier { name: String },
-    Task { name: String },
-    Effect { name: String },
-    Handoff { name: String },
-    Decision { name: String },
-    Budget { name: String },
-    Claim { name: String },
-    Lock { key: String },
-    Semaphore { key: String },
-    RateLimit { tenant: String, key: String },
-    Idempotency { key: String },
-    Schedule { name: String },
-    ScheduleHistory { name: String },
-    Election { name: String },
-    Service { service: String },
+    KvPrefix {
+        prefix: String,
+    },
+    Counter {
+        key: String,
+    },
+    Barrier {
+        name: String,
+    },
+    Task {
+        name: String,
+    },
+    Effect {
+        name: String,
+    },
+    Handoff {
+        name: String,
+    },
+    Decision {
+        name: String,
+    },
+    Budget {
+        name: String,
+    },
+    Claim {
+        name: String,
+    },
+    Lock {
+        key: String,
+    },
+    Semaphore {
+        key: String,
+    },
+    RateLimit {
+        tenant: String,
+        key: String,
+    },
+    Idempotency {
+        key: String,
+    },
+    Schedule {
+        name: String,
+    },
+    ScheduleHistory {
+        name: String,
+    },
+    Election {
+        name: String,
+    },
+    Service {
+        service: String,
+    },
     /// Range read: every KV key under `prefix` on one shard. Fanned out across
     /// shards by [`Node::list_kv`] and served serializably (no leader gate).
-    KvList { prefix: String },
+    KvList {
+        prefix: String,
+    },
     /// Every service with live instances on one shard. Fanned out by
     /// [`Node::list_services`] and served serializably.
     ServiceList,
@@ -402,14 +451,26 @@ impl ReadRequest {
         match self {
             ReadRequest::Kv { key } | ReadRequest::KvPrefix { prefix: key } => key,
             ReadRequest::Counter { key } => key,
-            ReadRequest::Barrier { name } | ReadRequest::Task { name } | ReadRequest::Effect { name } | ReadRequest::Handoff { name } | ReadRequest::Decision { name } | ReadRequest::Budget { name } | ReadRequest::Claim { name } => name,
+            ReadRequest::Barrier { name }
+            | ReadRequest::Task { name }
+            | ReadRequest::Effect { name }
+            | ReadRequest::Handoff { name }
+            | ReadRequest::Decision { name }
+            | ReadRequest::Budget { name }
+            | ReadRequest::Claim { name } => name,
             ReadRequest::Lock { .. } | ReadRequest::Semaphore { .. } => crate::state::LOCK_DOMAIN,
             ReadRequest::RateLimit { key, .. } | ReadRequest::Idempotency { key } => key,
             ReadRequest::Schedule { name } | ReadRequest::ScheduleHistory { name } => name,
             ReadRequest::Election { name } => name,
-            ReadRequest::Service { service } => service,
+            // Service discovery lives on the single SERVICE_DOMAIN shard — writes
+            // route every register/heartbeat/deregister there (see Command::routing_key).
+            // A per-service read must hit that same shard, NOT shard_for(service_name),
+            // or it reads a different (empty) shard than the one holding the instances.
+            ReadRequest::Service { .. } => crate::state::SERVICE_DOMAIN,
             // Lock/semaphore inventory shares the single lock-coordinator shard.
-            ReadRequest::LockInventory | ReadRequest::SemaphoreInventory => crate::state::LOCK_DOMAIN,
+            ReadRequest::LockInventory | ReadRequest::SemaphoreInventory => {
+                crate::state::LOCK_DOMAIN
+            }
             // List reads fan out across all shards rather than routing to one.
             ReadRequest::KvList { prefix } => prefix,
             ReadRequest::ServiceList | ReadRequest::ScheduleList | ReadRequest::ElectionList => "",
@@ -929,9 +990,11 @@ impl ShardActor {
     /// it means we may be running without the durability the caller assumes.
     fn persist_hard_state(&mut self) {
         if let Some(store) = self.store.as_ref() {
-            if let Err(e) =
-                store.save_meta(self.current_term, self.voted_for.as_deref(), self.commit_index)
-            {
+            if let Err(e) = store.save_meta(
+                self.current_term,
+                self.voted_for.as_deref(),
+                self.commit_index,
+            ) {
                 tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist hard state");
             }
         }
@@ -1335,7 +1398,8 @@ impl ShardActor {
         // election is granted; once a known leader stops heartbeating, contact goes
         // stale and pre-votes flow again so failover can proceed.
         let leader_alive = self.leader_id.is_some()
-            && self.last_leader_contact.elapsed() < Duration::from_millis(self.timing.election_min_ms);
+            && self.last_leader_contact.elapsed()
+                < Duration::from_millis(self.timing.election_min_ms);
         RequestVoteResp {
             term: self.current_term,
             granted: req.term >= self.current_term && log_ok && !leader_alive,
@@ -1458,20 +1522,24 @@ impl ShardActor {
                 revision,
                 detail: None,
             }),
-            Command::ServiceRegister { service, .. } if flagged("registered") => Some(ChangeEvent {
-                scope: "service",
-                kind: "register",
-                key: service.clone(),
-                revision,
-                detail: detail("instance"),
-            }),
-            Command::ServiceHeartbeat { service, .. } if flagged("heartbeat") => Some(ChangeEvent {
-                scope: "service",
-                kind: "heartbeat",
-                key: service.clone(),
-                revision,
-                detail: detail("instance"),
-            }),
+            Command::ServiceRegister { service, .. } if flagged("registered") => {
+                Some(ChangeEvent {
+                    scope: "service",
+                    kind: "register",
+                    key: service.clone(),
+                    revision,
+                    detail: detail("instance"),
+                })
+            }
+            Command::ServiceHeartbeat { service, .. } if flagged("heartbeat") => {
+                Some(ChangeEvent {
+                    scope: "service",
+                    kind: "heartbeat",
+                    key: service.clone(),
+                    revision,
+                    detail: detail("instance"),
+                })
+            }
             Command::ServiceDeregister { service, .. } if flagged("deregistered") => {
                 Some(ChangeEvent {
                     scope: "service",
@@ -1525,16 +1593,18 @@ impl ShardActor {
             ReadRequest::KvPrefix { prefix } => {
                 Ok(ReadResponse::KvPrefix(self.state.kv_prefix(&prefix)))
             }
-            ReadRequest::Counter { key } => {
-                Ok(ReadResponse::Counter(self.state.counter_get(&key)))
-            }
+            ReadRequest::Counter { key } => Ok(ReadResponse::Counter(self.state.counter_get(&key))),
             ReadRequest::Barrier { name } => {
                 Ok(ReadResponse::Barrier(self.state.barrier_get(&name)))
             }
             ReadRequest::Task { name } => Ok(ReadResponse::Task(self.state.task_get(&name))),
             ReadRequest::Effect { name } => Ok(ReadResponse::Effect(self.state.effect_get(&name))),
-            ReadRequest::Handoff { name } => Ok(ReadResponse::Handoff(self.state.handoff_get(&name))),
-            ReadRequest::Decision { name } => Ok(ReadResponse::Decision(self.state.decision_get(&name))),
+            ReadRequest::Handoff { name } => {
+                Ok(ReadResponse::Handoff(self.state.handoff_get(&name)))
+            }
+            ReadRequest::Decision { name } => {
+                Ok(ReadResponse::Decision(self.state.decision_get(&name)))
+            }
             ReadRequest::Budget { name } => Ok(ReadResponse::Budget(self.state.budget_get(&name))),
             ReadRequest::Claim { name } => Ok(ReadResponse::Claim(self.state.claim_get(&name))),
             ReadRequest::Lock { key } => Ok(ReadResponse::Lock(self.state.lock_get(&key))),
@@ -1587,9 +1657,7 @@ impl ShardActor {
             ReadRequest::ElectionList => {
                 ReadResponse::ElectionList(self.state.election_inventory())
             }
-            ReadRequest::LockInventory => {
-                ReadResponse::LockInventory(self.state.lock_inventory())
-            }
+            ReadRequest::LockInventory => ReadResponse::LockInventory(self.state.lock_inventory()),
             ReadRequest::SemaphoreInventory => {
                 ReadResponse::SemaphoreInventory(self.state.semaphore_inventory())
             }
@@ -1601,7 +1669,9 @@ impl ShardActor {
             ReadRequest::Task { name } => ReadResponse::Task(self.state.task_get(&name)),
             ReadRequest::Effect { name } => ReadResponse::Effect(self.state.effect_get(&name)),
             ReadRequest::Handoff { name } => ReadResponse::Handoff(self.state.handoff_get(&name)),
-            ReadRequest::Decision { name } => ReadResponse::Decision(self.state.decision_get(&name)),
+            ReadRequest::Decision { name } => {
+                ReadResponse::Decision(self.state.decision_get(&name))
+            }
             ReadRequest::Budget { name } => ReadResponse::Budget(self.state.budget_get(&name)),
             ReadRequest::Claim { name } => ReadResponse::Claim(self.state.claim_get(&name)),
             ReadRequest::Lock { key } => ReadResponse::Lock(self.state.lock_get(&key)),
@@ -1611,7 +1681,9 @@ impl ShardActor {
             ReadRequest::RateLimit { tenant, key } => {
                 ReadResponse::RateLimit(self.state.rate_limit_get(&tenant, &key))
             }
-            ReadRequest::Schedule { name } => ReadResponse::Schedule(self.state.schedule_get(&name)),
+            ReadRequest::Schedule { name } => {
+                ReadResponse::Schedule(self.state.schedule_get(&name))
+            }
             ReadRequest::ScheduleHistory { name } => {
                 ReadResponse::ScheduleHistory(self.state.schedule_history(&name))
             }
@@ -1819,17 +1891,22 @@ impl Node {
         let started = std::time::Instant::now();
         let Some(tx) = self.sender(shard) else {
             tracing::debug!(shard = ?shard, key = %routing_key, "query unavailable: shard not hosted here");
-            self.metrics.record("read", started.elapsed().as_secs_f64() * 1e3, false);
+            self.metrics
+                .record("read", started.elapsed().as_secs_f64() * 1e3, false);
             return Err(ProposeError::Unavailable { shard });
         };
         let (resp, rx) = oneshot::channel();
         if tx.send(ShardMsg::Query { request, resp }).await.is_err() {
-            self.metrics.record("read", started.elapsed().as_secs_f64() * 1e3, false);
+            self.metrics
+                .record("read", started.elapsed().as_secs_f64() * 1e3, false);
             return Err(ProposeError::Unavailable { shard });
         }
         let result = rx.await.unwrap_or(Err(ProposeError::Unavailable { shard }));
-        self.metrics
-            .record("read", started.elapsed().as_secs_f64() * 1e3, result.is_ok());
+        self.metrics.record(
+            "read",
+            started.elapsed().as_secs_f64() * 1e3,
+            result.is_ok(),
+        );
         tracing::debug!(
             shard = ?shard,
             key = %routing_key,
@@ -1909,10 +1986,7 @@ impl Node {
     /// Fan a serializable read out across **every shard this node hosts**, then
     /// merge. `make` builds a fresh request per shard ([`ReadRequest`] isn't
     /// `Clone`). Used for list/range operations that no single shard owns.
-    async fn query_all_shards(
-        &self,
-        make: impl Fn() -> ReadRequest,
-    ) -> Vec<ReadResponse> {
+    async fn query_all_shards(&self, make: impl Fn() -> ReadRequest) -> Vec<ReadResponse> {
         let mut out = Vec::with_capacity(self.shards.len());
         for tx in self.shards.values() {
             let (resp, rx) = oneshot::channel();
@@ -1954,7 +2028,8 @@ impl Node {
     /// routes to a single shard, so counts don't need de-duping across shards,
     /// but we still merge defensively in case a name appears more than once.
     pub async fn list_services(&self) -> Vec<ServiceSummary> {
-        let mut merged: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut merged: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for response in self.query_all_shards(|| ReadRequest::ServiceList).await {
             if let ReadResponse::ServiceList(summaries) = response {
                 for summary in summaries {
@@ -3053,12 +3128,18 @@ mod tests {
         let t = timing(0, 0, 0).sanitized();
         assert_eq!(t.tick, Duration::from_millis(1));
         assert_eq!(t.heartbeat, Duration::from_millis(1));
-        assert!(t.election_min_ms >= 2, "election clamped to >= 2x heartbeat");
+        assert!(
+            t.election_min_ms >= 2,
+            "election clamped to >= 2x heartbeat"
+        );
 
         // Tick coarser than the heartbeat is clamped down to the heartbeat.
         let t = timing(500, 150, 1000).sanitized();
         assert_eq!(t.tick, Duration::from_millis(150));
-        assert_eq!(t.election_min_ms, 1000, "a sane election timeout is preserved");
+        assert_eq!(
+            t.election_min_ms, 1000,
+            "a sane election timeout is preserved"
+        );
 
         // Election timeout below 2x the heartbeat is clamped up.
         let t = timing(20, 150, 100).sanitized();
@@ -3213,7 +3294,11 @@ mod tests {
 
         a.heartbeat_deadline = Instant::now() + Duration::from_secs(60);
         a.on_tick();
-        assert_eq!(a.role, Role::Leader, "no step-down when check-quorum is off");
+        assert_eq!(
+            a.role,
+            Role::Leader,
+            "no step-down when check-quorum is off"
+        );
     }
 
     fn pre_vote_req(term: u64, last_log_index: u64, last_log_term: u64) -> RequestVoteReq {

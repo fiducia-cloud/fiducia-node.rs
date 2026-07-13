@@ -77,7 +77,12 @@ async fn get_barrier(
     uri: Uri,
     Query(q): Query<NameParam>,
 ) -> Response {
-    match node.query(ReadRequest::Barrier { name: q.name.clone() }).await {
+    match node
+        .query(ReadRequest::Barrier {
+            name: q.name.clone(),
+        })
+        .await
+    {
         Ok(ReadResponse::Barrier(barrier)) => Json(json!({
             "name": q.name,
             "found": barrier.is_some(),

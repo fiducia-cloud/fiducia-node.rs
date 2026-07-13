@@ -274,7 +274,9 @@ mod tests {
             .append_tail(&[entry(1, 1, "a"), entry(2, 1, "b")])
             .unwrap();
         // Truncate index 2 and replace it with a higher-term entry.
-        store.rewrite(&[entry(1, 1, "a"), entry(2, 5, "c")]).unwrap();
+        store
+            .rewrite(&[entry(1, 1, "a"), entry(2, 5, "c")])
+            .unwrap();
         let (_s, rec) = ShardStore::open(&root, 0).unwrap();
         assert_eq!(rec.log.len(), 2);
         assert_eq!(rec.log[1].term, 5);
