@@ -1272,7 +1272,7 @@ struct DecisionVoteRecord {
     evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionRecord {
     question: String,
     options: Vec<String>,
