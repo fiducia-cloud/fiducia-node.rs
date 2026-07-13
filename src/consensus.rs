@@ -1069,9 +1069,11 @@ impl ShardActor {
         // No-op for the new term so prior-term entries can commit (and so a single
         // write isn't needed to make progress). Committing this proves leadership.
         let index = self.last_log_index() + 1;
+        let ts_ms = self.stamp_next_entry();
         self.log.push(LogEntry {
             term: self.current_term,
             index,
+            ts_ms,
             command: None,
         });
         // Durable before this entry can count toward a commit.
