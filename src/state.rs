@@ -1390,7 +1390,7 @@ impl DecisionRecord {
 }
 
 /// The status of a single budget reservation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReservationStatus {
     Held,
