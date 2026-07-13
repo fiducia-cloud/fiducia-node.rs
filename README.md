@@ -353,7 +353,7 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Explicit local-dev opt-out of the trust boundary. **Never set in production.** |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
 | `FIDUCIA_RAFT_CHECK_QUORUM` | bool | `true` | no | Leader steps down without a quorum of live followers. Disable with `0`/`false`/`off`. |
-| `FIDUCIA_RAFT_TICK_MS` | integer | `10` | no | Timer granularity; clamped ≤ heartbeat. |
+| `FIDUCIA_RAFT_TICK_MS` | integer | `20` | no | Timer granularity; clamped ≤ heartbeat. |
 | `FIDUCIA_RAFT_HEARTBEAT_MS` | integer | `50` | no | Leader heartbeat interval. |
 | `FIDUCIA_RAFT_ELECTION_MIN_MS` | integer | `150` | no | Election-timeout floor; clamped up to ≥ 2× heartbeat. |
 | `FIDUCIA_RAFT_ELECTION_JITTER_MS` | integer | `150` | no | Random jitter added to the election timeout. |
