@@ -2303,11 +2303,13 @@ impl StateMachine {
     /// A snapshot of every counting semaphore on this shard (holders, free
     /// permits, wait queue). Sorted by key for deterministic output.
     pub fn semaphore_inventory(&self) -> Vec<SemaphoreState> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         let mut keys: Vec<String> = store.semaphores.keys().cloned().collect();
         keys.sort();
-        keys.iter().map(|k| store.semaphore_snapshot(k)).collect()
+        keys.iter()
+            .map(|k| store.semaphore_snapshot(k, now))
+            .collect()
     }
 
     /// Every named election with live leadership on this shard, sorted by name.
