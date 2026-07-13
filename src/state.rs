@@ -2315,11 +2315,12 @@ impl StateMachine {
     /// Every named election with live leadership on this shard, sorted by name.
     /// Callers fan this out across shards (elections route by name) and merge.
     pub fn election_inventory(&self) -> Vec<ElectionEntry> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         let mut out: Vec<ElectionEntry> = store
             .elections
             .iter()
+            .filter(|(_, leadership)| leadership.lease_expires_ms > now)
             .map(|(name, leadership)| ElectionEntry {
                 name: name.clone(),
                 leadership: leadership.clone(),
