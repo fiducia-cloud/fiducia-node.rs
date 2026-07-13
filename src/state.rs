@@ -2272,12 +2272,13 @@ impl StateMachine {
     /// inventory reflects only live state. Grants are sorted by fencing token and
     /// the queue by request time, so the output is deterministic for tests/diffs.
     pub fn lock_inventory(&self) -> LockInventory {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         let mut held: Vec<LockHolding> = store
             .locks
             .grants
             .values()
+            .filter(|g| g.lease_expires_ms > now)
             .map(|g| LockHolding {
                 holder: g.holder.clone(),
                 keys: g.keys.clone(),
