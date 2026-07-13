@@ -3995,7 +3995,9 @@ impl Store {
         }
     }
 
-    fn semaphore_snapshot(&self, key: &str) -> SemaphoreState {
+    /// Read view of one semaphore at `now`. Pure: expired permits are filtered
+    /// from the view but freed (and waiters admitted) only by `apply_at`.
+    fn semaphore_snapshot(&self, key: &str, now: u64) -> SemaphoreState {
         let Some(sem) = self.semaphores.get(key) else {
             return SemaphoreState {
                 key: key.to_string(),
@@ -4005,13 +4007,19 @@ impl Store {
                 wait_queue: Vec::new(),
             };
         };
+        let live = sem
+            .holders
+            .iter()
+            .filter(|slot| slot.lease_expires_ms > now)
+            .count() as u32;
         SemaphoreState {
             key: key.to_string(),
             limit: sem.limit,
-            available: sem.limit.saturating_sub(sem.holders.len() as u32),
+            available: sem.limit.saturating_sub(live),
             holders: sem
                 .holders
                 .iter()
+                .filter(|slot| slot.lease_expires_ms > now)
                 .map(|slot| SemaphoreHolder {
                     holder: slot.holder.clone(),
                     fencing_token: slot.fencing_token,
