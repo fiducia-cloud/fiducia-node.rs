@@ -933,7 +933,7 @@ pub struct ServiceSummary {
 }
 
 /// A scheduled job definition.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub name: String,
     pub cron: Option<String>,
