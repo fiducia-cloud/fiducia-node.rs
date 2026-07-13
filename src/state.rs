@@ -1110,7 +1110,7 @@ pub struct EffectState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EffectRecord {
     effect_type: String,
     payload: Value,
