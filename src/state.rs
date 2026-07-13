@@ -4612,6 +4612,15 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(80));
 
+        // Reads are pure: the lapsed permit is filtered from the view, but the
+        // waiter is admitted (and its fencing token minted) only by the next
+        // applied command — never off a read's wall clock.
+        let state = sm.semaphore_get("lease-pool");
+        assert!(state.holders.is_empty(), "expired permit reads as free");
+        assert_eq!(state.wait_queue.len(), 1, "waiter still queued");
+
+        let retry = semaphore_acquire(&sm, "lease-pool", "holder-2", 1, true);
+        assert_eq!(retry["acquired"], true);
         let state = sm.semaphore_get("lease-pool");
         assert_eq!(state.holders.len(), 1);
         assert_eq!(state.holders[0].holder, "holder-2");
