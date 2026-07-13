@@ -1136,11 +1136,28 @@ impl ShardActor {
         }
     }
 
-    /// Persist the full log after a conflicting suffix was truncated/replaced.
+    /// Persist the full log after a conflicting suffix was truncated/replaced,
+    /// or after compaction dropped the prefix at the snapshot base.
     fn persist_log_rewrite(&mut self) {
         if let Some(store) = self.store.as_mut() {
             if let Err(e) = store.rewrite(&self.log) {
                 tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist log rewrite");
+            }
+        }
+    }
+
+    /// Persist the state-machine snapshot at the current compaction base. Must
+    /// run **before** the log rewrite that truncates at that base, or a crash
+    /// between the two would lose the only copy of the folded prefix.
+    fn persist_snapshot(&mut self) {
+        if let Some(store) = self.store.as_ref() {
+            let snapshot = ShardSnapshot {
+                last_included_index: self.snapshot_base_index,
+                last_included_term: self.snapshot_base_term,
+                state: self.state.snapshot(),
+            };
+            if let Err(e) = store.save_snapshot(&snapshot) {
+                tracing::error!(shard = ?self.shard_id, error = %e, "raft: failed to persist snapshot");
             }
         }
     }
