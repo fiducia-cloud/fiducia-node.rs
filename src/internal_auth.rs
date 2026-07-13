@@ -35,7 +35,7 @@ use serde_json::json;
 pub const INTERNAL_AUTH_HEADER: &str = "x-fiducia-internal-auth";
 
 /// The configured secret, read once from `FIDUCIA_INTERNAL_SECRET`. `None` (unset
-/// or blank) disables the guard.
+/// or blank) fails closed unless the explicit local-development opt-out is set.
 static SECRET: OnceLock<Option<String>> = OnceLock::new();
 
 fn configured() -> &'static Option<String> {
@@ -90,7 +90,7 @@ pub fn init_and_log() {
     }
 }
 
-/// Axum middleware guarding an internal plane. A no-op when no secret is set.
+/// Axum middleware guarding an internal plane.
 pub async fn guard(request: Request, next: Next) -> Response {
     let provided = request
         .headers()

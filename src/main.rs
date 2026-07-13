@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        // The guard is a no-op when the secret is unset (dev / single-node).
+        // Missing auth fails closed unless local dev explicitly opts out.
         .nest("/v1", v1.layer(middleware::from_fn(internal_auth::guard)))
         .with_state(node.clone())
         // Hardening (outermost last): catch handler panics → 500 and cap body
