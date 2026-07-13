@@ -186,7 +186,11 @@ async fn deregister(
 /// keep a live view of the instance set instead of polling. (TTL-expiry removals
 /// surface on the next read/registration rather than as a push event.)
 async fn watch(State(node): State<Arc<Node>>, Path(service): Path<String>) -> Response {
-    let Some(rx) = node.watch(&service).await else {
+    // Service events are committed on the single SERVICE_DOMAIN shard (writes all
+    // route there), so subscribe to that shard's broadcast — not shard_for(service)
+    // — then filter to this service below. Watching the name-hashed shard would miss
+    // every event for services whose name doesn't hash to SERVICE_DOMAIN.
+    let Some(rx) = node.watch(crate::state::SERVICE_DOMAIN).await else {
         return Json(
             json!({ "error": "unavailable", "op": "discovery.watch", "service": service }),
         )
