@@ -329,6 +329,10 @@ impl Default for NodeConfig {
                     .unwrap_or_else(|_| "/var/lib/fiducia".to_string())
                     .into(),
             ),
+            compact_threshold: std::env::var("FIDUCIA_RAFT_COMPACT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_COMPACT_THRESHOLD),
         }
     }
 }
