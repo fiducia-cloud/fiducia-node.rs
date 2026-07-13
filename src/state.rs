@@ -1651,7 +1651,12 @@ impl ClaimRecord {
     }
 }
 
-#[derive(Default)]
+/// The whole applied state of one shard. Serializable so consensus can fold the
+/// applied log prefix into a snapshot (log compaction) and ship it to a lagging
+/// follower (InstallSnapshot). `#[serde(default)]` keeps old snapshots loadable
+/// when a new primitive adds a field.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Store {
     revision: u64,
     next_fencing_token: u64,
