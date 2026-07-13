@@ -21,6 +21,13 @@
 //!   * `log`  — newline-delimited JSON, one [`LogEntry`] per line, appended and
 //!     fsync'd. A trailing torn line (crash mid-append) is dropped on load and
 //!     the file is canonicalized so the next append starts from clean bytes.
+//!     With a snapshot present the log holds only entries **after** the
+//!     snapshot's `last_included_index`.
+//!   * `snapshot` — JSON [`ShardSnapshot`]: the serialized state machine at
+//!     `last_included_index`, written atomically like `meta`. Compaction writes
+//!     the snapshot **before** rewriting the log, so a crash between the two
+//!     leaves a log whose prefix merely duplicates the snapshot — recovery drops
+//!     any entry at or below the snapshot index.
 //!
 //! NOTE: fsync here is synchronous inside the shard actor's task — correctness
 //! over throughput for this build. A high-write deployment should move the log
