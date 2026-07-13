@@ -1548,9 +1548,13 @@ impl ShardActor {
             return;
         }
         let index = self.last_log_index() + 1;
+        // Stamp the proposer's clock into the entry: this is the time the state
+        // machine will apply at, on every replica and on every replay.
+        let ts_ms = self.stamp_next_entry();
         self.log.push(LogEntry {
             term: self.current_term,
             index,
+            ts_ms,
             command: Some(command),
         });
         // Durable before this entry can count toward a commit / be acked.
