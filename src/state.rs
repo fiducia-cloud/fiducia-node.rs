@@ -792,7 +792,7 @@ struct QueuedLock {
 
 /// The multi-key lock table: which member key is held by which grant, the grants
 /// themselves, and the FIFO wait queue of whole requests.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct LockManager {
     /// member key → owning grant's fencing token.
     held: HashMap<String, u64>,
