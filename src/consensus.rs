@@ -2835,6 +2835,7 @@ mod tests {
                 shard_count,
                 // In-memory: the loopback cluster tests don't touch disk.
                 data_dir: None,
+                compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             },
             Transport::loopback(reg.clone()),
         )
@@ -3097,6 +3098,7 @@ mod tests {
                 peers: vec![],
                 shard_count: 0,
                 data_dir: None,
+                compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             },
             Transport::loopback(reg),
         );
@@ -3121,6 +3123,7 @@ mod tests {
             peers: vec![],
             shard_count: 1,
             data_dir: Some(dir.clone()),
+            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
         };
 
         {
@@ -3582,6 +3585,7 @@ mod tests {
             Arc::new(Transport::loopback(reg)),
             tx,
             RaftTiming::default(),
+            DEFAULT_COMPACT_THRESHOLD,
             None,
             Recovered::default(),
         )
@@ -3728,6 +3732,7 @@ mod tests {
         a.log.push(LogEntry {
             term: 1,
             index: 1,
+            ts_ms: 0,
             command: None,
         });
         assert!(

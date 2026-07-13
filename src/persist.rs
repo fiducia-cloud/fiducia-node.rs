@@ -273,6 +273,7 @@ mod tests {
         LogEntry {
             term,
             index,
+            ts_ms: 0,
             command: Some(Command::KvPut {
                 key: key.to_string(),
                 value: "v".to_string(),

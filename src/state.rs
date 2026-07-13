@@ -4528,9 +4528,20 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(80));
 
+        // Reads are pure: the lapsed grant shows as free but the waiter is not
+        // promoted yet — promotion mints a fencing token, which must happen only
+        // through the replicated apply path, never off a read's wall clock.
+        let state = sm.lock_get("lease-key");
+        assert_eq!(state.holder, None, "expired grant reads as free");
+        assert_eq!(state.wait_queue.len(), 1, "waiter still queued");
+
+        // The waiter's next acquire poll (an applied command) drives the
+        // expiry + promotion and returns its grant idempotently.
+        let retry = acquire(&sm, &["lease-key"], "holder-2", true);
+        assert_eq!(retry["acquired"], true);
+        assert!(retry["fencing_token"].as_u64().unwrap() > token1);
         let state = sm.lock_get("lease-key");
         assert_eq!(state.holder.as_deref(), Some("holder-2"));
-        assert!(state.fencing_token.unwrap() > token1);
         assert!(state.wait_queue.is_empty());
     }
 
