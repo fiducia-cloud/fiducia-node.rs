@@ -67,18 +67,22 @@ pub fn router() -> Router<Arc<Node>> {
 /// `GET /v1/kv` — read a key, watch a key/prefix, or list a prefix, by query.
 async fn get_or_list(
     State(node): State<Arc<Node>>,
+    org: OrgScope,
     uri: Uri,
     Query(q): Query<KvParams>,
 ) -> Response {
     if q.watch.unwrap_or(false) {
         return match (q.key, q.prefix) {
-            (Some(key), _) => watch(node, key, false).await,
-            (None, Some(prefix)) => watch(node, prefix, true).await,
+            (Some(key), _) => watch(node, org.scope(&key), false, org).await,
+            (None, Some(prefix)) => watch(node, org.scope(&prefix), true, org).await,
             (None, None) => bad_request("watch requires `key` or `prefix`"),
         };
     }
     match q.key {
-        Some(key) => match node.query(ReadRequest::Kv { key: key.clone() }).await {
+        // The caller's key is namespaced into their org before it reaches the
+        // state machine; the response echoes the caller-facing key, not the scoped
+        // one, so the isolation is invisible to the client.
+        Some(key) => match node.query(ReadRequest::Kv { key: org.scope(&key) }).await {
             Ok(ReadResponse::Kv(Some(entry))) => {
                 Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
             }
@@ -88,7 +92,7 @@ async fn get_or_list(
             Err(err) => read_error_response(err, &uri),
             _ => Json(json!({ "error": "unavailable" })).into_response(),
         },
-        None => list(node, q.prefix.unwrap_or_default()).await,
+        None => list(node, org, q.prefix.unwrap_or_default()).await,
     }
 }
 
