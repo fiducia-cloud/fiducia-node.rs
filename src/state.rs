@@ -2135,12 +2135,12 @@ impl StateMachine {
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         let mut entries: Vec<_> = store
             .kv
             .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
+            .filter(|(key, entry)| key.starts_with(prefix) && kv_live(entry, now))
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -2148,33 +2148,38 @@ impl StateMachine {
     }
 
     pub fn lock_get(&self, key: &str) -> LockState {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.lock_snapshot(key)
+        let store = self.store.lock().unwrap();
+        store.lock_snapshot(key, now_ms())
     }
 
     pub fn semaphore_get(&self, key: &str) -> SemaphoreState {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.semaphore_snapshot(key)
+        let store = self.store.lock().unwrap();
+        store.semaphore_snapshot(key, now_ms())
     }
 
     pub fn rate_limit_get(&self, tenant: &str, key: &str) -> Option<RateLimitSnapshot> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
         store.rate_limit_snapshot(tenant, key)
     }
 
     pub fn idempotency_get(&self, key: &str) -> Option<IdempotencyRecord> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.idempotency.get(key).cloned()
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
+        store
+            .idempotency
+            .get(key)
+            .filter(|record| record.lease_expires_ms > now)
+            .cloned()
     }
 
     pub fn election_get(&self, name: &str) -> Option<Leadership> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.elections.get(name).cloned()
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
+        store
+            .elections
+            .get(name)
+            .filter(|leadership| leadership.lease_expires_ms > now)
+            .cloned()
     }
 
     pub fn schedule_get(&self, name: &str) -> Option<Schedule> {
