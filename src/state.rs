@@ -822,7 +822,7 @@ pub struct SemaphoreHolder {
     pub lease_expires_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SemaphoreSlot {
     holder: String,
     fencing_token: u64,
