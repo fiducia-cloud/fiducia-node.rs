@@ -1708,9 +1708,25 @@ impl StateMachine {
         }
     }
 
+    /// Apply a command using the local wall clock. Convenience for single-process
+    /// callers and tests; the replicated path must use [`Self::apply_at`] with the
+    /// leader-stamped entry time so every replica (and every restart replay)
+    /// computes identical state.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply(&self, command: Command) -> ApplyResult {
+        self.apply_at(command, now_ms())
+    }
+
+    /// Apply a committed command at a fixed timestamp.
+    ///
+    /// `now` must come from the replicated log entry (stamped once by the
+    /// proposing leader), **never** from the local clock: lease expiry, waiter
+    /// promotion, and TTL arithmetic all key off it, so feeding in replay-time or
+    /// per-replica wall clocks would resurrect expired leases on restart and let
+    /// replicas diverge. This is the same rule `ScheduleUpsert` already followed
+    /// by carrying `now_ms` in the command, generalized to every primitive.
+    pub fn apply_at(&self, command: Command, now: u64) -> ApplyResult {
         let mut store = self.store.lock().unwrap();
-        let now = now_ms();
         store.expire_due(now);
         store.revision += 1;
         let revision = store.revision;
