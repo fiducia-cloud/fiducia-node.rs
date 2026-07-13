@@ -1263,7 +1263,7 @@ pub struct DecisionState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionVoteRecord {
     option: Option<String>,
     confidence: f32,
