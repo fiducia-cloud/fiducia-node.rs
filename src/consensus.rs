@@ -1522,6 +1522,82 @@ impl ShardActor {
         }
     }
 
+    /// A follower receiving the leader's snapshot: jump the state machine
+    /// straight to `last_included_index`, because the leader compacted away the
+    /// log entries this replica still needs. Keeps any log suffix consistent
+    /// with the snapshot boundary; conflicting or unverifiable suffixes are
+    /// dropped (the snapshot supersedes them).
+    fn handle_install_snapshot(&mut self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        // Reject a stale leader.
+        if req.term < self.current_term {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+            };
+        }
+        if req.term > self.current_term {
+            self.current_term = req.term;
+            self.voted_for = None;
+            self.persist_hard_state();
+        }
+        self.become_follower_of(req.leader_id.clone());
+
+        // Already at or past this snapshot ⇒ ack without installing (it is stale
+        // to us); the ack lets the leader advance to normal log replication.
+        if req.last_included_index <= self.commit_index {
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: true,
+            };
+        }
+
+        // Decide the fate of our live log **before** touching state: keep the
+        // suffix beyond the boundary when the boundary entry matches, else the
+        // whole log is superseded by the snapshot.
+        let boundary_matches = req.last_included_index <= self.last_log_index()
+            && self.term_at(req.last_included_index) == req.last_included_term;
+
+        if let Err(e) = self.state.restore(req.data) {
+            tracing::error!(
+                shard = ?self.shard_id,
+                error = %e,
+                "raft: InstallSnapshot payload failed to restore — not installed"
+            );
+            return InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+            };
+        }
+        if boundary_matches {
+            let drop = (req.last_included_index - self.snapshot_base_index) as usize;
+            self.log.drain(..drop);
+        } else {
+            self.log.clear();
+        }
+        self.snapshot_base_index = req.last_included_index;
+        self.snapshot_base_term = req.last_included_term;
+        self.commit_index = req.last_included_index;
+        self.last_applied = req.last_included_index;
+        tracing::info!(
+            shard = ?self.shard_id,
+            node = %self.node_id,
+            last_included_index = req.last_included_index,
+            kept_log_suffix = boundary_matches,
+            "raft: installed leader snapshot (was behind the compacted log base)"
+        );
+
+        // Durable before we ack: snapshot first, then the truncated log, then
+        // the advanced commit pointer (same ordering as compaction).
+        self.persist_snapshot();
+        self.persist_log_rewrite();
+        self.persist_hard_state();
+
+        InstallSnapshotResp {
+            term: self.current_term,
+            success: true,
+        }
+    }
+
     fn become_follower_of(&mut self, leader: String) {
         self.record_leader_transfer(self.role, Role::Follower, "append_entries");
         self.role = Role::Follower;
