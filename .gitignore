@@ -12,3 +12,10 @@
 
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/
+
+# --- hardened baseline (auto) ---
+Thumbs.db
+*.swp
+*~
+.direnv/
+target/

@@ -27,6 +27,7 @@ mod locks;
 mod metrics;
 mod observe;
 mod org_scope;
+mod peer_config;
 mod persist;
 mod raft_api;
 mod rate_limit;
@@ -62,18 +63,10 @@ const SERVICE: &str = "fiducia-node";
 /// `watch` streams and blocking lock acquires are long-lived by design.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// Body cap for the **peer** plane (`/raft`). Unlike a client write, an
-/// `InstallSnapshot` carries an entire shard's state-machine image and an
-/// `AppendEntries` can carry the whole retained log suffix (up to the
-/// compaction threshold of entries, each holding a near-`MAX_BODY_BYTES`
-/// value). Capping peers at `MAX_BODY_BYTES` would make a follower that fell
-/// behind unrecoverable the moment a shard's state outgrew 1 MiB: every
-/// snapshot install would 413 and replication would stall forever. Peers are
-/// authenticated by the internal-secret guard (which rejects before reading
-/// the body), so the larger cap is not exposed to untrusted callers; it still
-/// bounds a misbehaving peer.
-const MAX_PEER_BODY_BYTES: usize = 256 * 1024 * 1024;
-
+// The peer body cap is configured separately in `peer_config`. AppendEntries
+// stays well below it through bounded batches, while snapshots get a longer
+// request timeout and an explicit, documented operational ceiling. Peers are
+// authenticated by the internal-secret guard before JSON extraction.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
@@ -146,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new());
 
+    let max_peer_body_bytes = peer_config::max_body_bytes();
     let peer_app = Router::new()
         // A health route on the peer port too, so the peer listener can be probed.
         .route("/healthz", get(health))
@@ -158,8 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Both caps must be raised: tower-http's layer AND axum's built-in
         // `DefaultBodyLimit` (2 MiB), which `Json` extraction enforces
         // independently and which would otherwise 413 large snapshots.
-        .layer(RequestBodyLimitLayer::new(MAX_PEER_BODY_BYTES))
-        .layer(DefaultBodyLimit::max(MAX_PEER_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(max_peer_body_bytes))
+        .layer(DefaultBodyLimit::max(max_peer_body_bytes))
         .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
@@ -190,14 +184,7 @@ async fn health() -> Json<Value> {
 
 async fn readiness(State(node): State<Arc<Node>>) -> Response {
     let status = node.status().await;
-    let storage_faulted_shards: Vec<_> = status
-        .shards
-        .iter()
-        .filter(|shard| !shard.storage_healthy)
-        .map(|shard| shard.shard_id)
-        .collect();
-    let all_shards_running = status.shards.len() == status.shard_count as usize;
-    let ready = all_shards_running && storage_faulted_shards.is_empty();
+    let (ready, all_shards_running, storage_faulted_shards) = readiness_state(&status);
     let status_code = if ready {
         StatusCode::OK
     } else {
@@ -209,10 +196,25 @@ async fn readiness(State(node): State<Arc<Node>>) -> Response {
             "status": if ready { "ok" } else { "unavailable" },
             "service": SERVICE,
             "all_shards_running": all_shards_running,
+            "unresponsive_shards": status.unresponsive_shards,
             "storage_faulted_shards": storage_faulted_shards,
         })),
     )
         .into_response()
+}
+
+fn readiness_state(status: &consensus::NodeStatus) -> (bool, bool, Vec<consensus::ShardId>) {
+    let storage_faulted_shards: Vec<_> = status
+        .shards
+        .iter()
+        .filter(|shard| !shard.storage_healthy)
+        .map(|shard| shard.shard_id)
+        .collect();
+    let all_shards_running = status.hosted_shards.len() == status.shard_count as usize
+        && status.unresponsive_shards.is_empty()
+        && status.shards.len() == status.hosted_shards.len();
+    let ready = all_shards_running && storage_faulted_shards.is_empty();
+    (ready, all_shards_running, storage_faulted_shards)
 }
 
 /// `GET /v1/status` — per-shard consensus status for this node.
@@ -297,9 +299,11 @@ mod peer_plane_limit_tests {
         let app = Router::new()
             .nest("/raft", crate::raft_api::router())
             .with_state(node)
-            .layer(RequestBodyLimitLayer::new(super::MAX_PEER_BODY_BYTES))
+            .layer(RequestBodyLimitLayer::new(
+                crate::peer_config::DEFAULT_MAX_BODY_BYTES,
+            ))
             .layer(axum::extract::DefaultBodyLimit::max(
-                super::MAX_PEER_BODY_BYTES,
+                crate::peer_config::DEFAULT_MAX_BODY_BYTES,
             ));
 
         // Build a genuine >1 MiB state-machine image (a committed 2 MiB value).
@@ -346,5 +350,35 @@ mod peer_plane_limit_tests {
         assert_eq!(resp.match_index, 5);
 
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    #[tokio::test]
+    async fn missing_or_storage_faulted_shards_are_not_ready() {
+        let node = crate::test_support::node(2);
+        let healthy = node.status().await;
+        assert_eq!(super::readiness_state(&healthy), (true, true, vec![]));
+
+        let mut missing = healthy.clone();
+        missing.shards.pop();
+        assert_eq!(super::readiness_state(&missing), (false, false, vec![]));
+
+        let mut unresponsive = healthy.clone();
+        unresponsive
+            .unresponsive_shards
+            .push(unresponsive.shards[0].shard_id);
+        assert_eq!(
+            super::readiness_state(&unresponsive),
+            (false, false, vec![])
+        );
+
+        let mut faulted = healthy;
+        faulted.shards[0].storage_healthy = false;
+        assert_eq!(
+            super::readiness_state(&faulted),
+            (false, true, vec![faulted.shards[0].shard_id])
+        );
     }
 }

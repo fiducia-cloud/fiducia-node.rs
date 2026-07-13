@@ -45,7 +45,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, Instant};
 
 use crate::persist::{PersistedSnapshot, Recovered, ShardStore};
@@ -69,6 +69,9 @@ pub use fiducia_routing::ShardId;
 const SHARD_INBOX_CAPACITY: usize = 1024;
 /// How long a client write waits for its entry to commit before giving up.
 const COMMIT_WAIT: Duration = Duration::from_secs(5);
+/// Bound local actor-status collection so `/readyz` fails unavailable instead
+/// of hanging behind a wedged/full shard inbox.
+const STATUS_WAIT: Duration = Duration::from_secs(1);
 /// Capacity of each shard's change-event broadcast (feeds KV watches).
 const CHANGE_BUFFER: usize = 256;
 
@@ -563,6 +566,32 @@ pub struct ShardMetrics {
     pub follower_lag_max: u64,
     /// Observed leadership changes into or out of leader role on this shard.
     pub leader_transfer_count: u64,
+}
+
+/// Build the next contiguous AppendEntries batch without exceeding the
+/// configured entry count or target serialized size. A single oversized entry
+/// is still returned because the Raft log cannot split one command; the shared
+/// peer-body preflight remains the final hard ceiling for that case.
+fn bounded_append_request(
+    mut request: AppendEntriesReq,
+    suffix: &[LogEntry],
+    max_entries: usize,
+    max_bytes: usize,
+) -> AppendEntriesReq {
+    request.entries.clear();
+    for entry in suffix.iter().take(max_entries.max(1)) {
+        request.entries.push(entry.clone());
+        let body_bytes = serde_json::to_vec(&request)
+            .map(|body| body.len())
+            .unwrap_or(usize::MAX);
+        if body_bytes > max_bytes.max(1) {
+            if request.entries.len() > 1 {
+                request.entries.pop();
+            }
+            break;
+        }
+    }
+    request
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,21 +1240,35 @@ impl ShardActor {
 
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
-        let entries: Vec<LogEntry> = self
-            .log
-            .iter()
-            .skip(prev_log_index.saturating_sub(self.snapshot_index) as usize)
-            .cloned()
-            .collect();
-        let up_to = self.last_log_index();
-        let req = AppendEntriesReq {
-            term: self.current_term,
-            leader_id: self.node_id.clone(),
-            prev_log_index,
-            prev_log_term,
-            entries,
-            leader_commit: self.commit_index,
-        };
+        let max_entries = crate::peer_config::append_max_entries();
+        let max_bytes = crate::peer_config::append_max_bytes();
+        let suffix_start = prev_log_index.saturating_sub(self.snapshot_index) as usize;
+        let req = bounded_append_request(
+            AppendEntriesReq {
+                term: self.current_term,
+                leader_id: self.node_id.clone(),
+                prev_log_index,
+                prev_log_term,
+                entries: Vec::new(),
+                leader_commit: self.commit_index,
+            },
+            self.log.get(suffix_start..).unwrap_or(&[]),
+            max_entries,
+            max_bytes,
+        );
+        let up_to = prev_log_index.saturating_add(req.entries.len() as u64);
+        if req.entries.len() == 1
+            && serde_json::to_vec(&req)
+                .map(|body| body.len() > max_bytes)
+                .unwrap_or(true)
+        {
+            tracing::warn!(
+                shard = self.shard_id,
+                peer,
+                max_bytes,
+                "single Raft log entry exceeds append batch target"
+            );
+        }
 
         let transport = self.transport.clone();
         let self_tx = self.self_tx.clone();
@@ -1279,14 +1322,19 @@ impl ShardActor {
         if self.role != Role::Leader || resp.term != self.current_term {
             return;
         }
+        let leader_last_log_index = self.last_log_index();
+        let successful = resp.success && resp.match_index >= up_to;
         let mut more = false;
         if let Some(ls) = self.leader.as_mut() {
             // Any reply at our term is proof this peer still sees us as leader —
             // refresh the lease clock regardless of log success/mismatch.
             ls.last_contact.insert(from.clone(), Instant::now());
-            if resp.success {
-                ls.match_index.insert(from.clone(), up_to);
-                ls.next_index.insert(from.clone(), up_to + 1);
+            if successful {
+                let matched = ls.match_index.get(&from).copied().unwrap_or(0).max(up_to);
+                ls.match_index.insert(from.clone(), matched);
+                ls.next_index
+                    .insert(from.clone(), matched.saturating_add(1));
+                more = matched < leader_last_log_index;
             } else {
                 // Log mismatch: rewind and retry from an earlier index.
                 let cur = ls.next_index.get(&from).copied().unwrap_or(1);
@@ -1298,7 +1346,7 @@ impl ShardActor {
                 more = true;
             }
         }
-        if resp.success {
+        if successful {
             self.maybe_advance_commit();
         }
         self.refresh_follower_lag_metric();
@@ -2676,16 +2724,34 @@ impl Node {
     /// Per-shard consensus status across all shards this node hosts.
     pub async fn status(&self) -> NodeStatus {
         let mut shards: Vec<ShardStatus> = Vec::with_capacity(self.shards.len());
-        for tx in self.shards.values() {
-            let (resp, rx) = oneshot::channel();
-            if tx.send(ShardMsg::Status { resp }).await.is_ok() {
-                if let Ok(status) = rx.await {
-                    shards.push(status);
+        let mut hosted_shards: Vec<ShardId> = self.shards.keys().copied().collect();
+        hosted_shards.sort_unstable();
+        let mut unresponsive_shards = Vec::new();
+        let mut requests = JoinSet::new();
+        for (&shard_id, tx) in &self.shards {
+            let tx = tx.clone();
+            requests.spawn(async move {
+                let status = tokio::time::timeout(STATUS_WAIT, async move {
+                    let (resp, rx) = oneshot::channel();
+                    tx.send(ShardMsg::Status { resp }).await.ok()?;
+                    rx.await.ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                (shard_id, status)
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            if let Ok((shard_id, status)) = result {
+                match status {
+                    Some(status) => shards.push(status),
+                    None => unresponsive_shards.push(shard_id),
                 }
             }
         }
         shards.sort_by_key(|s| s.shard_id);
-        let hosted_shards: Vec<ShardId> = shards.iter().map(|s| s.shard_id).collect();
+        unresponsive_shards.sort_unstable();
         let leading_shards: Vec<ShardId> = shards
             .iter()
             .filter(|s| s.role == Role::Leader)
@@ -2702,6 +2768,7 @@ impl Node {
             shard_count: self.config.shard_count,
             timing: RaftTiming::from_env(),
             hosted_shards,
+            unresponsive_shards,
             leader_count: leading_shards.len(),
             follower_count: following_shards.len(),
             leading_shards,
@@ -2837,6 +2904,10 @@ pub struct NodeStatus {
     pub timing: RaftTiming,
     /// Shards for which this node hosts a local actor.
     pub hosted_shards: Vec<ShardId>,
+    /// Hosted shard actors that did not answer the bounded status probe. These
+    /// remain hosted; reporting them separately prevents a wedged actor from
+    /// disappearing from inventory or producing an all-healthy rollup.
+    pub unresponsive_shards: Vec<ShardId>,
     /// Count of hosted shards for which this node is currently leader.
     pub leader_count: usize,
     /// Count of hosted shards for which this node is currently follower.
@@ -3044,6 +3115,56 @@ mod tests {
             ttl_ms: None,
             prev_revision: None,
         }
+    }
+
+    #[test]
+    fn append_batches_respect_count_and_wire_size_without_dropping_an_entry() {
+        let entries: Vec<_> = (1..=4)
+            .map(|index| LogEntry {
+                term: 3,
+                index,
+                proposed_at_ms: 1,
+                command: Some(put(&format!("k-{index}"), &"v".repeat(512))),
+            })
+            .collect();
+        let request = || AppendEntriesReq {
+            term: 3,
+            leader_id: "leader".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
+
+        let by_count = bounded_append_request(request(), &entries, 2, usize::MAX);
+        assert_eq!(by_count.entries.len(), 2);
+        assert_eq!(by_count.entries[0].index, 1);
+        assert_eq!(by_count.entries[1].index, 2);
+
+        let one = bounded_append_request(request(), &entries, 1, usize::MAX);
+        let one_bytes = serde_json::to_vec(&one).unwrap().len();
+        let by_size = bounded_append_request(request(), &entries, 4, one_bytes);
+        assert_eq!(by_size.entries.len(), 1);
+        assert!(serde_json::to_vec(&by_size).unwrap().len() <= one_bytes);
+
+        // A single command is indivisible: return it and let the transport's
+        // absolute peer-body preflight decide whether it can be sent.
+        let indivisible = bounded_append_request(request(), &entries, 4, 1);
+        assert_eq!(indivisible.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_keeps_unresponsive_shards_in_hosted_inventory() {
+        let reg = LoopbackRegistry::new();
+        let n = node("status-node", &[], 2, &reg);
+        n.tasks[0].abort();
+        tokio::task::yield_now().await;
+
+        let status = n.status().await;
+        assert_eq!(status.hosted_shards, vec![0, 1]);
+        assert_eq!(status.unresponsive_shards, vec![0]);
+        assert_eq!(status.shards.len(), 1);
+        assert_eq!(status.shards[0].shard_id, 1);
     }
 
     async fn leader_of(nodes: &[&Node], shard: ShardId) -> Option<usize> {
@@ -4090,6 +4211,35 @@ mod tests {
         }
         a.leader = Some(ls);
         a
+    }
+
+    #[tokio::test]
+    async fn successful_partial_append_immediately_schedules_the_next_batch() {
+        let mut actor = leader_actor();
+        actor.log = (1..=3)
+            .map(|index| LogEntry {
+                term: actor.current_term,
+                index,
+                proposed_at_ms: index,
+                command: None,
+            })
+            .collect();
+
+        actor.handle_append_reply(
+            "b".to_string(),
+            1,
+            Some(1),
+            Some(AppendEntriesResp {
+                term: actor.current_term,
+                success: true,
+                match_index: 1,
+            }),
+        );
+
+        let leader = actor.leader.as_ref().unwrap();
+        assert_eq!(leader.match_index.get("b"), Some(&1));
+        assert_eq!(leader.next_index.get("b"), Some(&2));
+        assert_eq!(leader.in_flight.get("b"), Some(&true));
     }
 
     /// CheckQuorum/leader-lease: a leader holds the lease only while a *majority*

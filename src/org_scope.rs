@@ -36,18 +36,21 @@ pub const ORG_HEADER: &str = "x-fiducia-org-id";
 /// Max bytes for an org id (matches the `orgs.slug`/id column bounds).
 const MAX_ORG_BYTES: usize = 128;
 
-/// SOH byte used to fence the trusted org prefix. Caller input is always appended
-/// after the complete prefix, so even an input containing SOH cannot escape it.
-const DELIM: char = '\u{1}';
-
 /// A validated org scope, attached to every state-touching `/v1` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgScope(pub String);
 
 impl OrgScope {
     /// Namespace a caller-supplied key into this org's private keyspace.
+    ///
+    /// The format (`\x01<org>\x01<key>`) lives in the shared `fiducia-routing`
+    /// crate because the scoped key is what the state machine routes on: the LB
+    /// must hash the same scoped key to send a request to the right shard, so
+    /// node and LB must share one definition, not two copies. Caller input is
+    /// always appended after the complete trusted prefix, so even an input
+    /// containing the SOH delimiter cannot escape into another org.
     pub fn scope(&self, key: &str) -> String {
-        format!("{DELIM}{}{DELIM}{key}", self.0)
+        fiducia_routing::org_scoped_key(&self.0, key)
     }
 
     /// Recover the caller-facing key from a namespaced one, if it belongs to this
@@ -56,7 +59,7 @@ impl OrgScope {
     /// `scope("")` yields this org's list-prefix, so a prefix scan is just
     /// `scope(&caller_prefix)`.
     pub fn unscope<'a>(&self, scoped: &'a str) -> Option<&'a str> {
-        scoped.strip_prefix(&format!("{DELIM}{}{DELIM}", self.0))
+        scoped.strip_prefix(&fiducia_routing::org_scope_prefix(&self.0))
     }
 
     pub fn scope_all(&self, keys: impl IntoIterator<Item = String>) -> Vec<String> {
