@@ -17,12 +17,13 @@ use axum::{
 };
 
 use crate::consensus::{Node, ShardId};
-use crate::transport::{AppendEntriesReq, RequestVoteReq};
+use crate::transport::{AppendEntriesReq, InstallSnapshotReq, RequestVoteReq};
 
 pub fn router() -> Router<Arc<Node>> {
     Router::new()
         .route("/:shard/append", post(append))
         .route("/:shard/vote", post(vote))
+        .route("/:shard/snapshot", post(snapshot))
 }
 
 /// `POST /raft/{shard}/append` — replicate log entries / heartbeat.
