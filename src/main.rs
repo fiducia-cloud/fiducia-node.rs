@@ -155,7 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_state(node)
         .layer(TraceLayer::new_for_http())
+        // Both caps must be raised: tower-http's layer AND axum's built-in
+        // `DefaultBodyLimit` (2 MiB), which `Json` extraction enforces
+        // independently and which would otherwise 413 large snapshots.
         .layer(RequestBodyLimitLayer::new(MAX_PEER_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_PEER_BODY_BYTES))
         .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
