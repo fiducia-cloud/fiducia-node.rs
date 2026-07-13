@@ -773,7 +773,7 @@ pub struct LockInventory {
 }
 
 /// One held union-lock acquisition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LockGrant {
     holder: String,
     keys: Vec<String>,
