@@ -602,7 +602,7 @@ pub struct KvEntry {
 /// A distributed counter: a signed 64-bit value with a monotonic revision, used
 /// for success/failure thresholds, quotas, and fan-in tallies. Every mutation
 /// stamps `mod_revision`, so callers can compare-and-set against a known value.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterEntry {
     pub value: i64,
     pub mod_revision: u64,
