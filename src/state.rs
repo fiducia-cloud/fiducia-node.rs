@@ -6056,4 +6056,118 @@ mod tests {
             assert_eq!(command.routing_key(), SERVICE_DOMAIN);
         }
     }
+
+    // --- deterministic apply time + snapshot/restore (fiducia-node #8) -------
+
+    /// Replaying the same commands at the same stamped times must produce the
+    /// same state — including that a lease which expired before the "restart"
+    /// stays expired instead of being refreshed relative to replay time. This is
+    /// the state-machine half of the replay-resurrection fix; consensus stamps
+    /// each log entry with the proposer's clock and replays through `apply_at`.
+    #[test]
+    fn apply_at_replay_does_not_resurrect_expired_leases() {
+        let commands = |sm: &StateMachine| {
+            sm.apply_at(
+                Command::IdempotencyClaim {
+                    key: "req-1".to_string(),
+                    owner: "worker-a".to_string(),
+                    ttl_ms: 500,
+                    retention_ms: None,
+                    metadata: HashMap::new(),
+                },
+                1_000, // claimed at t=1s, lease until t=1.5s
+            );
+            sm.apply_at(
+                Command::LockAcquire {
+                    keys: vec!["orders".to_string()],
+                    holder: "holder-1".to_string(),
+                    ttl_ms: 500,
+                    wait: false,
+                },
+                1_100,
+            );
+        };
+
+        let original = StateMachine::new();
+        commands(&original);
+        // "Restart" much later: a replica rebuilds by replaying the log with the
+        // SAME stamps, regardless of what its wall clock says now.
+        let replayed = StateMachine::new();
+        commands(&replayed);
+        assert_eq!(
+            serde_json::to_string(&original.snapshot()).unwrap(),
+            serde_json::to_string(&replayed.snapshot()).unwrap(),
+            "replay at stamped times must reproduce identical state"
+        );
+
+        // A command committed after the leases lapsed expires them on every
+        // replica identically — and a NEW claim wins (no duplicate replay).
+        let reclaim = replayed.apply_at(
+            Command::IdempotencyClaim {
+                key: "req-1".to_string(),
+                owner: "worker-b".to_string(),
+                ttl_ms: 500,
+                retention_ms: None,
+                metadata: HashMap::new(),
+            },
+            10_000, // long after the t=1.5s lease expiry
+        );
+        assert_eq!(reclaim.output["claimed"], true);
+        assert_eq!(
+            reclaim.output["duplicate"], false,
+            "an expired claim must not resurrect as a duplicate after replay"
+        );
+    }
+
+    /// A snapshot must capture the whole store — grants, FIFO wait queues,
+    /// fencing-token counter, stored idempotency results — so a restore behaves
+    /// exactly like the original, including minting strictly higher tokens.
+    #[test]
+    fn snapshot_restore_round_trips_locks_queues_and_token_counter() {
+        let sm = StateMachine::new();
+        let first = acquire(&sm, &["a", "b"], "holder-1", false);
+        let token1 = first["fencing_token"].as_u64().unwrap();
+        assert_eq!(acquire(&sm, &["b"], "holder-2", true)["queued"], true);
+        let claim = sm.apply(Command::IdempotencyClaim {
+            key: "req-9".to_string(),
+            owner: "worker-a".to_string(),
+            ttl_ms: 60_000,
+            retention_ms: Some(120_000),
+            metadata: HashMap::new(),
+        });
+        sm.apply(Command::IdempotencyComplete {
+            key: "req-9".to_string(),
+            owner: "worker-a".to_string(),
+            fencing_token: claim.output["fencing_token"].as_u64().unwrap(),
+            result: Some(json!({ "status": 201 })),
+        });
+
+        let restored = StateMachine::new();
+        restored.restore(sm.snapshot()).expect("restore snapshot");
+
+        // Stored result replays for duplicates.
+        let record = restored.idempotency_get("req-9").expect("record");
+        assert_eq!(record.status, IdempotencyStatus::Completed);
+        assert_eq!(record.result, Some(json!({ "status": 201 })));
+
+        // The wait queue and the token counter survived: releasing the original
+        // grant promotes holder-2 with a STRICTLY higher token.
+        let release = restored.apply(Command::LockRelease {
+            holder: "holder-1".to_string(),
+            fencing_token: token1,
+        });
+        assert_eq!(release.output["released"], true);
+        let promoted_token = release.output["promoted"][0]["fencing_token"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            promoted_token > token1,
+            "restored token counter must keep minting strictly higher tokens"
+        );
+        assert_eq!(
+            restored.lock_get("b").holder.as_deref(),
+            Some("holder-2"),
+            "restored FIFO queue must promote in order"
+        );
+    }
 }
