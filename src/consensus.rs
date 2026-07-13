@@ -1459,8 +1459,13 @@ impl ShardActor {
         }
         self.become_follower_of(req.leader_id.clone());
 
-        // Log-consistency check at prev_log_index.
-        if req.prev_log_index > 0 && self.term_at(req.prev_log_index) != req.prev_log_term {
+        // Log-consistency check at prev_log_index. Indices at or below our
+        // snapshot base are committed on a quorum and identical on every member
+        // (that is what allowed them to be folded into a snapshot), so the check
+        // passes there by construction.
+        if req.prev_log_index > self.snapshot_base_index
+            && self.term_at(req.prev_log_index) != req.prev_log_term
+        {
             return AppendEntriesResp {
                 term: self.current_term,
                 success: false,
@@ -1471,16 +1476,22 @@ impl ShardActor {
             };
         }
 
-        // Append, truncating on the first conflicting term.
+        // Append, truncating on the first conflicting term. Entries at or below
+        // the snapshot base are already folded into our snapshot — skip them.
         let mut idx = req.prev_log_index;
         let mut truncated = false;
         let mut grew = false;
         for entry in req.entries {
             idx += 1;
-            match self.log.get((idx - 1) as usize) {
+            if idx <= self.snapshot_base_index {
+                continue;
+            }
+            self.last_entry_ts = self.last_entry_ts.max(entry.ts_ms);
+            let pos = (idx - self.snapshot_base_index - 1) as usize;
+            match self.log.get(pos) {
                 Some(existing) if existing.term == entry.term => {} // already have it
                 Some(_) => {
-                    self.log.truncate((idx - 1) as usize);
+                    self.log.truncate(pos);
                     self.log.push(entry);
                     truncated = true;
                 }
