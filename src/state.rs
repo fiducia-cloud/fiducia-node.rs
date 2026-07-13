@@ -1168,7 +1168,7 @@ pub struct HandoffState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HandoffRecord {
     resource: String,
     from: String,
