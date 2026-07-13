@@ -2213,12 +2213,18 @@ impl StateMachine {
     }
 
     pub fn service_list(&self, service: &str) -> Vec<ServiceInstance> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let store = self.store.lock().unwrap();
+        let now = now_ms();
         store
             .services
             .get(service)
-            .map(|instances| instances.values().cloned().collect())
+            .map(|instances| {
+                instances
+                    .values()
+                    .filter(|instance| instance.lease_expires_ms > now)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
