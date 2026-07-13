@@ -4060,6 +4060,11 @@ fn rate_limit_store_key(tenant: &str, key: &str) -> String {
     format!("{tenant}:{key}")
 }
 
+/// Whether a KV entry is live at `now` (no TTL, or TTL not yet passed).
+fn kv_live(entry: &KvEntry, now: u64) -> bool {
+    entry.expires_at_ms.map(|e| e > now).unwrap_or(true)
+}
+
 /// Sort + dedup a key set so `{A,B}` and `{B,A,B}` are the same union, and so
 /// conflict/grant checks are order-independent.
 fn canonical_keys(keys: &[String]) -> Vec<String> {
