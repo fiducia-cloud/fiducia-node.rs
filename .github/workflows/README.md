@@ -9,8 +9,10 @@ full commit SHA.
   uses Rust 1.95.0, and installs cargo-audit 0.21.2 from its locked graph.
 - `docker.yml` — on merge to `main`: build and push the non-root container image
   with immutable sibling refs, an SBOM, and maximum provenance attestations.
-- `deploy-test.yml` — secret-gated deploy to the `fiducia-test` namespace;
-  a no-op (validation only) when `KUBE_CONFIG_TEST` is absent, but a configured
-  deployment fails the job if `kubectl` cannot update the target.
+- `deploy-test.yml` — fail-closed deploy to the `fiducia-test` namespace. It
+  requires a nonblank base64-encoded `KUBE_CONFIG_TEST`, installs it mode 0600,
+  updates the immutable commit-tagged image, and waits for the deployment
+  rollout to succeed. Missing credentials, invalid kubeconfig data, update
+  errors, and rollout failures all fail the job.
 - `cli-flags.yml` — audits `.cli-flags.toml` with the pinned `flags2env`
   submodule whenever the CLI flag schema, scripts, or submodule change.

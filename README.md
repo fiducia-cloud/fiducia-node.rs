@@ -369,11 +369,11 @@ projects, users, API keys, audit, and billing—not the coordination store.
 ## Run locally
 
 ```bash
-FIDUCIA_INTERNAL_SECRET=dev-secret cargo run  # listens on :8090 (override PORT)
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run --locked  # listens on :8090 (override PORT)
 # Single node (default): leads every shard from t=0.
 # A real group:
 #   FIDUCIA_INTERNAL_SECRET=shared-secret FIDUCIA_NODE_ID=node-a:9090 \
-#     FIDUCIA_PEERS=node-b:9090,node-c:9090 cargo run
+#     FIDUCIA_PEERS=node-b:9090,node-c:9090 cargo run --locked
 curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8090/v1/status
 ```
 
@@ -428,10 +428,10 @@ with a shared cluster secret and **fails closed**:
 
 ```bash
 # Insecure local mode — no cluster secret, boundary explicitly disabled:
-FIDUCIA_ALLOW_INSECURE_INTERNAL=1 cargo run    # listens on :8090 (override PORT)
+FIDUCIA_ALLOW_INSECURE_INTERNAL=1 cargo run --locked    # listens on :8090 (override PORT)
 
 # Or exercise the real posture locally by setting a secret and sending it:
-FIDUCIA_INTERNAL_SECRET=dev-secret cargo run
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run --locked
 curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8090/v1/status
 ```
 
@@ -450,7 +450,7 @@ schema, exports the resulting env map, then execs the command:
 make -B -C vendor/flags-2-env all
 # Derive FIDUCIA_* from flags, then run the node:
 scripts/with-flags2env.sh --node-id node-a:9090 --peers node-b:9090,node-c:9090 \
-  --shard-count 16 -- cargo run
+  --shard-count 16 -- cargo run --locked
 # Audit the schema (also run in CI by .github/workflows/cli-flags.yml):
 vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 ```
