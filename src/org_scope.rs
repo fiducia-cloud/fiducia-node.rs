@@ -36,18 +36,21 @@ pub const ORG_HEADER: &str = "x-fiducia-org-id";
 /// Max bytes for an org id (matches the `orgs.slug`/id column bounds).
 const MAX_ORG_BYTES: usize = 128;
 
-/// SOH byte used to fence the trusted org prefix. Caller input is always appended
-/// after the complete prefix, so even an input containing SOH cannot escape it.
-const DELIM: char = '\u{1}';
-
 /// A validated org scope, attached to every state-touching `/v1` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgScope(pub String);
 
 impl OrgScope {
     /// Namespace a caller-supplied key into this org's private keyspace.
+    ///
+    /// The format (`\x01<org>\x01<key>`) lives in the shared `fiducia-routing`
+    /// crate because the scoped key is what the state machine routes on: the LB
+    /// must hash the same scoped key to send a request to the right shard, so
+    /// node and LB must share one definition, not two copies. Caller input is
+    /// always appended after the complete trusted prefix, so even an input
+    /// containing the SOH delimiter cannot escape into another org.
     pub fn scope(&self, key: &str) -> String {
-        format!("{DELIM}{}{DELIM}{key}", self.0)
+        fiducia_routing::org_scoped_key(&self.0, key)
     }
 
     /// Recover the caller-facing key from a namespaced one, if it belongs to this
@@ -56,7 +59,7 @@ impl OrgScope {
     /// `scope("")` yields this org's list-prefix, so a prefix scan is just
     /// `scope(&caller_prefix)`.
     pub fn unscope<'a>(&self, scoped: &'a str) -> Option<&'a str> {
-        scoped.strip_prefix(&format!("{DELIM}{}{DELIM}", self.0))
+        scoped.strip_prefix(&fiducia_routing::org_scope_prefix(&self.0))
     }
 
     pub fn scope_all(&self, keys: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -119,7 +122,7 @@ const OPAQUE_FIELDS: &[&str] = &[
 fn unscope_value(org: &OrgScope, value: &mut Value, identity: bool) -> bool {
     match value {
         Value::String(text) if identity => {
-            if text.starts_with(DELIM) {
+            if text.starts_with(fiducia_routing::ORG_SCOPE_DELIM) {
                 let Some(caller_value) = org.unscope(text) else {
                     return false;
                 };
@@ -169,11 +172,19 @@ fn reject(code: &str, detail: &str) -> Response {
 }
 
 /// Paths under `/v1` that are node introspection, not tenant data, and so do not
-/// require an org. Matched against the full request path.
+/// require an org. The middleware is layered on the router that gets **nested**
+/// under `/v1`, so at match time the request path has the `/v1` prefix already
+/// stripped ("/status", not "/v1/status") — match both forms so the exemption
+/// can't silently die if the mounting ever changes.
 fn is_exempt(path: &str) -> bool {
     matches!(
         path,
-        "/v1/status" | "/v1/observe/shards" | "/v1/observe/metrics"
+        "/status"
+            | "/observe/shards"
+            | "/observe/metrics"
+            | "/v1/status"
+            | "/v1/observe/shards"
+            | "/v1/observe/metrics"
     )
 }
 
@@ -266,14 +277,30 @@ mod tests {
 
     #[test]
     fn introspection_paths_are_exempt() {
+        // The middleware runs on the router nested under `/v1`, so at match
+        // time the prefix is already stripped — these are the forms the guard
+        // actually sees at runtime. (This was once tested only via the
+        // `/v1/...` forms, which never occur in practice, so the exemption was
+        // dead and even `/v1/status` demanded an org.)
+        assert!(is_exempt("/status"));
+        assert!(is_exempt("/observe/metrics"));
+        assert!(is_exempt("/observe/shards"));
+        // Defensive: the full-path forms stay covered too.
         assert!(is_exempt("/v1/status"));
         assert!(is_exempt("/v1/observe/metrics"));
         assert!(is_exempt("/v1/observe/shards"));
-        assert!(!is_exempt("/v1/observe/locks"));
-        assert!(!is_exempt("/v1/observe/semaphores"));
-        assert!(!is_exempt("/v1/observe/elections"));
-        assert!(!is_exempt("/v1/kv"));
-        assert!(!is_exempt("/v1/locks/acquire"));
+        for path in [
+            "/observe/locks",
+            "/observe/semaphores",
+            "/observe/elections",
+            "/kv",
+            "/locks/acquire",
+            "/v1/observe/locks",
+            "/v1/kv",
+            "/v1/locks/acquire",
+        ] {
+            assert!(!is_exempt(path), "{path} must require an org");
+        }
     }
 
     #[test]
