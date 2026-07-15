@@ -42,10 +42,12 @@ pub fn spawn(node: Arc<Node>) {
 }
 
 async fn run(node: Arc<Node>) {
+    // Fail fast: the `Client::default()` fallback would have no timeout, letting
+    // one hung delivery target stall its background task forever.
     let http = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .unwrap_or_default();
+        .expect("failed to build the schedule-delivery HTTP client");
     let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
     let mut tick = tokio::time::interval(TICK);
     loop {

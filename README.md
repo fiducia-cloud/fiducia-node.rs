@@ -27,9 +27,17 @@ All over HTTP (`/v1`):
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
 | **Service discovery** | `/v1/services/*`   | TTL-health registry of live service instances (Consul/etcd).   |
+| **Counters**          | `/v1/counters/*`   | Replicated signed integers with CAS via `mod_revision` (thresholds, tallies). |
+| **Barriers**          | `/v1/barriers/*`   | Fan-in barriers with resolution policies: `all`, `quorum`, `first_success`, `any_veto`, `best_by_deadline`, `weighted_quorum`. |
+| **Tasks**             | `/v1/tasks/*`      | Claimable work units: exclusive owner + fencing token, lease-based reclaim of abandoned work. |
+| **Effects**           | `/v1/effects/*`    | Approval-escrow for dangerous actions: `prepare` → principal `approve`(s) → `commit`, exactly once. |
+| **Handoffs**          | `/v1/handoffs/*`   | Atomic ownership transfer (offer/accept with tokens) — never dual or zero ownership. |
+| **Decisions**         | `/v1/decisions/*`  | Typed, weighted, evidence-bearing votes with deterministic resolution policies. |
+| **Budgets**           | `/v1/budgets/*`    | Hierarchical spend budgets (dollars/tokens/tool-calls): reserve → commit/release against per-axis ceilings. |
+| **Claims**            | `/v1/claims/*`     | Contestable, versioned assertion ledger (support/contest/resolve/supersede). |
 
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
-internal `/raft/{shard}/{append,vote}` peer endpoints. `/healthz` is process
+internal `/raft/{shard}/{append,vote,snapshot}` peer endpoints. `/healthz` is process
 liveness; `/readyz` returns 503 if any shard actor is missing or has tripped its
 durable-storage fail-closed state. Local shard-status collection is bounded, so
 a wedged/full actor inbox makes readiness fail instead of hanging the probe.
@@ -257,6 +265,15 @@ inbox message, so a slow peer can't stall the shard.
 `/raft/{shard}/…`) for production, and an in-process **loopback** registry for
 tests — so a whole multi-node cluster (election + replication + failover) runs
 deterministically in one process with no sockets. See the `consensus` tests.
+
+> **Invariant: consensus has no message-bus dependency.** Raft RPC (votes,
+> AppendEntries, snapshots), peer discovery (`FIDUCIA_PEERS`), heartbeats to the
+> brain (via the sidecar), and client commands all travel over HTTP. NATS is
+> used elsewhere in the platform for *event delivery only* — if the broker is
+> down, elections, replication, and every `/v1` primitive keep working. Keep it
+> that way: routing coordination traffic through the bus would make the broker
+> a single point of failure for the one system whose job is to survive
+> failures. (Audited 2026-07: `async-nats` appears in no consensus-path crate.)
 
 ### Cross-cloud RF=3 timing
 
