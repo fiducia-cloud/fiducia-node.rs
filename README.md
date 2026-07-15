@@ -270,6 +270,22 @@ Correctness-sensitive reads stay leader-only in this node. Do not serve locks,
 fencing tokens, cron claims, or authoritative KV state from a random follower:
 a lagging follower can be missing a committed entry until it catches up.
 
+Raft uses its authenticated HTTP peer plane directly and has no NATS dependency.
+Broker and telemetry outages therefore cannot participate in elections, quorum,
+log replication, fencing, or the commit decision.
+
+CheckQuorum may relinquish leadership without advancing the term, but that role
+change preserves the member's durable `voted_for`: a member can never vote for a
+second candidate in the same term. A same-term competing leader is logged as a
+safety violation. Rejected replication rewinds at the normal heartbeat cadence,
+so an unhealthy peer cannot create a tight RPC/error-log loop.
+
+Cron target delivery uses `fiducia-schedule:<schedule>:<fire-ms>` as its stable
+idempotency key, so two schedules due in the same millisecond cannot suppress
+one another at a shared target. Claim and result-persistence failures are logged;
+a delivered-but-unrecorded fire stays pending and is safely redelivered under
+the same key by the elected leader.
+
 That makes topology a product choice:
 
 - use cross-cloud RF=3 for premium/global-critical coordination where surviving

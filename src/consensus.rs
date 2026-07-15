@@ -1095,6 +1095,16 @@ impl ShardActor {
     /// Convert to follower at `term`, optionally learning the new leader. Fails
     /// any outstanding client writes so they retry against the real leader.
     fn step_down(&mut self, term: u64, leader: Option<String>) {
+        if term < self.current_term {
+            tracing::warn!(
+                shard = ?self.shard_id,
+                node = %self.node_id,
+                requested_term = term,
+                current_term = self.current_term,
+                "raft: ignored an attempt to step down into an older term"
+            );
+            return;
+        }
         if self.role != Role::Follower {
             tracing::info!(
                 shard = ?self.shard_id,
@@ -1104,14 +1114,20 @@ impl ShardActor {
             );
         }
         self.record_leader_transfer(self.role, Role::Follower, "step_down");
-        self.current_term = term;
-        self.voted_for = None;
+        // A member may cast at most one durable vote per term. CheckQuorum
+        // relinquishes leadership without observing a newer term, so clearing
+        // `voted_for` on that same-term step-down would let this member vote for
+        // a second candidate in the term it originally won. That creates two
+        // legitimate leaders and a same-term AppendEntries storm. Only adopting
+        // a genuinely newer term resets the vote.
+        if term > self.current_term {
+            self.current_term = term;
+            self.voted_for = None;
+        }
         self.role = Role::Follower;
         self.leader = None;
         self.votes.clear();
-        if leader.is_some() {
-            self.leader_id = leader;
-        }
+        self.leader_id = leader;
         if let Err(error) = self.persist_hard_state() {
             self.fail_storage("persisting higher term while stepping down", error);
             return;
@@ -1343,7 +1359,11 @@ impl ShardActor {
                     .saturating_add(1)
                     .min(cur.saturating_sub(1));
                 ls.next_index.insert(from.clone(), backoff.max(1));
-                more = true;
+                // Let the next heartbeat drive the retry. Immediate retries are
+                // useful while a follower is accepting contiguous batches, but
+                // a mismatch (especially an irreconcilable committed-prefix
+                // conflict) would otherwise spin a network/error-log hot loop.
+                more = false;
             }
         }
         if successful {
@@ -1669,6 +1689,18 @@ impl ShardActor {
                 };
             }
             expected_index = next;
+        }
+        if self.role == Role::Leader
+            && req.term == self.current_term
+            && req.leader_id != self.node_id
+        {
+            tracing::error!(
+                shard = ?self.shard_id,
+                node = %self.node_id,
+                term = self.current_term,
+                competing_leader = %req.leader_id,
+                "raft: observed a competing leader in the same term"
+            );
         }
         self.become_follower_of(req.leader_id.clone());
 
@@ -4242,6 +4274,29 @@ mod tests {
         assert_eq!(leader.in_flight.get("b"), Some(&true));
     }
 
+    #[test]
+    fn rejected_append_rewinds_without_starting_a_tight_retry_loop() {
+        let mut actor = leader_actor();
+        let leader = actor.leader.as_mut().unwrap();
+        leader.next_index.insert("b".to_string(), 9);
+        leader.in_flight.insert("b".to_string(), true);
+
+        actor.handle_append_reply(
+            "b".to_string(),
+            8,
+            Some(1),
+            Some(AppendEntriesResp {
+                term: actor.current_term,
+                success: false,
+                match_index: 4,
+            }),
+        );
+
+        let leader = actor.leader.as_ref().unwrap();
+        assert_eq!(leader.next_index.get("b"), Some(&5));
+        assert_eq!(leader.in_flight.get("b"), Some(&false));
+    }
+
     /// CheckQuorum/leader-lease: a leader holds the lease only while a *majority*
     /// has contacted it within an election timeout. Once the lease lapses it must
     /// refuse linearizable reads and (on the next tick) step down — closing the
@@ -4289,6 +4344,34 @@ mod tests {
         a.on_tick();
         assert_eq!(a.role, Role::Follower);
         assert!(a.leader.is_none());
+    }
+
+    /// CheckQuorum changes only the volatile role; it must not erase the durable
+    /// vote that elected this member. Otherwise the member can grant a second
+    /// vote in the same term and make two different candidates legitimate
+    /// leaders, which then demote each other with same-term AppendEntries.
+    #[test]
+    fn same_term_quorum_step_down_preserves_vote_and_refuses_a_second_candidate() {
+        let mut a = leader_actor();
+        a.current_term = 7;
+        a.voted_for = Some(a.node_id.clone());
+
+        a.relinquish_no_quorum();
+
+        assert_eq!(a.role, Role::Follower);
+        assert_eq!(a.current_term, 7);
+        assert_eq!(a.voted_for.as_deref(), Some("a"));
+        assert_eq!(a.leader_id, None);
+
+        let response = a.handle_request_vote(RequestVoteReq {
+            term: 7,
+            candidate_id: "b".to_string(),
+            last_log_index: a.last_log_index(),
+            last_log_term: a.last_log_term(),
+            pre_vote: false,
+        });
+        assert!(!response.granted, "one member must not vote twice per term");
+        assert_eq!(a.voted_for.as_deref(), Some("a"));
     }
 
     /// With CheckQuorum disabled the lease logic is byte-identical to the old

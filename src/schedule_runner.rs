@@ -99,7 +99,15 @@ async fn claim_due(
             .await
         {
             Ok(outcome) => outcome.output.get("claimed").and_then(|v| v.as_bool()) == Some(true),
-            Err(_) => false, // NotLeader (or transient) — stop firing this schedule
+            Err(error) => {
+                tracing::warn!(
+                    schedule = %schedule.name,
+                    fire_id_ms = fire,
+                    ?error,
+                    "schedule fire claim failed; this node will not deliver it"
+                );
+                false
+            }
         };
         if !claimed {
             break;
@@ -130,7 +138,14 @@ async fn redeliver_pending(
         .await
     {
         Ok(ReadResponse::ScheduleHistory(history)) => history,
-        _ => return,
+        Ok(other) => {
+            tracing::warn!(schedule = %schedule.name, response = ?other, "unexpected schedule-history response");
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(schedule = %schedule.name, ?error, "schedule history unavailable on this node");
+            return;
+        }
     };
     for run in history.iter().filter(|r| r.status == RunStatus::Pending) {
         if let Ok(fire) = run.fire_id.parse::<u64>() {
@@ -157,7 +172,7 @@ fn deliver_in_background(
     let in_flight = in_flight.clone();
     tokio::spawn(async move {
         let (delivered, attempts, error) = deliver(&http, &schedule, fire_id_ms).await;
-        let _ = node
+        if let Err(error) = node
             .propose(Command::ScheduleRecordResult {
                 name: schedule.name.clone(),
                 fire_id_ms,
@@ -165,7 +180,20 @@ fn deliver_in_background(
                 attempts,
                 error,
             })
-            .await;
+            .await
+        {
+            // The target may already have acted. The durable run remains
+            // Pending and will be retried by the elected leader, so this must be
+            // visible; the target's idempotency key prevents a duplicate effect.
+            tracing::error!(
+                schedule = %schedule.name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                ?error,
+                "schedule delivery result was not committed; a redelivery is expected"
+            );
+        }
         in_flight.lock().unwrap().remove(&key);
     });
 }
@@ -185,13 +213,14 @@ async fn deliver(
         "target": schedule.target,
     });
     let max_attempts = schedule.max_retries.saturating_add(1);
+    let idempotency_key = delivery_idempotency_key(&schedule.name, fire_id_ms);
     let mut attempts = 0u32;
     let mut last_error = None;
     while attempts < max_attempts {
         attempts += 1;
         match http
             .post(&url)
-            .header("Idempotency-Key", fire_id_ms.to_string())
+            .header("Idempotency-Key", &idempotency_key)
             .header("X-Fiducia-Schedule", &schedule.name)
             .json(&body)
             .send()
@@ -199,7 +228,25 @@ async fn deliver(
         {
             Ok(resp) if resp.status().is_success() => return (true, attempts, None),
             Ok(resp) => last_error = Some(format!("HTTP {}", resp.status())),
-            Err(err) => last_error = Some(err.to_string()),
+            Err(error) => {
+                // Request errors may echo credential-bearing target URLs. Keep
+                // the durable history and logs useful without persisting them.
+                tracing::warn!(
+                    schedule = %schedule.name,
+                    fire_id_ms,
+                    attempt = attempts,
+                    timeout = error.is_timeout(),
+                    connect = error.is_connect(),
+                    "schedule target request failed"
+                );
+                last_error = Some(if error.is_timeout() {
+                    "request timed out".to_string()
+                } else if error.is_connect() {
+                    "connection failed".to_string()
+                } else {
+                    "request failed".to_string()
+                });
+            }
         }
         if attempts < max_attempts {
             // 200ms, 400ms, 800ms, … capped.
@@ -208,6 +255,10 @@ async fn deliver(
         }
     }
     (false, attempts, last_error)
+}
+
+fn delivery_idempotency_key(schedule_name: &str, fire_id_ms: u64) -> String {
+    format!("fiducia-schedule:{schedule_name}:{fire_id_ms}")
 }
 
 /// The HTTP endpoint to POST a fire to. Per the "uniform HTTP" delivery model, all
@@ -226,4 +277,26 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_idempotency_key_is_stable_for_a_redelivery() {
+        assert_eq!(
+            delivery_idempotency_key("billing-hourly", 1_725_000_000_000),
+            delivery_idempotency_key("billing-hourly", 1_725_000_000_000),
+        );
+    }
+
+    #[test]
+    fn delivery_idempotency_key_does_not_collide_across_schedules() {
+        let fire = 1_725_000_000_000;
+        assert_ne!(
+            delivery_idempotency_key("billing-hourly", fire),
+            delivery_idempotency_key("email-hourly", fire),
+        );
+    }
 }
