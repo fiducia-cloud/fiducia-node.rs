@@ -4374,6 +4374,39 @@ mod tests {
         assert_eq!(a.voted_for.as_deref(), Some("a"));
     }
 
+    #[test]
+    fn older_term_step_down_request_cannot_demote_a_current_leader() {
+        let mut a = leader_actor();
+        a.current_term = 9;
+        a.voted_for = Some(a.node_id.clone());
+
+        a.step_down(8, Some("b".to_string()));
+
+        assert_eq!(a.role, Role::Leader);
+        assert_eq!(a.current_term, 9);
+        assert_eq!(a.voted_for.as_deref(), Some("a"));
+        assert_eq!(a.leader_id.as_deref(), Some("a"));
+        assert!(
+            a.leader.is_some(),
+            "volatile leader state must remain intact"
+        );
+    }
+
+    #[test]
+    fn higher_term_step_down_resets_the_vote_and_tracks_the_new_leader() {
+        let mut a = leader_actor();
+        a.current_term = 9;
+        a.voted_for = Some(a.node_id.clone());
+
+        a.step_down(10, Some("b".to_string()));
+
+        assert_eq!(a.role, Role::Follower);
+        assert_eq!(a.current_term, 10);
+        assert_eq!(a.voted_for, None);
+        assert_eq!(a.leader_id.as_deref(), Some("b"));
+        assert!(a.leader.is_none());
+    }
+
     /// With CheckQuorum disabled the lease logic is byte-identical to the old
     /// behaviour: a leader with zero majority contact still serves reads and never
     /// steps down for want of acks (it only steps down on a higher term).
