@@ -182,10 +182,12 @@ impl Transport {
             reqwest::Client::builder()
                 // Total request timeouts are request-specific below: a vote or
                 // append should fail quickly, while a bounded snapshot needs a
-                // materially longer transfer window.
+                // materially longer transfer window. Fail fast at startup: the
+                // `Client::default()` fallback would drop the connect timeout,
+                // so an unreachable peer could pin RPC tasks on the OS timeout.
                 .connect_timeout(crate::peer_config::rpc_timeout())
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to build the Raft peer HTTP client"),
         )
     }
 

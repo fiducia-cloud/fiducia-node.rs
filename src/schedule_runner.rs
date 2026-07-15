@@ -42,10 +42,12 @@ pub fn spawn(node: Arc<Node>) {
 }
 
 async fn run(node: Arc<Node>) {
+    // Fail fast: the `Client::default()` fallback would have no timeout, letting
+    // one hung delivery target stall its background task forever.
     let http = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .unwrap_or_default();
+        .expect("failed to build the schedule-delivery HTTP client");
     let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
     let mut tick = tokio::time::interval(TICK);
     loop {
@@ -157,7 +159,10 @@ fn deliver_in_background(
     let in_flight = in_flight.clone();
     tokio::spawn(async move {
         let (delivered, attempts, error) = deliver(&http, &schedule, fire_id_ms).await;
-        let _ = node
+        // At-least-once holds either way (a fire whose result never records stays
+        // Pending and is re-delivered), but a *persistent* record failure would
+        // otherwise be an invisible re-delivery loop — log it.
+        if let Err(err) = node
             .propose(Command::ScheduleRecordResult {
                 name: schedule.name.clone(),
                 fire_id_ms,
@@ -165,7 +170,16 @@ fn deliver_in_background(
                 attempts,
                 error,
             })
-            .await;
+            .await
+        {
+            tracing::warn!(
+                schedule = %schedule.name,
+                fire_id_ms,
+                delivered,
+                error = ?err,
+                "cron: failed to record the fire result; the fire stays Pending and will re-deliver"
+            );
+        }
         in_flight.lock().unwrap().remove(&key);
     });
 }
