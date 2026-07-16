@@ -382,3 +382,128 @@ mod readiness_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod org_isolation_tests {
+    use std::sync::Arc;
+
+    use axum::{middleware, routing::get, Router};
+    use serde_json::json;
+
+    use crate::consensus::Node;
+    use crate::org_scope;
+
+    async fn spawn(app: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// The client plane's org boundary must hold for the NEWER primitives too:
+    /// org B must neither see nor affect org A's barrier of the same name. A
+    /// scoping regression here is a cross-tenant data leak, so this drives the
+    /// real router + `require_org` middleware over HTTP rather than calling the
+    /// state machine directly.
+    #[tokio::test]
+    async fn barriers_are_isolated_per_org() {
+        let node: Arc<Node> = crate::test_support::node(1);
+        let v1 = Router::new()
+            .route("/status", get(super::status))
+            .nest("/barriers", crate::barriers::router())
+            .layer(middleware::from_fn(org_scope::require_org));
+        let addr = spawn(Router::new().nest("/v1", v1).with_state(node)).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}/v1/barriers");
+
+        let post = |path: &'static str, org: &'static str, body: serde_json::Value| {
+            let client = client.clone();
+            let base = base.clone();
+            async move {
+                client
+                    .post(format!("{base}{path}"))
+                    .header(org_scope::ORG_HEADER, org)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("request")
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("json body")
+            }
+        };
+        let get_barrier = |org: &'static str| {
+            let client = client.clone();
+            let base = base.clone();
+            async move {
+                client
+                    .get(format!("{base}?name=release/reviewers"))
+                    .header(org_scope::ORG_HEADER, org)
+                    .send()
+                    .await
+                    .expect("request")
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("json body")
+            }
+        };
+
+        // Org A creates and fully resolves its barrier.
+        let created = post(
+            "/create",
+            "org-a",
+            json!({ "name": "release/reviewers", "policy": { "kind": "all" }, "expected": 1 }),
+        )
+        .await;
+        assert_eq!(created["committed"], json!(true), "{created}");
+        let arrived = post(
+            "/arrive",
+            "org-a",
+            json!({ "name": "release/reviewers", "participant": "worker-a" }),
+        )
+        .await;
+        assert_eq!(
+            arrived["result"]["output"]["resolved"],
+            json!(true),
+            "{arrived}"
+        );
+
+        // Org B must not see org A's barrier under the same caller-facing name.
+        let foreign = get_barrier("org-b").await;
+        assert_eq!(
+            foreign["found"],
+            json!(false),
+            "org B saw org A's barrier: {foreign}"
+        );
+        // ...while org A still sees its own, resolved.
+        let own = get_barrier("org-a").await;
+        assert_eq!(own["found"], json!(true), "{own}");
+
+        // Org B creating the SAME name works independently and starts pending —
+        // its writes land in a disjoint keyspace, untouched by org A's state.
+        let created_b = post(
+            "/create",
+            "org-b",
+            json!({ "name": "release/reviewers", "policy": { "kind": "all" }, "expected": 2 }),
+        )
+        .await;
+        assert_eq!(created_b["committed"], json!(true), "{created_b}");
+        let b_view = get_barrier("org-b").await;
+        assert_eq!(b_view["found"], json!(true), "{b_view}");
+        assert_eq!(
+            b_view["barrier"]["status"],
+            json!("pending"),
+            "org B's fresh barrier must not inherit org A's resolution: {b_view}"
+        );
+
+        // And a request with NO org header is refused outright (fail closed).
+        let anonymous = client
+            .get(format!("{base}?name=release/reviewers"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(anonymous.status(), 400, "org-less coordination access");
+    }
+}
