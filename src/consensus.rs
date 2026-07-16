@@ -2170,7 +2170,9 @@ impl ShardActor {
         let flagged = |field: &str| output.get(field).and_then(|v| v.as_bool()).unwrap_or(false);
         let detail = |field: &str| output.get(field).cloned();
         let event = match command {
-            Command::KvPut { key, .. } => Some(ChangeEvent {
+            // A compare-and-set put that lost (`ok: false`, `cas_mismatch`)
+            // mutated nothing — watchers must not see a phantom change.
+            Command::KvPut { key, .. } if flagged("ok") => Some(ChangeEvent {
                 scope: "kv",
                 kind: "put",
                 key: key.clone(),
@@ -4027,6 +4029,175 @@ mod tests {
         {
             Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "after-unresponsive"),
             other => panic!("unexpected read after unresponsive failover: {other:?}"),
+        }
+    }
+
+    /// Linearizable-read fencing across a symmetric partition: once the
+    /// isolated old leader's lease lapses and the majority side elects a new
+    /// leader, the deposed leader must refuse a linearizable read with the
+    /// typed propose error (never answer with the stale pre-partition value),
+    /// while the new majority leader serves the post-partition write. This is
+    /// the live multi-node counterpart of the actor-level
+    /// `leader_lease_gates_reads_and_steps_down_on_lost_quorum`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deposed_leader_refuses_linearizable_reads_while_new_majority_leader_serves() {
+        // Every node routes its *outbound* RPCs through its own registry, and
+        // is *inbound-reachable* through entries in the other registries. That
+        // gives per-node partition control that the single shared registry of
+        // the other cluster tests cannot express: the leader can be cut off in
+        // both directions while its shard actors stay alive to answer queries.
+        let ids = ["a", "b", "c"];
+        let regs = [
+            LoopbackRegistry::new(),
+            LoopbackRegistry::new(),
+            LoopbackRegistry::new(),
+        ];
+        let a = node("a", &["b", "c"], 1, &regs[0]);
+        let b = node("b", &["a", "c"], 1, &regs[1]);
+        let c = node("c", &["a", "b"], 1, &regs[2]);
+        let nodes = [&a, &b, &c];
+        for (owner, reg) in regs.iter().enumerate() {
+            for (other, node) in nodes.iter().enumerate() {
+                if other != owner {
+                    reg.register(ids[other], 0, node.shards[&0].clone());
+                }
+            }
+        }
+
+        let leader_idx = await_leader(&nodes, 0, 150).await;
+        nodes[leader_idx]
+            .propose(put("fence/k", "before-partition"))
+            .await
+            .expect("write before partition");
+
+        // Symmetric partition around the leader: it can no longer reach any
+        // peer (its lease must lapse), and no peer can reach it (the majority
+        // is free to elect). Its actors keep running.
+        let old_leader = nodes[leader_idx];
+        for peer in 0..3 {
+            if peer != leader_idx {
+                regs[leader_idx].deregister(ids[peer]);
+                regs[peer].deregister(ids[leader_idx]);
+            }
+        }
+
+        let survivors: Vec<&Node> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| *n)
+            .collect();
+        let new_leader = await_leader(&survivors, 0, 200).await;
+        survivors[new_leader]
+            .propose(put("fence/k", "after-partition"))
+            .await
+            .expect("majority side commits during the partition");
+
+        // Bounded poll until the old leader learns it is deposed (the majority's
+        // higher term reaches it over its still-working outbound links).
+        let mut deposed = false;
+        for _ in 0..200 {
+            let status = old_leader.status().await;
+            if status
+                .shards
+                .iter()
+                .any(|s| s.shard_id == 0 && s.role != Role::Leader)
+            {
+                deposed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(deposed, "old leader never learned it was deposed");
+
+        // The deposed leader must fence the read with the typed error — it may
+        // never answer authoritatively with the stale value.
+        match old_leader
+            .query(ReadRequest::Kv {
+                key: "fence/k".to_string(),
+            })
+            .await
+        {
+            Err(ProposeError::NotLeader { .. }) | Err(ProposeError::Unavailable { .. }) => {}
+            other => panic!("deposed leader must refuse the linearizable read: {other:?}"),
+        }
+
+        // The majority leader serves the post-partition value linearizably.
+        match survivors[new_leader]
+            .query(ReadRequest::Kv {
+                key: "fence/k".to_string(),
+            })
+            .await
+        {
+            Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "after-partition"),
+            other => panic!("majority leader should serve the fresh value: {other:?}"),
+        }
+    }
+
+    /// Watch/change-feed contract: a committed KV put publishes exactly one
+    /// change event carrying the written key and its commit revision, while a
+    /// committed-but-lost compare-and-set publishes nothing — watchers only see
+    /// mutations that actually happened, never phantom changes.
+    #[tokio::test]
+    async fn kv_put_publishes_one_change_event_and_a_failed_cas_publishes_none() {
+        let reg = LoopbackRegistry::new();
+        let n = node("watch-solo", &[], 2, &reg);
+        let mut rx = n.watch("flags/watched").await.expect("subscribe to shard");
+
+        let first = n
+            .propose(put("flags/watched", "v1"))
+            .await
+            .expect("first put commits");
+        let first_revision = first.output["revision"].as_u64().unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("change event within deadline")
+            .expect("change stream open");
+        assert_eq!(event.scope, "kv");
+        assert_eq!(event.kind, "put");
+        assert_eq!(event.key, "flags/watched");
+        assert_eq!(event.revision, first_revision);
+
+        // A CAS put against a wrong revision commits through the log but
+        // mutates nothing — it must not publish a change event.
+        let stale = n
+            .propose(Command::KvPut {
+                key: "flags/watched".to_string(),
+                value: "v2".to_string(),
+                ttl_ms: None,
+                prev_revision: Some(first_revision + 999),
+            })
+            .await
+            .expect("failed CAS still commits");
+        assert_eq!(stale.output["ok"], false);
+        assert_eq!(stale.output["reason"], "cas_mismatch");
+
+        // The very next event on the stream is the follow-up successful put:
+        // nothing was broadcast for the failed CAS in between.
+        let second = n
+            .propose(put("flags/watched", "v3"))
+            .await
+            .expect("second put commits");
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("change event within deadline")
+            .expect("change stream open");
+        assert_eq!(event.kind, "put");
+        assert_eq!(event.key, "flags/watched");
+        assert_eq!(event.revision, second.output["revision"].as_u64().unwrap());
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "no further change events should be pending"
+        );
+        match n
+            .query(ReadRequest::Kv {
+                key: "flags/watched".to_string(),
+            })
+            .await
+        {
+            Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "v3"),
+            other => panic!("unexpected read after CAS sequence: {other:?}"),
         }
     }
 
