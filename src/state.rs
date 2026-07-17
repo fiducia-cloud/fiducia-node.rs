@@ -2319,6 +2319,85 @@ impl Store {
         self.next_fencing_token
     }
 
+    /// The highest fencing token referenced anywhere in this state — the floor
+    /// `next_fencing_token` must never be below, or a future mint would reissue
+    /// a token some holder already presents.
+    fn max_referenced_fencing_token(&self) -> u64 {
+        let mut max = 0u64;
+        for (&token, grant) in &self.locks.grants {
+            max = max.max(token).max(grant.fencing_token);
+        }
+        for &token in self.locks.held.values() {
+            max = max.max(token);
+        }
+        for semaphore in self.semaphores.values() {
+            for slot in &semaphore.holders {
+                max = max.max(slot.fencing_token);
+            }
+        }
+        for record in self.idempotency.values() {
+            max = max.max(record.fencing_token);
+        }
+        for leadership in self.elections.values() {
+            max = max.max(leadership.fencing_token);
+        }
+        for task in self.tasks.values() {
+            max = max.max(task.fencing_token);
+        }
+        for handoff in self.handoffs.values() {
+            max = max.max(handoff.from_token);
+            if let Some(to_token) = handoff.to_token {
+                max = max.max(to_token);
+            }
+        }
+        max
+    }
+
+    /// Validate a deserialized snapshot before it becomes live state.
+    ///
+    /// `Store` derives `#[serde(default)]`, so a snapshot missing
+    /// `next_fencing_token` (a migrated/truncated/corrupted file that still
+    /// parses) would silently deserialize the counter as 0 — and the node would
+    /// re-mint tokens holders already present: fencing-token reuse, the exact
+    /// split-brain fencing exists to prevent. This check refuses any state whose
+    /// counter is below a token it references, and any lock table whose
+    /// `held`/`grants` dual index is inconsistent (a resurrected or half-released
+    /// lock). Callers surface the error (InstallSnapshot rejects; boot fail-stops)
+    /// rather than serving from silently-wrong state.
+    fn validate_restored(&self) -> Result<(), String> {
+        let floor = self.max_referenced_fencing_token();
+        if self.next_fencing_token < floor {
+            return Err(format!(
+                "next_fencing_token {} is below the highest referenced fencing token {}; \
+                 restoring would re-mint issued tokens",
+                self.next_fencing_token, floor
+            ));
+        }
+        for (key, token) in &self.locks.held {
+            if !self.locks.grants.contains_key(token) {
+                return Err(format!(
+                    "held lock key '{key}' references missing grant token {token}"
+                ));
+            }
+        }
+        for (&token, grant) in &self.locks.grants {
+            if grant.fencing_token != token {
+                return Err(format!(
+                    "lock grant indexed at token {token} carries fencing_token {}",
+                    grant.fencing_token
+                ));
+            }
+            for key in &grant.keys {
+                if self.locks.held.get(key) != Some(&token) {
+                    return Err(format!(
+                        "lock grant {token} claims key '{key}' that is not held by it"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn expire_due(&mut self, now: u64) {
         self.kv.retain(|_, entry| {
             entry
