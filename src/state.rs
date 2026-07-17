@@ -6112,4 +6112,66 @@ mod tests {
         assert_eq!(inventory.held[0].fencing_token, 1);
         assert_eq!(inventory.wait_queue[0].holder, "waiter");
     }
+
+    #[test]
+    fn restore_rejects_a_zeroed_or_missing_fencing_counter() {
+        // A state that has minted a token: one held lock (fencing token 1).
+        let original = StateMachine::new();
+        original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["guarded".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 300_000,
+                wait: false,
+            },
+            now_ms(),
+        );
+        let bytes = original.snapshot().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Sanity: the untouched snapshot restores.
+        StateMachine::new().restore(&bytes).unwrap();
+
+        // Counter regressed below a referenced token (bit-flip / buggy writer):
+        // refused, or a future mint would reissue token 1 (split-brain).
+        value["next_fencing_token"] = serde_json::json!(0);
+        let regressed = serde_json::to_vec(&value).unwrap();
+        let err = StateMachine::new().restore(&regressed).unwrap_err();
+        assert!(err.to_string().contains("re-mint"), "unexpected error: {err}");
+
+        // Counter field absent entirely (migrated/truncated snapshot): serde's
+        // `#[serde(default)]` would silently zero it — the validator refuses.
+        value.as_object_mut().unwrap().remove("next_fencing_token");
+        let missing = serde_json::to_vec(&value).unwrap();
+        assert!(StateMachine::new().restore(&missing).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_an_inconsistent_lock_table() {
+        let original = StateMachine::new();
+        original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["guarded".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 300_000,
+                wait: false,
+            },
+            now_ms(),
+        );
+        let bytes = original.snapshot().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Drop the grant but keep the held-key entry pointing at it: a
+        // half-released lock. Must be refused, not served.
+        value["locks"]["grants"]
+            .as_object_mut()
+            .unwrap()
+            .clear();
+        let torn = serde_json::to_vec(&value).unwrap();
+        let err = StateMachine::new().restore(&torn).unwrap_err();
+        assert!(
+            err.to_string().contains("missing grant"),
+            "unexpected error: {err}"
+        );
+    }
 }
