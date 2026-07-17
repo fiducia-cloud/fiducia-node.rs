@@ -86,7 +86,15 @@ pub fn router() -> Router<Arc<Node>> {
 
 /// `GET /v1/observe/locks` — active lock grants and FIFO waiters for the caller
 /// org (leader-gated read of the lock-coordinator shard).
-async fn locks(State(node): State<Arc<Node>>, org: OrgScope, uri: Uri) -> Response {
+async fn locks(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(denied) = require_admin_scope(&headers) {
+        return denied;
+    }
     match node.lock_inventory().await {
         Ok(mut inv) => {
             inv.held.retain(|holding| {
