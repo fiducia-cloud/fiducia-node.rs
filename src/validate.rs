@@ -357,6 +357,17 @@ mod tests {
     }
 
     #[test]
+    fn lock_release_bounds_the_holder() {
+        assert!(lock_release("worker-a").is_ok());
+        assert_eq!(lock_release("").unwrap_err().code, "empty_field");
+        assert_eq!(
+            lock_release(&big(MAX_HOLDER_BYTES + 1)).unwrap_err().code,
+            "field_too_long"
+        );
+        assert!(lock_release(&big(MAX_HOLDER_BYTES)).is_ok());
+    }
+
+    #[test]
     fn semaphore_limit_ceiling_is_enforced() {
         let err = semaphore_acquire("k", &None, MAX_SEMAPHORE_LIMIT + 1, None).unwrap_err();
         assert_eq!(err.code, "limit_too_large");
