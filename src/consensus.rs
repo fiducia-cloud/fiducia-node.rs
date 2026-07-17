@@ -5091,8 +5091,7 @@ mod tests {
         // leader and accept writes. Retry proposals across the survivors until
         // one commits (routing follows leadership as it settles).
         let deadline = Instant::now() + Duration::from_secs(15);
-        let mut committed_at = None;
-        'outer: loop {
+        let new_leader = 'outer: loop {
             for (i, node) in nodes.iter().enumerate() {
                 if i == leader {
                     continue;
@@ -5107,8 +5106,7 @@ mod tests {
                     .await
                     .is_ok()
                 {
-                    committed_at = Some(i);
-                    break 'outer;
+                    break 'outer i;
                 }
             }
             assert!(
@@ -5116,8 +5114,7 @@ mod tests {
                 "survivors did not elect a leader and commit within 15s of leader death"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let new_leader = committed_at.expect("a survivor committed the write");
+        };
         assert_ne!(
             new_leader, leader,
             "the dead leader cannot have committed it"
