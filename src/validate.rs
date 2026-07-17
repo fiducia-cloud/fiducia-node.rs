@@ -145,6 +145,14 @@ pub fn lock_acquire(
     Ok(())
 }
 
+/// Validate a lock release: the holder is echoed back into the (scoped) command
+/// and matched against the grant, so bound its length like every other holder id.
+/// Release itself persists nothing, but validating here keeps every mutating lock
+/// path consistently bounded and rejects obvious abuse before `propose`.
+pub fn lock_release(holder: &str) -> Result<(), Rejection> {
+    check_str("holder", holder, MAX_HOLDER_BYTES, false)
+}
+
 /// Validate a semaphore acquire: key, optional holder, holder limit, optional TTL.
 pub fn semaphore_acquire(
     key: &str,
