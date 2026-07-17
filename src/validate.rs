@@ -431,7 +431,7 @@ mod tests {
         let keys = vec![big(MAX_KEY_BYTES)];
         assert!(lock_acquire(&keys, &None, Some(30_000)).is_ok());
         assert_eq!(
-            lock_acquire(&vec![big(MAX_KEY_BYTES + 1)], &None, None)
+            lock_acquire(&[big(MAX_KEY_BYTES + 1)], &None, None)
                 .unwrap_err()
                 .code,
             "field_too_long"
