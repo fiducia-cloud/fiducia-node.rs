@@ -116,7 +116,15 @@ async fn locks(
 
 /// `GET /v1/observe/semaphores` — caller-org counting semaphores with holders,
 /// free permits, and waiters.
-async fn semaphores(State(node): State<Arc<Node>>, org: OrgScope, uri: Uri) -> Response {
+async fn semaphores(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(denied) = require_admin_scope(&headers) {
+        return denied;
+    }
     match node.semaphore_inventory().await {
         Ok(mut list) => {
             list.retain(|semaphore| org.unscope(&semaphore.key).is_some());
