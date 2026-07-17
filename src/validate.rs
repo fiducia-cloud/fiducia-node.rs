@@ -416,7 +416,7 @@ mod tests {
         // docs/rfcs/rfc-0001-reservations.md). 90 min must be accepted so
         // that use case works before the reservations primitive lands.
         const NINETY_MIN_MS: u64 = 90 * 60 * 1000;
-        assert!(NINETY_MIN_MS < MAX_TTL_MS);
+        const { assert!(NINETY_MIN_MS < MAX_TTL_MS) };
         let keys = vec!["athleto:seat:A".to_string(), "athleto:seat:B".to_string()];
         assert!(
             lock_acquire(&keys, &Some("cart:7f3a".to_string()), Some(NINETY_MIN_MS)).is_ok(),
@@ -431,7 +431,7 @@ mod tests {
         let keys = vec![big(MAX_KEY_BYTES)];
         assert!(lock_acquire(&keys, &None, Some(30_000)).is_ok());
         assert_eq!(
-            lock_acquire(&vec![big(MAX_KEY_BYTES + 1)], &None, None)
+            lock_acquire(&[big(MAX_KEY_BYTES + 1)], &None, None)
                 .unwrap_err()
                 .code,
             "field_too_long"
