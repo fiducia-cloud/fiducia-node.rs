@@ -136,7 +136,10 @@ async fn semaphores(
 
 /// `GET /v1/observe/elections` — current leaders for caller-org elections,
 /// merged across all shards this node hosts.
-async fn elections(State(node): State<Arc<Node>>, org: OrgScope) -> Response {
+async fn elections(State(node): State<Arc<Node>>, org: OrgScope, headers: HeaderMap) -> Response {
+    if let Err(denied) = require_admin_scope(&headers) {
+        return denied;
+    }
     let elections: Vec<_> = node
         .list_elections()
         .await
