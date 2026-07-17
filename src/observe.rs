@@ -213,6 +213,56 @@ mod tests {
     use super::*;
     use crate::state::Command;
 
+    /// Headers carrying an admin scope, as the LB forwards them for an
+    /// admin-scoped observe request.
+    fn admin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(SCOPES_HEADER, "admin:read".parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn require_admin_scope_allows_admin_and_rejects_non_admin() {
+        // No scope header at all (auth disabled / direct dev): allowed.
+        assert!(require_admin_scope(&HeaderMap::new()).is_ok());
+
+        for granted in ["admin:read", "admin:write", "admin:*", "*", "kv:read admin:read"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SCOPES_HEADER, granted.parse().unwrap());
+            assert!(
+                require_admin_scope(&headers).is_ok(),
+                "scope set `{granted}` should be allowed to observe inventory"
+            );
+        }
+
+        // A plain locks:read key (the enumeration threat) is rejected, as is an
+        // empty/scopeless forwarded set.
+        for granted in ["locks:read", "locks:read locks:write", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SCOPES_HEADER, granted.parse().unwrap());
+            let denied = require_admin_scope(&headers).expect_err("must be forbidden");
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_locks_rejects_a_forwarded_non_admin_scope() {
+        // Even though the inventory belongs to the caller org, a forwarded
+        // locks:read scope must not be able to enumerate holders + fencing tokens.
+        let node = crate::test_support::node(4);
+        let org = OrgScope("org-a".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(SCOPES_HEADER, "locks:read".parse().unwrap());
+        let response = locks(
+            State(node),
+            org,
+            headers,
+            Uri::from_static("/v1/observe/locks"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn tenant_observability_inventory_never_leaks_other_org_entries() {
         let node = crate::test_support::node(4);
