@@ -390,4 +390,32 @@ mod tests {
         let err = election_campaign("leader", "node-a", 30_000, &md).unwrap_err();
         assert_eq!(err.code, "too_much_metadata");
     }
+
+    #[test]
+    fn ninety_minute_hold_ttl_is_within_the_ceiling() {
+        // A shopping-cart / seat hold parks a long TTL on a lock (see
+        // docs/rfcs/rfc-0001-reservations.md). 90 min must be accepted so
+        // that use case works before the reservations primitive lands.
+        const NINETY_MIN_MS: u64 = 90 * 60 * 1000;
+        assert!(NINETY_MIN_MS < MAX_TTL_MS);
+        let keys = vec!["athleto:seat:A".to_string(), "athleto:seat:B".to_string()];
+        assert!(
+            lock_acquire(&keys, &Some("cart:7f3a".to_string()), Some(NINETY_MIN_MS)).is_ok(),
+            "a 90-minute union-lock hold should validate"
+        );
+    }
+
+    #[test]
+    fn lock_key_at_exactly_the_byte_cap_is_accepted() {
+        // Guards the boundary: MAX_KEY_BYTES must be inclusive, so a namespaced
+        // key sized right at the limit is not spuriously rejected.
+        let keys = vec![big(MAX_KEY_BYTES)];
+        assert!(lock_acquire(&keys, &None, Some(30_000)).is_ok());
+        assert_eq!(
+            lock_acquire(&vec![big(MAX_KEY_BYTES + 1)], &None, None)
+                .unwrap_err()
+                .code,
+            "field_too_long"
+        );
+    }
 }
