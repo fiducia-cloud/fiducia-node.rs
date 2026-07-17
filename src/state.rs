@@ -1710,8 +1710,16 @@ impl StateMachine {
     }
 
     /// Restore an atomically persisted state-machine snapshot.
+    ///
+    /// The deserialized state is invariant-checked before it becomes live (see
+    /// [`Store::validate_restored`]): a snapshot that parses but would zero or
+    /// regress the fencing counter, or carries an inconsistent lock table, is
+    /// rejected here instead of silently serving wrong authority.
     pub fn restore(&self, bytes: &[u8]) -> Result<(), serde_json::Error> {
         let restored: Store = serde_json::from_slice(bytes)?;
+        restored
+            .validate_restored()
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
         *self.store.lock().unwrap() = restored;
         Ok(())
     }
