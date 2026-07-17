@@ -9,10 +9,16 @@ full commit SHA.
   uses Rust 1.95.0, and installs cargo-audit 0.21.2 from its locked graph.
 - `docker.yml` — on merge to `main`: build and push the non-root container image
   with immutable sibling refs, an SBOM, and maximum provenance attestations.
-- `deploy-test.yml` — fail-closed deploy to the `fiducia-test` namespace. It
-  requires a nonblank base64-encoded `KUBE_CONFIG_TEST`, installs it mode 0600,
-  updates the immutable commit-tagged image, and waits for the deployment
-  rollout to succeed. Missing credentials, invalid kubeconfig data, update
-  errors, and rollout failures all fail the job.
 - `cli-flags.yml` — audits `.cli-flags.toml` with the pinned `flags2env`
   submodule whenever the CLI flag schema, scripts, or submodule change.
+
+The image workflow publishes only the immutable commit-SHA tag. Kubeconfig
+credentials and rollout logic belong only to `fiducia-monorepo`.
+
+## Security baseline
+
+Every executable workflow uses explicit least-privilege permissions, immutable
+third-party action or container references, non-persisted checkout credentials,
+concurrency control, and a job timeout. The main CI workflow validates this
+directory with the digest-pinned actionlint container. Environment mutation is
+forbidden unless this README documents a repository-specific platform exception.

@@ -27,9 +27,17 @@ All over HTTP (`/v1`):
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
 | **Service discovery** | `/v1/services/*`   | TTL-health registry of live service instances (Consul/etcd).   |
+| **Counters**          | `/v1/counters/*`   | Replicated signed integers with CAS via `mod_revision` (thresholds, tallies). |
+| **Barriers**          | `/v1/barriers/*`   | Fan-in barriers with resolution policies: `all`, `quorum`, `first_success`, `any_veto`, `best_by_deadline`, `weighted_quorum`. |
+| **Tasks**             | `/v1/tasks/*`      | Claimable work units: exclusive owner + fencing token, lease-based reclaim of abandoned work. |
+| **Effects**           | `/v1/effects/*`    | Approval-escrow for dangerous actions: `prepare` → principal `approve`(s) → `commit`, exactly once. |
+| **Handoffs**          | `/v1/handoffs/*`   | Atomic ownership transfer (offer/accept with tokens) — never dual or zero ownership. |
+| **Decisions**         | `/v1/decisions/*`  | Typed, weighted, evidence-bearing votes with deterministic resolution policies. |
+| **Budgets**           | `/v1/budgets/*`    | Hierarchical spend budgets (dollars/tokens/tool-calls): reserve → commit/release against per-axis ceilings. |
+| **Claims**            | `/v1/claims/*`     | Contestable, versioned assertion ledger (support/contest/resolve/supersede). |
 
 Plus `/healthz`, `/readyz`, `/v1/status` (per-shard consensus status), and the
-internal `/raft/{shard}/{append,vote}` peer endpoints. `/healthz` is process
+internal `/raft/{shard}/{append,vote,snapshot}` peer endpoints. `/healthz` is process
 liveness; `/readyz` returns 503 if any shard actor is missing or has tripped its
 durable-storage fail-closed state. Local shard-status collection is bounded, so
 a wedged/full actor inbox makes readiness fail instead of hanging the probe.
@@ -258,6 +266,15 @@ inbox message, so a slow peer can't stall the shard.
 tests — so a whole multi-node cluster (election + replication + failover) runs
 deterministically in one process with no sockets. See the `consensus` tests.
 
+> **Invariant: consensus has no message-bus dependency.** Raft RPC (votes,
+> AppendEntries, snapshots), peer discovery (`FIDUCIA_PEERS`), heartbeats to the
+> brain (via the sidecar), and client commands all travel over HTTP. NATS is
+> used elsewhere in the platform for *event delivery only* — if the broker is
+> down, elections, replication, and every `/v1` primitive keep working. Keep it
+> that way: routing coordination traffic through the bus would make the broker
+> a single point of failure for the one system whose job is to survive
+> failures. (Audited 2026-07: `async-nats` appears in no consensus-path crate.)
+
 ### Cross-cloud RF=3 timing
 
 The intended multi-cloud baseline is **RF=3 voters per shard**: one node in each
@@ -269,6 +286,22 @@ clients only treat writes as successful after quorum commit.
 Correctness-sensitive reads stay leader-only in this node. Do not serve locks,
 fencing tokens, cron claims, or authoritative KV state from a random follower:
 a lagging follower can be missing a committed entry until it catches up.
+
+Raft uses its authenticated HTTP peer plane directly and has no NATS dependency.
+Broker and telemetry outages therefore cannot participate in elections, quorum,
+log replication, fencing, or the commit decision.
+
+CheckQuorum may relinquish leadership without advancing the term, but that role
+change preserves the member's durable `voted_for`: a member can never vote for a
+second candidate in the same term. A same-term competing leader is logged as a
+safety violation. Rejected replication rewinds at the normal heartbeat cadence,
+so an unhealthy peer cannot create a tight RPC/error-log loop.
+
+Cron target delivery uses `fiducia-schedule:<schedule>:<fire-ms>` as its stable
+idempotency key, so two schedules due in the same millisecond cannot suppress
+one another at a shared target. Claim and result-persistence failures are logged;
+a delivered-but-unrecorded fire stays pending and is safely redelivered under
+the same key by the elected leader.
 
 That makes topology a product choice:
 
@@ -468,7 +501,7 @@ The source build is intentionally closed over immutable inputs:
   builder; Cargo build, clippy, and test commands use the committed lockfile.
 - CI and Docker resolve `fiducia-interfaces` at
   `487e470c45ab5851e8f6f3b1dc048fe067fbf408` and `fiducia-routing.rs` at
-  `6106b4f79a5559699a64c931dbcb472f42274266`. The image build verifies each
+  `543b4ea3b3bba28b66c15a97a27514488d2ccce3`. The image build verifies each
   fetched checkout before compiling instead of following either repository's
   moving `main` branch.
 - GitHub Actions use full commit SHAs. CI installs cargo-audit 0.21.2 from its

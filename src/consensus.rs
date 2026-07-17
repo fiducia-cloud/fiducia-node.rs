@@ -112,6 +112,12 @@ pub struct RaftTiming {
     /// liveness cost is that an isolated leader gives up leadership a lease sooner.
     /// Disable with `FIDUCIA_RAFT_CHECK_QUORUM=off`.
     pub check_quorum: bool,
+    /// Committed entries applied past the last snapshot before the shard folds
+    /// them into a new snapshot and compacts the log (`0` disables compaction).
+    /// Resolved once at boot from `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` — it was
+    /// previously re-read from the process environment after every applied
+    /// command, on the apply hot path.
+    pub snapshot_threshold: u64,
 }
 
 impl Default for RaftTiming {
@@ -123,6 +129,7 @@ impl Default for RaftTiming {
             election_jitter_ms: 150,
             pre_vote: true,
             check_quorum: true,
+            snapshot_threshold: 1024,
         }
     }
 }
@@ -165,6 +172,7 @@ impl RaftTiming {
                     )
                 })
                 .unwrap_or(d.check_quorum),
+            snapshot_threshold: ms("FIDUCIA_RAFT_SNAPSHOT_THRESHOLD", d.snapshot_threshold),
         }
         .sanitized()
     }
@@ -674,7 +682,7 @@ impl ShardActor {
         timing: RaftTiming,
         store: Option<ShardStore>,
         recovered: Recovered,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let members = peers.len() + 1;
         let single = members == 1;
         let (changes, _) = broadcast::channel(CHANGE_BUFFER);
@@ -696,32 +704,39 @@ impl ShardActor {
             .as_ref()
             .map(|snapshot| snapshot.state.clone())
             .unwrap_or_default();
+        // Recovery-invariant violations are returned as errors so the caller can
+        // quarantine THIS shard (fail-closed, visible in /readyz and /v1/status)
+        // instead of aborting the process and taking every healthy shard with it.
         for (offset, entry) in recovered.log.iter().enumerate() {
             let expected = snapshot_index
                 .checked_add(offset as u64)
                 .and_then(|index| index.checked_add(1))
-                .expect("recovered log index overflow");
-            assert_eq!(
-                entry.index, expected,
-                "invalid recovered state for shard {shard_id}: expected log index {expected}, found {}",
-                entry.index
-            );
+                .ok_or_else(|| format!("shard {shard_id}: recovered log index overflow"))?;
+            if entry.index != expected {
+                return Err(format!(
+                    "invalid recovered state for shard {shard_id}: expected log index {expected}, found {}",
+                    entry.index
+                ));
+            }
         }
         let recovered_tail = recovered
             .log
             .last()
             .map(|entry| entry.index)
             .unwrap_or(snapshot_index);
-        assert!(
-            recovered.commit_index <= recovered_tail,
-            "invalid recovered state for shard {shard_id}: commit index {} exceeds durable tail {recovered_tail}",
-            recovered.commit_index
-        );
+        if recovered.commit_index > recovered_tail {
+            return Err(format!(
+                "invalid recovered state for shard {shard_id}: commit index {} exceeds durable tail {recovered_tail}",
+                recovered.commit_index
+            ));
+        }
         let recovered_commit = recovered.commit_index.max(snapshot_index);
         let state = StateMachine::new();
         if let Some(snapshot) = recovered.snapshot.as_ref() {
             if let Err(error) = state.restore(&snapshot.state) {
-                panic!("invalid state-machine snapshot for shard {shard_id}: {error}");
+                return Err(format!(
+                    "invalid state-machine snapshot for shard {shard_id}: {error}"
+                ));
             }
         }
         let mut actor = ShardActor {
@@ -770,6 +785,65 @@ impl ShardActor {
         if actor.commit_index > 0 {
             actor.apply_committed();
         }
+        Ok(actor)
+    }
+
+    /// Build a shard actor that is fail-closed from its first tick: it hosts the
+    /// shard id (so `/v1/status` and `/readyz` report it) but participates in
+    /// nothing — `storage_fault` gates every vote, append, proposal, and read,
+    /// exactly as if durable storage had failed mid-run. Used when a shard's
+    /// on-disk state cannot be opened or validated at boot: the alternative
+    /// (aborting the process) would needlessly take every healthy shard on this
+    /// node out of its quorum.
+    #[allow(clippy::too_many_arguments)]
+    fn quarantined(
+        shard_id: ShardId,
+        node_id: String,
+        peers: Vec<String>,
+        transport: Arc<Transport>,
+        self_tx: mpsc::Sender<ShardMsg>,
+        timing: RaftTiming,
+        reason: String,
+    ) -> Self {
+        let members = peers.len() + 1;
+        let (changes, _) = broadcast::channel(CHANGE_BUFFER);
+        let mut actor = ShardActor {
+            shard_id,
+            node_id: node_id.clone(),
+            peers,
+            members,
+            transport,
+            self_tx,
+            // Never a leader — not even in single-member mode. A quarantined
+            // shard must not serve anything until its durable state is repaired
+            // and the node restarts.
+            role: Role::Follower,
+            current_term: 1,
+            voted_for: None,
+            leader_id: None,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            snapshot_state: Vec::new(),
+            log: Vec::new(),
+            commit_index: 0,
+            last_applied: 0,
+            store: None,
+            storage_fault: Some(reason),
+            votes: HashSet::new(),
+            pre_votes: HashSet::new(),
+            pre_vote_term: 0,
+            leader: None,
+            timing,
+            election_deadline: Instant::now(),
+            heartbeat_deadline: Instant::now(),
+            last_leader_contact: Instant::now(),
+            rng: Rng::seeded(&node_id, shard_id),
+            pending: HashMap::new(),
+            changes,
+            state: StateMachine::new(),
+            metrics: ShardMetrics::default(),
+        };
+        actor.reset_election_deadline();
         actor
     }
 
@@ -1095,6 +1169,16 @@ impl ShardActor {
     /// Convert to follower at `term`, optionally learning the new leader. Fails
     /// any outstanding client writes so they retry against the real leader.
     fn step_down(&mut self, term: u64, leader: Option<String>) {
+        if term < self.current_term {
+            tracing::warn!(
+                shard = ?self.shard_id,
+                node = %self.node_id,
+                requested_term = term,
+                current_term = self.current_term,
+                "raft: ignored an attempt to step down into an older term"
+            );
+            return;
+        }
         if self.role != Role::Follower {
             tracing::info!(
                 shard = ?self.shard_id,
@@ -1104,14 +1188,20 @@ impl ShardActor {
             );
         }
         self.record_leader_transfer(self.role, Role::Follower, "step_down");
-        self.current_term = term;
-        self.voted_for = None;
+        // A member may cast at most one durable vote per term. CheckQuorum
+        // relinquishes leadership without observing a newer term, so clearing
+        // `voted_for` on that same-term step-down would let this member vote for
+        // a second candidate in the term it originally won. That creates two
+        // legitimate leaders and a same-term AppendEntries storm. Only adopting
+        // a genuinely newer term resets the vote.
+        if term > self.current_term {
+            self.current_term = term;
+            self.voted_for = None;
+        }
         self.role = Role::Follower;
         self.leader = None;
         self.votes.clear();
-        if leader.is_some() {
-            self.leader_id = leader;
-        }
+        self.leader_id = leader;
         if let Err(error) = self.persist_hard_state() {
             self.fail_storage("persisting higher term while stepping down", error);
             return;
@@ -1343,7 +1433,11 @@ impl ShardActor {
                     .saturating_add(1)
                     .min(cur.saturating_sub(1));
                 ls.next_index.insert(from.clone(), backoff.max(1));
-                more = true;
+                // Let the next heartbeat drive the retry. Immediate retries are
+                // useful while a follower is accepting contiguous batches, but
+                // a mismatch (especially an irreconcilable committed-prefix
+                // conflict) would otherwise spin a network/error-log hot loop.
+                more = false;
             }
         }
         if successful {
@@ -1669,6 +1763,18 @@ impl ShardActor {
                 };
             }
             expected_index = next;
+        }
+        if self.role == Role::Leader
+            && req.term == self.current_term
+            && req.leader_id != self.node_id
+        {
+            tracing::error!(
+                shard = ?self.shard_id,
+                node = %self.node_id,
+                term = self.current_term,
+                competing_leader = %req.leader_id,
+                "raft: observed a competing leader in the same term"
+            );
         }
         self.become_follower_of(req.leader_id.clone());
 
@@ -2023,10 +2129,7 @@ impl ShardActor {
     }
 
     fn maybe_compact(&mut self) {
-        let threshold = std::env::var("FIDUCIA_RAFT_SNAPSHOT_THRESHOLD")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1024);
+        let threshold = self.timing.snapshot_threshold;
         if threshold == 0 || self.last_applied.saturating_sub(self.snapshot_index) < threshold {
             return;
         }
@@ -2067,7 +2170,9 @@ impl ShardActor {
         let flagged = |field: &str| output.get(field).and_then(|v| v.as_bool()).unwrap_or(false);
         let detail = |field: &str| output.get(field).cloned();
         let event = match command {
-            Command::KvPut { key, .. } => Some(ChangeEvent {
+            // A compare-and-set put that lost (`ok: false`, `cas_mismatch`)
+            // mutated nothing — watchers must not see a phantom change.
+            Command::KvPut { key, .. } if flagged("ok") => Some(ChangeEvent {
                 scope: "kv",
                 kind: "put",
                 key: key.clone(),
@@ -2370,28 +2475,62 @@ impl Node {
             if let Some(reg) = transport.loopback_registry() {
                 reg.register(&config.node_id, shard_id, tx.clone());
             }
-            // Open durable storage when a data dir is configured. Failing closed
-            // here (panic) is deliberate: a coordination engine that silently
-            // ran without durability would be worse than a visible crashloop.
-            let (store, recovered) = match &config.data_dir {
-                Some(dir) => {
-                    let (s, r) = ShardStore::open(dir, shard_id).unwrap_or_else(|e| {
-                        panic!("fiducia-node: cannot open durable store for shard {shard_id} under {dir:?}: {e}")
-                    });
-                    (Some(s), r)
-                }
-                None => (None, Recovered::default()),
+            // Unusable durable state fails closed at SHARD scope, not process
+            // scope: the affected shard is quarantined (hosted but refusing all
+            // participation, loud in logs, /readyz, and /v1/status) while every
+            // other shard keeps serving its quorum. Aborting the whole node here
+            // would turn one corrupt shard directory into a full-node crashloop
+            // that costs every shard group on this node a member. Running the
+            // shard WITHOUT durability is never an option — quarantine keeps it
+            // fail-closed exactly like a mid-run storage fault.
+            let quarantine = |reason: String| {
+                tracing::error!(
+                    shard = shard_id,
+                    node = %config.node_id,
+                    %reason,
+                    "raft: shard quarantined at boot — durable state unusable; \
+                     the shard is fail-closed on this node until its store is \
+                     repaired and the node restarts"
+                );
+                ShardActor::quarantined(
+                    shard_id,
+                    config.node_id.clone(),
+                    config.peers.clone(),
+                    transport.clone(),
+                    tx.clone(),
+                    timing,
+                    reason,
+                )
             };
-            let actor = ShardActor::new(
-                shard_id,
-                config.node_id.clone(),
-                config.peers.clone(),
-                transport.clone(),
-                tx.clone(),
-                timing,
-                store,
-                recovered,
-            );
+            let actor = match &config.data_dir {
+                Some(dir) => match ShardStore::open(dir, shard_id) {
+                    Ok((store, recovered)) => ShardActor::new(
+                        shard_id,
+                        config.node_id.clone(),
+                        config.peers.clone(),
+                        transport.clone(),
+                        tx.clone(),
+                        timing,
+                        Some(store),
+                        recovered,
+                    )
+                    .unwrap_or_else(&quarantine),
+                    Err(error) => {
+                        quarantine(format!("cannot open durable store under {dir:?}: {error}"))
+                    }
+                },
+                None => ShardActor::new(
+                    shard_id,
+                    config.node_id.clone(),
+                    config.peers.clone(),
+                    transport.clone(),
+                    tx.clone(),
+                    timing,
+                    None,
+                    Recovered::default(),
+                )
+                .unwrap_or_else(&quarantine),
+            };
             tasks.push(tokio::spawn(actor.run(rx)));
             shards.insert(shard_id, tx);
         }
@@ -2590,19 +2729,25 @@ impl Node {
     /// `Clone`). Used for list/range operations that no single shard owns.
     async fn query_all_shards(&self, make: impl Fn() -> ReadRequest) -> Vec<ReadResponse> {
         let mut out = Vec::with_capacity(self.shards.len());
-        for tx in self.shards.values() {
+        for (shard_id, tx) in self.shards.iter() {
             let (resp, rx) = oneshot::channel();
-            if tx
+            let sent = tx
                 .send(ShardMsg::QueryLocal {
                     request: make(),
                     resp,
                 })
                 .await
-                .is_ok()
-            {
-                if let Ok(response) = rx.await {
-                    out.push(response);
-                }
+                .is_ok();
+            let response = if sent { rx.await.ok() } else { None };
+            match response {
+                Some(response) => out.push(response),
+                // A shard that can't answer makes every merged list (kv, services,
+                // schedules, elections) silently partial; `status()` reports such
+                // shards as unresponsive, so at minimum leave a log trail here.
+                None => tracing::warn!(
+                    shard = shard_id,
+                    "shard did not answer a local query; merged results are partial"
+                ),
             }
         }
         out
@@ -3815,6 +3960,7 @@ mod tests {
             election_jitter_ms: 0,
             pre_vote: true,
             check_quorum: true,
+            ..RaftTiming::default()
         };
 
         // Zero tick/heartbeat would panic tokio's interval — floored to 1ms.
@@ -3886,6 +4032,175 @@ mod tests {
         }
     }
 
+    /// Linearizable-read fencing across a symmetric partition: once the
+    /// isolated old leader's lease lapses and the majority side elects a new
+    /// leader, the deposed leader must refuse a linearizable read with the
+    /// typed propose error (never answer with the stale pre-partition value),
+    /// while the new majority leader serves the post-partition write. This is
+    /// the live multi-node counterpart of the actor-level
+    /// `leader_lease_gates_reads_and_steps_down_on_lost_quorum`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deposed_leader_refuses_linearizable_reads_while_new_majority_leader_serves() {
+        // Every node routes its *outbound* RPCs through its own registry, and
+        // is *inbound-reachable* through entries in the other registries. That
+        // gives per-node partition control that the single shared registry of
+        // the other cluster tests cannot express: the leader can be cut off in
+        // both directions while its shard actors stay alive to answer queries.
+        let ids = ["a", "b", "c"];
+        let regs = [
+            LoopbackRegistry::new(),
+            LoopbackRegistry::new(),
+            LoopbackRegistry::new(),
+        ];
+        let a = node("a", &["b", "c"], 1, &regs[0]);
+        let b = node("b", &["a", "c"], 1, &regs[1]);
+        let c = node("c", &["a", "b"], 1, &regs[2]);
+        let nodes = [&a, &b, &c];
+        for (owner, reg) in regs.iter().enumerate() {
+            for (other, node) in nodes.iter().enumerate() {
+                if other != owner {
+                    reg.register(ids[other], 0, node.shards[&0].clone());
+                }
+            }
+        }
+
+        let leader_idx = await_leader(&nodes, 0, 150).await;
+        nodes[leader_idx]
+            .propose(put("fence/k", "before-partition"))
+            .await
+            .expect("write before partition");
+
+        // Symmetric partition around the leader: it can no longer reach any
+        // peer (its lease must lapse), and no peer can reach it (the majority
+        // is free to elect). Its actors keep running.
+        let old_leader = nodes[leader_idx];
+        for peer in 0..3 {
+            if peer != leader_idx {
+                regs[leader_idx].deregister(ids[peer]);
+                regs[peer].deregister(ids[leader_idx]);
+            }
+        }
+
+        let survivors: Vec<&Node> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| *n)
+            .collect();
+        let new_leader = await_leader(&survivors, 0, 200).await;
+        survivors[new_leader]
+            .propose(put("fence/k", "after-partition"))
+            .await
+            .expect("majority side commits during the partition");
+
+        // Bounded poll until the old leader learns it is deposed (the majority's
+        // higher term reaches it over its still-working outbound links).
+        let mut deposed = false;
+        for _ in 0..200 {
+            let status = old_leader.status().await;
+            if status
+                .shards
+                .iter()
+                .any(|s| s.shard_id == 0 && s.role != Role::Leader)
+            {
+                deposed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(deposed, "old leader never learned it was deposed");
+
+        // The deposed leader must fence the read with the typed error — it may
+        // never answer authoritatively with the stale value.
+        match old_leader
+            .query(ReadRequest::Kv {
+                key: "fence/k".to_string(),
+            })
+            .await
+        {
+            Err(ProposeError::NotLeader { .. }) | Err(ProposeError::Unavailable { .. }) => {}
+            other => panic!("deposed leader must refuse the linearizable read: {other:?}"),
+        }
+
+        // The majority leader serves the post-partition value linearizably.
+        match survivors[new_leader]
+            .query(ReadRequest::Kv {
+                key: "fence/k".to_string(),
+            })
+            .await
+        {
+            Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "after-partition"),
+            other => panic!("majority leader should serve the fresh value: {other:?}"),
+        }
+    }
+
+    /// Watch/change-feed contract: a committed KV put publishes exactly one
+    /// change event carrying the written key and its commit revision, while a
+    /// committed-but-lost compare-and-set publishes nothing — watchers only see
+    /// mutations that actually happened, never phantom changes.
+    #[tokio::test]
+    async fn kv_put_publishes_one_change_event_and_a_failed_cas_publishes_none() {
+        let reg = LoopbackRegistry::new();
+        let n = node("watch-solo", &[], 2, &reg);
+        let mut rx = n.watch("flags/watched").await.expect("subscribe to shard");
+
+        let first = n
+            .propose(put("flags/watched", "v1"))
+            .await
+            .expect("first put commits");
+        let first_revision = first.output["revision"].as_u64().unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("change event within deadline")
+            .expect("change stream open");
+        assert_eq!(event.scope, "kv");
+        assert_eq!(event.kind, "put");
+        assert_eq!(event.key, "flags/watched");
+        assert_eq!(event.revision, first_revision);
+
+        // A CAS put against a wrong revision commits through the log but
+        // mutates nothing — it must not publish a change event.
+        let stale = n
+            .propose(Command::KvPut {
+                key: "flags/watched".to_string(),
+                value: "v2".to_string(),
+                ttl_ms: None,
+                prev_revision: Some(first_revision + 999),
+            })
+            .await
+            .expect("failed CAS still commits");
+        assert_eq!(stale.output["ok"], false);
+        assert_eq!(stale.output["reason"], "cas_mismatch");
+
+        // The very next event on the stream is the follow-up successful put:
+        // nothing was broadcast for the failed CAS in between.
+        let second = n
+            .propose(put("flags/watched", "v3"))
+            .await
+            .expect("second put commits");
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("change event within deadline")
+            .expect("change stream open");
+        assert_eq!(event.kind, "put");
+        assert_eq!(event.key, "flags/watched");
+        assert_eq!(event.revision, second.output["revision"].as_u64().unwrap());
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "no further change events should be pending"
+        );
+        match n
+            .query(ReadRequest::Kv {
+                key: "flags/watched".to_string(),
+            })
+            .await
+        {
+            Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "v3"),
+            other => panic!("unexpected read after CAS sequence: {other:?}"),
+        }
+    }
+
     // --- PreVote (anti-disruption straw poll) -----------------------------
 
     /// Bare follower shard actor (3-member group) for white-box tests of the
@@ -3903,6 +4218,7 @@ mod tests {
             None,
             Recovered::default(),
         )
+        .expect("fresh actor")
     }
 
     fn durable_actor(peers: Vec<String>) -> ShardActor {
@@ -3929,6 +4245,7 @@ mod tests {
             Some(store),
             recovered,
         )
+        .expect("durable actor")
     }
 
     #[test]
@@ -4242,6 +4559,29 @@ mod tests {
         assert_eq!(leader.in_flight.get("b"), Some(&true));
     }
 
+    #[test]
+    fn rejected_append_rewinds_without_starting_a_tight_retry_loop() {
+        let mut actor = leader_actor();
+        let leader = actor.leader.as_mut().unwrap();
+        leader.next_index.insert("b".to_string(), 9);
+        leader.in_flight.insert("b".to_string(), true);
+
+        actor.handle_append_reply(
+            "b".to_string(),
+            8,
+            Some(1),
+            Some(AppendEntriesResp {
+                term: actor.current_term,
+                success: false,
+                match_index: 4,
+            }),
+        );
+
+        let leader = actor.leader.as_ref().unwrap();
+        assert_eq!(leader.next_index.get("b"), Some(&5));
+        assert_eq!(leader.in_flight.get("b"), Some(&false));
+    }
+
     /// CheckQuorum/leader-lease: a leader holds the lease only while a *majority*
     /// has contacted it within an election timeout. Once the lease lapses it must
     /// refuse linearizable reads and (on the next tick) step down — closing the
@@ -4288,6 +4628,67 @@ mod tests {
         a.heartbeat_deadline = Instant::now() + Duration::from_secs(60);
         a.on_tick();
         assert_eq!(a.role, Role::Follower);
+        assert!(a.leader.is_none());
+    }
+
+    /// CheckQuorum changes only the volatile role; it must not erase the durable
+    /// vote that elected this member. Otherwise the member can grant a second
+    /// vote in the same term and make two different candidates legitimate
+    /// leaders, which then demote each other with same-term AppendEntries.
+    #[test]
+    fn same_term_quorum_step_down_preserves_vote_and_refuses_a_second_candidate() {
+        let mut a = leader_actor();
+        a.current_term = 7;
+        a.voted_for = Some(a.node_id.clone());
+
+        a.relinquish_no_quorum();
+
+        assert_eq!(a.role, Role::Follower);
+        assert_eq!(a.current_term, 7);
+        assert_eq!(a.voted_for.as_deref(), Some("a"));
+        assert_eq!(a.leader_id, None);
+
+        let response = a.handle_request_vote(RequestVoteReq {
+            term: 7,
+            candidate_id: "b".to_string(),
+            last_log_index: a.last_log_index(),
+            last_log_term: a.last_log_term(),
+            pre_vote: false,
+        });
+        assert!(!response.granted, "one member must not vote twice per term");
+        assert_eq!(a.voted_for.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn older_term_step_down_request_cannot_demote_a_current_leader() {
+        let mut a = leader_actor();
+        a.current_term = 9;
+        a.voted_for = Some(a.node_id.clone());
+
+        a.step_down(8, Some("b".to_string()));
+
+        assert_eq!(a.role, Role::Leader);
+        assert_eq!(a.current_term, 9);
+        assert_eq!(a.voted_for.as_deref(), Some("a"));
+        assert_eq!(a.leader_id.as_deref(), Some("a"));
+        assert!(
+            a.leader.is_some(),
+            "volatile leader state must remain intact"
+        );
+    }
+
+    #[test]
+    fn higher_term_step_down_resets_the_vote_and_tracks_the_new_leader() {
+        let mut a = leader_actor();
+        a.current_term = 9;
+        a.voted_for = Some(a.node_id.clone());
+
+        a.step_down(10, Some("b".to_string()));
+
+        assert_eq!(a.role, Role::Follower);
+        assert_eq!(a.current_term, 10);
+        assert_eq!(a.voted_for, None);
+        assert_eq!(a.leader_id.as_deref(), Some("b"));
         assert!(a.leader.is_none());
     }
 
@@ -4500,10 +4901,243 @@ mod tests {
                     }),
                 }],
             },
-        );
+        )
+        .expect("recovered actor");
         assert_eq!(actor.last_applied, 6);
         assert_eq!(actor.snapshot_index, 5);
         assert_eq!(actor.state.kv_get("before").unwrap().value, "snapshot");
         assert_eq!(actor.state.kv_get("after").unwrap().value, "suffix");
+    }
+
+    /// Regression (boot quarantine): a shard whose on-disk state cannot be used
+    /// must come up fail-closed WITHOUT taking the process — or its sibling
+    /// shards — down with it. Here shard 0's directory holds a log entry whose
+    /// index contradicts the recovery invariants; the node must still bootstrap,
+    /// quarantine shard 0 (visible via status), and keep shard 1 serving writes.
+    #[tokio::test]
+    async fn corrupt_shard_is_quarantined_while_sibling_shards_keep_serving() {
+        let root = std::env::temp_dir().join(format!(
+            "fiducia-quarantine-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Seed shard 0 with durable state that violates recovery invariants:
+        // a log whose first entry index (7) does not follow the snapshot base (0).
+        // Strict recovery rejects it — previously as a process-killing panic.
+        {
+            let (mut store, _recovered) = ShardStore::open(&root, 0).unwrap();
+            store
+                .append_tail(&[LogEntry {
+                    term: 1,
+                    index: 7,
+                    proposed_at_ms: 1_000,
+                    command: Some(Command::KvPut {
+                        key: "poison".to_string(),
+                        value: "x".to_string(),
+                        ttl_ms: None,
+                        prev_revision: None,
+                    }),
+                }])
+                .unwrap();
+        }
+
+        let node = Node::bootstrap(
+            NodeConfig {
+                node_id: "quarantine-node".to_string(),
+                peers: Vec::new(), // single member: healthy shards lead from t=0
+                shard_count: 2,
+                data_dir: Some(root.clone()),
+            },
+            Transport::loopback(LoopbackRegistry::new()),
+        );
+
+        // Shard 0 is hosted but fail-closed; its status names the fault. Shard 1
+        // stays healthy and (single-member) leads.
+        let status = node.status().await;
+        let shard0 = status
+            .shards
+            .iter()
+            .find(|s| s.shard_id == 0)
+            .expect("shard 0 reported");
+        assert!(!shard0.storage_healthy, "corrupt shard must be quarantined");
+        assert!(shard0.storage_error.is_some());
+        assert_eq!(
+            shard0.role,
+            Role::Follower,
+            "a quarantined shard never leads"
+        );
+        let shard1 = status
+            .shards
+            .iter()
+            .find(|s| s.shard_id == 1)
+            .expect("shard 1 reported");
+        assert!(shard1.storage_healthy, "sibling shard must stay healthy");
+        assert_eq!(
+            shard1.role,
+            Role::Leader,
+            "single-member healthy shard leads"
+        );
+
+        // The node still serves writes: keys hash across both shards, so within a
+        // few probes one must land on healthy shard 1 and commit; probes landing
+        // on quarantined shard 0 must fail closed rather than hang or panic.
+        let mut committed = false;
+        for i in 0..16 {
+            if node
+                .propose(Command::KvPut {
+                    key: format!("quarantine-probe-{i}"),
+                    value: "v".to_string(),
+                    ttl_ms: None,
+                    prev_revision: None,
+                })
+                .await
+                .is_ok()
+            {
+                committed = true;
+                break;
+            }
+        }
+        assert!(committed, "healthy shards must keep committing writes");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Failover over the REAL production transport: three nodes form a Raft
+    /// group over HTTP (`Transport::http` → each peer's `/raft/{shard}/…`
+    /// plane, exactly as deployed pods do), commit a write, then the leader is
+    /// killed — server aborted, shard actors aborted, exactly like losing the
+    /// node/cluster that hosted it. The surviving 2/3 must elect a new leader
+    /// and keep committing writes. This is the in-process twin of the e2e
+    /// chaos test (fiducia-e2e tests/chaos/cluster-failure.test.mjs), which
+    /// proves the same invariant by scaling a real cluster's StatefulSet to 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_cluster_elects_new_leader_and_commits_after_leader_death() {
+        // Bind three ephemeral listeners first so every member knows all peers.
+        let mut listeners = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            ids.push(listener.local_addr().unwrap().to_string());
+            listeners.push(listener);
+        }
+
+        let mut nodes: Vec<Arc<Node>> = Vec::new();
+        let mut servers = Vec::new();
+        for (i, listener) in listeners.into_iter().enumerate() {
+            let peers: Vec<String> = ids
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, id)| id.clone())
+                .collect();
+            let node = Arc::new(Node::bootstrap(
+                NodeConfig {
+                    node_id: ids[i].clone(),
+                    peers,
+                    shard_count: 1, // one Raft group ⇒ one unambiguous leader
+                    data_dir: None,
+                },
+                Transport::http(),
+            ));
+            let app = axum::Router::new()
+                .nest("/raft", crate::raft_api::router())
+                .with_state(node.clone());
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            nodes.push(node);
+        }
+
+        // A leader must emerge from a real election over HTTP.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let leader = loop {
+            let mut found = None;
+            for (i, node) in nodes.iter().enumerate() {
+                if node.status().await.leading_shards.contains(&0) {
+                    found = Some(i);
+                }
+            }
+            if let Some(i) = found {
+                break i;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no leader elected over HTTP within 10s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        // A write proposed at the leader commits on the full quorum.
+        nodes[leader]
+            .propose(Command::KvPut {
+                key: "failover/before".to_string(),
+                value: "pre-failover".to_string(),
+                ttl_ms: None,
+                prev_revision: None,
+            })
+            .await
+            .expect("write commits with all three members alive");
+
+        // Kill the leader: its HTTP plane and its shard actors go away together,
+        // as they would when the hosting node/cluster dies.
+        servers[leader].abort();
+        nodes[leader].shutdown(None);
+
+        // WRONG BEHAVIOR => FAIL: the surviving majority must elect a NEW
+        // leader and accept writes. Retry proposals across the survivors until
+        // one commits (routing follows leadership as it settles).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let new_leader = 'outer: loop {
+            for (i, node) in nodes.iter().enumerate() {
+                if i == leader {
+                    continue;
+                }
+                if node
+                    .propose(Command::KvPut {
+                        key: "failover/after".to_string(),
+                        value: "post-failover".to_string(),
+                        ttl_ms: None,
+                        prev_revision: None,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    break 'outer i;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "survivors did not elect a leader and commit within 15s of leader death"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_ne!(
+            new_leader, leader,
+            "the dead leader cannot have committed it"
+        );
+
+        // The pre-failover write survives, linearizably, on the new leader.
+        match nodes[new_leader]
+            .query(ReadRequest::Kv {
+                key: "failover/before".to_string(),
+            })
+            .await
+        {
+            Ok(ReadResponse::Kv(Some(entry))) => assert_eq!(entry.value, "pre-failover"),
+            other => panic!("pre-failover write lost after failover: {other:?}"),
+        }
+
+        for (i, node) in nodes.iter().enumerate() {
+            if i != leader {
+                node.shutdown(None);
+            }
+        }
+        for server in servers {
+            server.abort();
+        }
     }
 }
