@@ -302,6 +302,7 @@ mod tests {
                 locks(
                     State(node.clone()),
                     org.clone(),
+                    admin_headers(),
                     Uri::from_static("/v1/observe/locks"),
                 )
                 .await,
