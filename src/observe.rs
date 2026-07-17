@@ -54,6 +54,9 @@ const ADMIN_OBSERVE_SCOPES: &[&str] = &["*", "admin:*", "admin:read", "admin:wri
 /// direct in-cluster node introspection inside the trusted-hop boundary — the
 /// check is skipped so those paths keep working. Reaching the node already
 /// requires the internal-auth secret, so "no scopes" is not an untrusted caller.
+// The `Err` carries a ready axum `Response` so handlers can `return` it
+// directly; that type is large by design and this is a request-path guard.
+#[allow(clippy::result_large_err)]
 fn require_admin_scope(headers: &HeaderMap) -> Result<(), Response> {
     let Some(raw) = headers.get(SCOPES_HEADER).and_then(|v| v.to_str().ok()) else {
         return Ok(());
@@ -226,7 +229,13 @@ mod tests {
         // No scope header at all (auth disabled / direct dev): allowed.
         assert!(require_admin_scope(&HeaderMap::new()).is_ok());
 
-        for granted in ["admin:read", "admin:write", "admin:*", "*", "kv:read admin:read"] {
+        for granted in [
+            "admin:read",
+            "admin:write",
+            "admin:*",
+            "*",
+            "kv:read admin:read",
+        ] {
             let mut headers = HeaderMap::new();
             headers.insert(SCOPES_HEADER, granted.parse().unwrap());
             assert!(
@@ -328,11 +337,10 @@ mod tests {
             assert_eq!(semaphore_inventory["count"], 1);
             assert_eq!(semaphore_inventory["semaphores"][0]["key"], "shared-pool");
 
-            let election_inventory =
-                crate::test_support::json(
-                    elections(State(node.clone()), org, admin_headers()).await,
-                )
-                .await;
+            let election_inventory = crate::test_support::json(
+                elections(State(node.clone()), org, admin_headers()).await,
+            )
+            .await;
             assert_eq!(election_inventory["count"], 1);
             assert_eq!(election_inventory["elections"][0]["name"], "scheduler");
         }

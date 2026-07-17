@@ -6137,7 +6137,10 @@ mod tests {
         value["next_fencing_token"] = serde_json::json!(0);
         let regressed = serde_json::to_vec(&value).unwrap();
         let err = StateMachine::new().restore(&regressed).unwrap_err();
-        assert!(err.to_string().contains("re-mint"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("re-mint"),
+            "unexpected error: {err}"
+        );
 
         // Counter field absent entirely (migrated/truncated snapshot): serde's
         // `#[serde(default)]` would silently zero it — the validator refuses.
@@ -6163,10 +6166,7 @@ mod tests {
 
         // Drop the grant but keep the held-key entry pointing at it: a
         // half-released lock. Must be refused, not served.
-        value["locks"]["grants"]
-            .as_object_mut()
-            .unwrap()
-            .clear();
+        value["locks"]["grants"].as_object_mut().unwrap().clear();
         let torn = serde_json::to_vec(&value).unwrap();
         let err = StateMachine::new().restore(&torn).unwrap_err();
         assert!(
