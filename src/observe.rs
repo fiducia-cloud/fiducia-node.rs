@@ -329,7 +329,10 @@ mod tests {
             assert_eq!(semaphore_inventory["semaphores"][0]["key"], "shared-pool");
 
             let election_inventory =
-                crate::test_support::json(elections(State(node.clone()), org).await).await;
+                crate::test_support::json(
+                    elections(State(node.clone()), org, admin_headers()).await,
+                )
+                .await;
             assert_eq!(election_inventory["count"], 1);
             assert_eq!(election_inventory["elections"][0]["name"], "scheduler");
         }
