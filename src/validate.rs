@@ -145,6 +145,14 @@ pub fn lock_acquire(
     Ok(())
 }
 
+/// Validate a lock release: the holder is echoed back into the (scoped) command
+/// and matched against the grant, so bound its length like every other holder id.
+/// Release itself persists nothing, but validating here keeps every mutating lock
+/// path consistently bounded and rejects obvious abuse before `propose`.
+pub fn lock_release(holder: &str) -> Result<(), Rejection> {
+    check_str("holder", holder, MAX_HOLDER_BYTES, false)
+}
+
 /// Validate a semaphore acquire: key, optional holder, holder limit, optional TTL.
 pub fn semaphore_acquire(
     key: &str,
@@ -346,6 +354,17 @@ mod tests {
             "ttl_too_large"
         );
         assert!(lock_acquire(&keys, &None, Some(MAX_TTL_MS)).is_ok());
+    }
+
+    #[test]
+    fn lock_release_bounds_the_holder() {
+        assert!(lock_release("worker-a").is_ok());
+        assert_eq!(lock_release("").unwrap_err().code, "empty_field");
+        assert_eq!(
+            lock_release(&big(MAX_HOLDER_BYTES + 1)).unwrap_err().code,
+            "field_too_long"
+        );
+        assert!(lock_release(&big(MAX_HOLDER_BYTES)).is_ok());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::Uri,
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -30,6 +30,50 @@ use serde_json::json;
 
 use crate::consensus::{read_error_response, Node, Role};
 use crate::org_scope::OrgScope;
+
+/// Header the load balancer forwards carrying the caller's granted scopes
+/// (space-separated), derived from the verified API key / JWT.
+const SCOPES_HEADER: &str = "x-fiducia-scopes";
+
+/// Scopes that may observe a tenant's coordination *inventory* (every holder +
+/// fencing token in the org). This is an operator surface, not a per-key read.
+const ADMIN_OBSERVE_SCOPES: &[&str] = &["*", "admin:*", "admin:read", "admin:write"];
+
+/// Defense-in-depth admin gate for the tenant-inventory observe reads
+/// (`/v1/observe/{locks,semaphores,elections}`), which return *every* holder and
+/// fencing token in the caller org — a fencing token is a capability, so a plain
+/// `locks:read` key must not be able to enumerate them.
+///
+/// The load balancer already gates `/v1/observe/*` behind an admin scope (see
+/// `required_scopes_for_route` in fiducia-load-balance). This is the node-side
+/// backstop: if a request still arrives carrying a forwarded scope set that lacks
+/// an admin scope (an LB misconfiguration, a future direct-admin caller, or a
+/// narrower key than the LB gate assumed), the node refuses it too.
+///
+/// When **no** scope header is present at all — auth disabled for local/dev, or
+/// direct in-cluster node introspection inside the trusted-hop boundary — the
+/// check is skipped so those paths keep working. Reaching the node already
+/// requires the internal-auth secret, so "no scopes" is not an untrusted caller.
+fn require_admin_scope(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(raw) = headers.get(SCOPES_HEADER).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    let has_admin = raw
+        .split_whitespace()
+        .any(|granted| ADMIN_OBSERVE_SCOPES.contains(&granted));
+    if has_admin {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "insufficient_scope",
+            "detail": "observing the tenant coordination inventory requires an admin scope",
+            "required_scopes": ["admin:read", "admin:write"],
+        })),
+    )
+        .into_response())
+}
 
 pub fn router() -> Router<Arc<Node>> {
     Router::new()
@@ -42,7 +86,15 @@ pub fn router() -> Router<Arc<Node>> {
 
 /// `GET /v1/observe/locks` — active lock grants and FIFO waiters for the caller
 /// org (leader-gated read of the lock-coordinator shard).
-async fn locks(State(node): State<Arc<Node>>, org: OrgScope, uri: Uri) -> Response {
+async fn locks(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(denied) = require_admin_scope(&headers) {
+        return denied;
+    }
     match node.lock_inventory().await {
         Ok(mut inv) => {
             inv.held.retain(|holding| {
@@ -64,7 +116,15 @@ async fn locks(State(node): State<Arc<Node>>, org: OrgScope, uri: Uri) -> Respon
 
 /// `GET /v1/observe/semaphores` — caller-org counting semaphores with holders,
 /// free permits, and waiters.
-async fn semaphores(State(node): State<Arc<Node>>, org: OrgScope, uri: Uri) -> Response {
+async fn semaphores(
+    State(node): State<Arc<Node>>,
+    org: OrgScope,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(denied) = require_admin_scope(&headers) {
+        return denied;
+    }
     match node.semaphore_inventory().await {
         Ok(mut list) => {
             list.retain(|semaphore| org.unscope(&semaphore.key).is_some());
@@ -76,7 +136,10 @@ async fn semaphores(State(node): State<Arc<Node>>, org: OrgScope, uri: Uri) -> R
 
 /// `GET /v1/observe/elections` — current leaders for caller-org elections,
 /// merged across all shards this node hosts.
-async fn elections(State(node): State<Arc<Node>>, org: OrgScope) -> Response {
+async fn elections(State(node): State<Arc<Node>>, org: OrgScope, headers: HeaderMap) -> Response {
+    if let Err(denied) = require_admin_scope(&headers) {
+        return denied;
+    }
     let elections: Vec<_> = node
         .list_elections()
         .await
@@ -150,6 +213,56 @@ mod tests {
     use super::*;
     use crate::state::Command;
 
+    /// Headers carrying an admin scope, as the LB forwards them for an
+    /// admin-scoped observe request.
+    fn admin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(SCOPES_HEADER, "admin:read".parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn require_admin_scope_allows_admin_and_rejects_non_admin() {
+        // No scope header at all (auth disabled / direct dev): allowed.
+        assert!(require_admin_scope(&HeaderMap::new()).is_ok());
+
+        for granted in ["admin:read", "admin:write", "admin:*", "*", "kv:read admin:read"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SCOPES_HEADER, granted.parse().unwrap());
+            assert!(
+                require_admin_scope(&headers).is_ok(),
+                "scope set `{granted}` should be allowed to observe inventory"
+            );
+        }
+
+        // A plain locks:read key (the enumeration threat) is rejected, as is an
+        // empty/scopeless forwarded set.
+        for granted in ["locks:read", "locks:read locks:write", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SCOPES_HEADER, granted.parse().unwrap());
+            let denied = require_admin_scope(&headers).expect_err("must be forbidden");
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_locks_rejects_a_forwarded_non_admin_scope() {
+        // Even though the inventory belongs to the caller org, a forwarded
+        // locks:read scope must not be able to enumerate holders + fencing tokens.
+        let node = crate::test_support::node(4);
+        let org = OrgScope("org-a".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(SCOPES_HEADER, "locks:read".parse().unwrap());
+        let response = locks(
+            State(node),
+            org,
+            headers,
+            Uri::from_static("/v1/observe/locks"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn tenant_observability_inventory_never_leaks_other_org_entries() {
         let node = crate::test_support::node(4);
@@ -189,6 +302,7 @@ mod tests {
                 locks(
                     State(node.clone()),
                     org.clone(),
+                    admin_headers(),
                     Uri::from_static("/v1/observe/locks"),
                 )
                 .await,
@@ -205,6 +319,7 @@ mod tests {
                 semaphores(
                     State(node.clone()),
                     org.clone(),
+                    admin_headers(),
                     Uri::from_static("/v1/observe/semaphores"),
                 )
                 .await,
@@ -214,7 +329,10 @@ mod tests {
             assert_eq!(semaphore_inventory["semaphores"][0]["key"], "shared-pool");
 
             let election_inventory =
-                crate::test_support::json(elections(State(node.clone()), org).await).await;
+                crate::test_support::json(
+                    elections(State(node.clone()), org, admin_headers()).await,
+                )
+                .await;
             assert_eq!(election_inventory["count"], 1);
             assert_eq!(election_inventory["elections"][0]["name"], "scheduler");
         }

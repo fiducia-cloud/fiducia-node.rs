@@ -144,6 +144,9 @@ async fn release_token(
     uri: Uri,
     Json(body): Json<ReleaseBody>,
 ) -> Response {
+    if let Err(rejection) = crate::validate::lock_release(&body.holder) {
+        return rejection.into_response();
+    }
     release(node, org, uri, body).await
 }
 
