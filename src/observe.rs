@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::Uri,
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -30,6 +30,50 @@ use serde_json::json;
 
 use crate::consensus::{read_error_response, Node, Role};
 use crate::org_scope::OrgScope;
+
+/// Header the load balancer forwards carrying the caller's granted scopes
+/// (space-separated), derived from the verified API key / JWT.
+const SCOPES_HEADER: &str = "x-fiducia-scopes";
+
+/// Scopes that may observe a tenant's coordination *inventory* (every holder +
+/// fencing token in the org). This is an operator surface, not a per-key read.
+const ADMIN_OBSERVE_SCOPES: &[&str] = &["*", "admin:*", "admin:read", "admin:write"];
+
+/// Defense-in-depth admin gate for the tenant-inventory observe reads
+/// (`/v1/observe/{locks,semaphores,elections}`), which return *every* holder and
+/// fencing token in the caller org — a fencing token is a capability, so a plain
+/// `locks:read` key must not be able to enumerate them.
+///
+/// The load balancer already gates `/v1/observe/*` behind an admin scope (see
+/// `required_scopes_for_route` in fiducia-load-balance). This is the node-side
+/// backstop: if a request still arrives carrying a forwarded scope set that lacks
+/// an admin scope (an LB misconfiguration, a future direct-admin caller, or a
+/// narrower key than the LB gate assumed), the node refuses it too.
+///
+/// When **no** scope header is present at all — auth disabled for local/dev, or
+/// direct in-cluster node introspection inside the trusted-hop boundary — the
+/// check is skipped so those paths keep working. Reaching the node already
+/// requires the internal-auth secret, so "no scopes" is not an untrusted caller.
+fn require_admin_scope(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(raw) = headers.get(SCOPES_HEADER).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    let has_admin = raw
+        .split_whitespace()
+        .any(|granted| ADMIN_OBSERVE_SCOPES.contains(&granted));
+    if has_admin {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "insufficient_scope",
+            "detail": "observing the tenant coordination inventory requires an admin scope",
+            "required_scopes": ["admin:read", "admin:write"],
+        })),
+    )
+        .into_response())
+}
 
 pub fn router() -> Router<Arc<Node>> {
     Router::new()
