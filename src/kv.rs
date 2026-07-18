@@ -259,6 +259,7 @@ async fn list(node: Arc<Node>, org: OrgScope, prefix: String) -> Response {
         .filter_map(|mut item| {
             let unscoped = org.unscope(&item.key)?.to_string();
             item.key = unscoped;
+            item.entry.value = unseal_for_read(&node, &item.entry.value);
             Some(item)
         })
         .collect();
