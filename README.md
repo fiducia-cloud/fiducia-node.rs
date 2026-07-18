@@ -22,7 +22,7 @@ All over HTTP (`/v1`):
 | **Locks (multi-key)** | `/v1/locks/*`      | Mutual exclusion over a **union** of keys — the flagship. Atomic all-or-nothing, FIFO, deadlock-free, fencing tokens, TTL leases. |
 | **Semaphores**        | `/v1/semaphores/*` | Counting locks: up to `limit` concurrent holders, FIFO queue beyond the cap. |
 | **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
-| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). |
+| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted at rest by default** (AES-256-GCM) when `FIDUCIA_KV_ENCRYPTION_KEY` is set; per-write `{"plaintext": true}` opt-out. |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
