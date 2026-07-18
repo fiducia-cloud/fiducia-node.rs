@@ -22,7 +22,7 @@ All over HTTP (`/v1`):
 | **Locks (multi-key)** | `/v1/locks/*`      | Mutual exclusion over a **union** of keys — the flagship. Atomic all-or-nothing, FIFO, deadlock-free, fencing tokens, TTL leases. |
 | **Semaphores**        | `/v1/semaphores/*` | Counting locks: up to `limit` concurrent holders, FIFO queue beyond the cap. |
 | **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
-| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted at rest by default** (AES-256-GCM) when `FIDUCIA_KV_ENCRYPTION_KEY` is set; per-write `{"plaintext": true}` opt-out. |
+| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted before Raft** through external Vault Transit or a versioned local AES-256-GCM keyring; per-write `{"plaintext": true}` opt-out. |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
@@ -429,7 +429,15 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_RAFT_RPC_TIMEOUT_MS` | integer | `10000` | no | Total timeout for vote and bounded AppendEntries HTTP requests. |
 | `FIDUCIA_RAFT_SNAPSHOT_TIMEOUT_MS` | integer | `120000` | no | Longer total timeout for InstallSnapshot HTTP requests. |
 | `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
-| `FIDUCIA_KV_ENCRYPTION_KEY` | base64 32 bytes | *(unset ⇒ KV plaintext at rest)* | recommended | Cluster-wide AES-256 key for **KV encryption at rest**. When set, `/v1/kv` values are sealed (AES-256-GCM) before entering the Raft log, so the on-disk log, snapshots, and in-memory state all hold ciphertext. Must be **identical on every replica**. A client may opt a single write out with `{"plaintext": true}`. |
+| `FIDUCIA_KV_ENCRYPTION_KEYS` | JSON object | *(unset)* | **yes** | Versioned local keyring mapping key IDs to base64 32-byte AES-256 keys. Retain old IDs while any live value or backup uses them. |
+| `FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID` | string | *(unset)* | no | Local key ID used for new writes. Required with the versioned keyring. Changing it rotates writes without breaking reads under retained old IDs. |
+| `FIDUCIA_KV_ENCRYPTION_KEY` | base64 32 bytes | *(unset)* | **yes** | Legacy single local key accepted for migration. Prefer the versioned keyring so rotation can overlap old and new keys. |
+| `FIDUCIA_KV_ENCRYPTION_KEY_ID` | string | `legacy` | no | Optional envelope key ID for the legacy single-key setting. It is invalid without `FIDUCIA_KV_ENCRYPTION_KEY`. |
+| `FIDUCIA_KV_VAULT_ADDR` | URL | *(unset)* | no | External Vault Transit-compatible base URL. Public hosts require HTTPS; cleartext is accepted only for loopback/private/internal hosts. |
+| `FIDUCIA_KV_VAULT_TOKEN` | string | *(unset)* | **yes** | Short-lived, least-privilege token allowed to encrypt/decrypt the configured Transit key. Redirects are disabled. |
+| `FIDUCIA_KV_VAULT_KEY` | string | *(unset)* | no | Transit key name used for KV envelopes. |
+| `FIDUCIA_KV_VAULT_MOUNT` | string | `transit` | no | Transit secrets-engine mount name. |
+| `FIDUCIA_KV_VAULT_NAMESPACE` | string | *(unset)* | no | Optional Vault Enterprise namespace. |
 | `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Debug-build-only local-dev opt-out. Release binaries compile the bypass out. |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
 | `FIDUCIA_RAFT_CHECK_QUORUM` | bool | `true` | no | Leader steps down without a quorum of live followers. Disable with `0`/`false`/`off`. |
@@ -439,6 +447,17 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_RAFT_ELECTION_JITTER_MS` | integer | `150` | no | Random jitter added to the election timeout. |
 
 Bool vars accept `1`/`true` (and, for the Raft toggles, `0`/`false`/`off`).
+
+Choose exactly one KV protection backend. Partial or conflicting configuration
+fails startup. Both backends seal values before a proposal enters Raft and bind
+the ciphertext to its organization-scoped storage key. Reads fail closed when a
+provider/key is unavailable or an envelope is malformed; they never return raw
+ciphertext or silently fall back to plaintext. KV get/list responses expose
+`protection.at_rest` plus provider, key ID, or provider key version metadata.
+Vault rotation is performed by a separate operator identity; Fiducia writes with
+the provider's new version and keeps reading supported old versions. Local
+rotation adds a new key ID and changes the active ID, then rewrites long-lived
+values before retiring an old key.
 
 ### Secure-by-default trust boundary
 

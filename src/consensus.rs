@@ -2561,7 +2561,9 @@ impl Node {
             transport,
             tasks,
             metrics: Arc::new(crate::metrics::Metrics::new()),
-            kv_cipher: crate::kv::KvCipher::from_env().map(Arc::new),
+            kv_cipher: crate::kv::KvCipher::from_env()
+                .unwrap_or_else(|error| panic!("invalid KV protection configuration: {error}"))
+                .map(Arc::new),
         }
     }
 
@@ -3215,7 +3217,11 @@ mod tests {
                 "node.civo.fiducia.cloud:9090".to_string(),
             ]
         );
-        assert_eq!(peers.len() + 1, 3, "3-member group, quorum 2, tolerates 1 loss");
+        assert_eq!(
+            peers.len() + 1,
+            3,
+            "3-member group, quorum 2, tolerates 1 loss"
+        );
     }
 
     // --- response-shaping unit test (no cluster) --------------------------

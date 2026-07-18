@@ -19,11 +19,14 @@
 //!   * `PUT    /v1/kv?key=K`              — upsert `{ "value", "ttl_ms"? }`, optional CAS
 //!   * `DELETE /v1/kv?key=K`              — delete a key
 
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use axum::{
     extract::{Query, State},
@@ -36,7 +39,8 @@ use axum::{
     Json, Router,
 };
 use base64::Engine;
-use serde::Deserialize;
+use reqwest::Url;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
 
@@ -47,93 +51,674 @@ use crate::state::Command;
 /// Marker prefix on a sealed KV value. Self-describing so a value can be
 /// recognised as ciphertext on read without a schema flag, which is what lets
 /// encrypted and plaintext-declared values coexist in the same keyspace.
-const KV_ENVELOPE_PREFIX: &str = "fcenc:v1:";
+const KV_ENVELOPE_V1_PREFIX: &str = "fcenc:v1:";
+const KV_ENVELOPE_V2_PREFIX: &str = "fcenc:v2:";
+const KV_VAULT_ENVELOPE_PREFIX: &str = "fcenc:vault:v1:";
+const VAULT_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 
-/// KV value encryption at rest (AES-256-GCM).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct KvProtection {
+    pub at_rest: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_version: Option<u64>,
+}
+
+impl KvProtection {
+    fn plaintext() -> Self {
+        Self {
+            at_rest: "plaintext",
+            provider: None,
+            key_id: None,
+            key_version: None,
+        }
+    }
+}
+
+struct UnsealedValue {
+    value: String,
+    protection: KvProtection,
+}
+
+#[derive(Debug)]
+pub struct KvCryptoError(String);
+
+impl KvCryptoError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for KvCryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KvCryptoError {}
+
+/// KV value protection at rest.
 ///
-/// **Default posture:** when `FIDUCIA_KV_ENCRYPTION_KEY` is set (base64 of a
-/// 32-byte key, the same on every replica), values are sealed *before* they
-/// enter the Raft log — so the on-disk log, the snapshots, and the in-memory
-/// state machine all hold ciphertext only, closing the plaintext-at-rest hole.
-/// A client may opt a specific write out with `"plaintext": true` (a hot key
-/// it would rather not pay decrypt-on-read for); that value is stored verbatim.
+/// **Default posture:** when Vault Transit or a local AES-256-GCM keyring is
+/// configured, values are sealed *before* they enter the Raft log — so the
+/// on-disk log, snapshots, and in-memory state machine all hold ciphertext.
+/// A client may opt a specific write out with `"plaintext": true`; that value
+/// is stored verbatim.
 ///
 /// Sealing happens once, on the node that receives the PUT, and the resulting
 /// envelope string is what gets replicated — so every replica stores identical
 /// bytes and the state machine stays deterministic despite the random nonce.
-pub struct KvCipher {
-    cipher: Aes256Gcm,
+pub enum KvCipher {
+    Local(LocalKeyring),
+    Vault(VaultTransit),
+}
+
+pub struct LocalKeyring {
+    active_key_id: String,
+    keys: HashMap<String, Aes256Gcm>,
+}
+
+pub struct VaultTransit {
+    address: Url,
+    mount: String,
+    key_name: String,
+    token: String,
+    namespace: Option<String>,
+    client: reqwest::Client,
+}
+
+impl fmt::Debug for KvCipher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(keyring) => f
+                .debug_struct("KvCipher::Local")
+                .field("active_key_id", &keyring.active_key_id)
+                .field("key_count", &keyring.keys.len())
+                .finish(),
+            Self::Vault(vault) => f
+                .debug_struct("KvCipher::Vault")
+                .field("address", &vault.address)
+                .field("mount", &vault.mount)
+                .field("key_name", &vault.key_name)
+                .field("namespace", &vault.namespace)
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl KvCipher {
-    /// Load the cluster KV key from `FIDUCIA_KV_ENCRYPTION_KEY`. `None` (env
-    /// unset/empty/malformed) means encryption is disabled and values are
-    /// stored as-is — the pre-existing behaviour.
-    pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("FIDUCIA_KV_ENCRYPTION_KEY").ok()?;
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return None;
+    /// Load one fail-closed protection backend.
+    ///
+    /// `FIDUCIA_KV_VAULT_ADDR` + `FIDUCIA_KV_VAULT_TOKEN` +
+    /// `FIDUCIA_KV_VAULT_KEY` selects HashiCorp Vault Transit. Vault owns key
+    /// material and key-version rotation; Fiducia stores only Vault ciphertext.
+    /// Otherwise a local keyring is loaded from
+    /// `FIDUCIA_KV_ENCRYPTION_KEYS` (JSON object of key-id -> base64 key) and
+    /// `FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID`. The legacy single-key variable is
+    /// still accepted and is emitted as a v2 envelope with key id `legacy`.
+    /// Partial or malformed configuration is an error, never a silent downgrade.
+    pub fn from_env() -> Result<Option<Self>, KvCryptoError> {
+        Self::from_lookup(nonempty_env)
+    }
+
+    fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Option<Self>, KvCryptoError> {
+        let vault_address = lookup("FIDUCIA_KV_VAULT_ADDR");
+        let vault_token = lookup("FIDUCIA_KV_VAULT_TOKEN");
+        let vault_key = lookup("FIDUCIA_KV_VAULT_KEY");
+        let vault_mount = lookup("FIDUCIA_KV_VAULT_MOUNT");
+        let vault_namespace = lookup("FIDUCIA_KV_VAULT_NAMESPACE");
+        let versioned_keys = lookup("FIDUCIA_KV_ENCRYPTION_KEYS");
+        let active_key_id = lookup("FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID");
+        let legacy_key = lookup("FIDUCIA_KV_ENCRYPTION_KEY");
+        let legacy_key_id = lookup("FIDUCIA_KV_ENCRYPTION_KEY_ID");
+
+        let vault_present = [
+            &vault_address,
+            &vault_token,
+            &vault_key,
+            &vault_mount,
+            &vault_namespace,
+        ]
+        .into_iter()
+        .any(Option::is_some);
+        let versioned_present = versioned_keys.is_some() || active_key_id.is_some();
+        let legacy_present = legacy_key.is_some() || legacy_key_id.is_some();
+        let local_present = versioned_present || legacy_present;
+
+        if vault_present && local_present {
+            return Err(KvCryptoError::new(
+                "configure exactly one KV protection backend: Vault Transit or a local keyring",
+            ));
         }
-        let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
-        let key: [u8; 32] = bytes.try_into().ok()?;
-        Some(Self {
-            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+
+        if vault_present {
+            let address = vault_address.ok_or_else(|| {
+                KvCryptoError::new("FIDUCIA_KV_VAULT_ADDR is required for Vault Transit")
+            })?;
+            let token = vault_token.ok_or_else(|| {
+                KvCryptoError::new("FIDUCIA_KV_VAULT_TOKEN is required for Vault Transit")
+            })?;
+            let key_name = vault_key.ok_or_else(|| {
+                KvCryptoError::new("FIDUCIA_KV_VAULT_KEY is required for Vault Transit")
+            })?;
+            let address = validate_vault_address(&address)?;
+            let mount = vault_mount.unwrap_or_else(|| "transit".to_string());
+            validate_vault_segment("FIDUCIA_KV_VAULT_MOUNT", &mount)?;
+            validate_vault_segment("FIDUCIA_KV_VAULT_KEY", &key_name)?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| KvCryptoError::new("could not construct Vault Transit client"))?;
+            return Ok(Some(Self::Vault(VaultTransit {
+                address,
+                mount,
+                key_name,
+                token,
+                namespace: vault_namespace,
+                client,
+            })));
+        }
+
+        if versioned_present && legacy_present {
+            return Err(KvCryptoError::new(
+                "configure either FIDUCIA_KV_ENCRYPTION_KEYS or the legacy single key, not both",
+            ));
+        }
+
+        if versioned_present {
+            let raw = versioned_keys.ok_or_else(|| {
+                KvCryptoError::new(
+                    "FIDUCIA_KV_ENCRYPTION_KEYS is required with FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID",
+                )
+            })?;
+            let encoded: HashMap<String, String> = serde_json::from_str(&raw).map_err(|_| {
+                KvCryptoError::new(
+                    "FIDUCIA_KV_ENCRYPTION_KEYS must be a JSON object of key ids to base64 keys",
+                )
+            })?;
+            let active_key_id = active_key_id.ok_or_else(|| {
+                KvCryptoError::new(
+                    "FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID is required with the keyring",
+                )
+            })?;
+            return Ok(Some(Self::Local(LocalKeyring::new(
+                active_key_id,
+                encoded,
+            )?)));
+        }
+
+        if !legacy_present {
+            return Ok(None);
+        }
+        let raw = legacy_key.ok_or_else(|| {
+            KvCryptoError::new(
+                "FIDUCIA_KV_ENCRYPTION_KEY is required with FIDUCIA_KV_ENCRYPTION_KEY_ID",
+            )
+        })?;
+        let key_id = legacy_key_id.unwrap_or_else(|| "legacy".to_string());
+        Ok(Some(Self::Local(LocalKeyring::new(
+            key_id.clone(),
+            HashMap::from([(key_id, raw)]),
+        )?)))
+    }
+
+    pub fn posture(&self) -> String {
+        match self {
+            Self::Local(keyring) => format!(
+                "local-keyring active_key_id={} readable_keys={}",
+                keyring.active_key_id,
+                keyring.keys.len()
+            ),
+            Self::Vault(vault) => format!(
+                "vault-transit address={} mount={} key={}",
+                vault.address, vault.mount, vault.key_name
+            ),
+        }
+    }
+
+    async fn seal(&self, storage_key: &str, plaintext: &str) -> Result<String, KvCryptoError> {
+        match self {
+            Self::Local(keyring) => keyring.seal(storage_key, plaintext),
+            Self::Vault(vault) => vault.seal(storage_key, plaintext).await,
+        }
+    }
+
+    async fn unseal(
+        &self,
+        storage_key: &str,
+        stored: &str,
+    ) -> Result<UnsealedValue, KvCryptoError> {
+        match self {
+            Self::Local(keyring) => keyring.unseal(storage_key, stored),
+            Self::Vault(vault) => vault.unseal(storage_key, stored).await,
+        }
+    }
+}
+
+impl LocalKeyring {
+    fn new(active_key_id: String, encoded: HashMap<String, String>) -> Result<Self, KvCryptoError> {
+        validate_key_id(&active_key_id)?;
+        if encoded.is_empty() {
+            return Err(KvCryptoError::new(
+                "FIDUCIA_KV_ENCRYPTION_KEYS must contain at least one key",
+            ));
+        }
+        let mut keys = HashMap::new();
+        for (key_id, value) in encoded {
+            validate_key_id(&key_id)?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value.trim())
+                .map_err(|_| KvCryptoError::new(format!("KV key {key_id:?} is not base64")))?;
+            let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                KvCryptoError::new(format!("KV key {key_id:?} must decode to exactly 32 bytes"))
+            })?;
+            keys.insert(key_id, Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)));
+        }
+        if !keys.contains_key(&active_key_id) {
+            return Err(KvCryptoError::new(
+                "FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID is not present in the keyring",
+            ));
+        }
+        Ok(Self {
+            active_key_id,
+            keys,
         })
     }
 
-    /// Seal plaintext into `PREFIX + base64(nonce ‖ ciphertext ‖ tag)`.
-    pub fn seal(&self, plaintext: &str) -> String {
+    fn seal(&self, storage_key: &str, plaintext: &str) -> Result<String, KvCryptoError> {
+        let cipher = self
+            .keys
+            .get(&self.active_key_id)
+            .ok_or_else(|| KvCryptoError::new("active KV key disappeared"))?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-        let ciphertext = self
-            .cipher
-            .encrypt(&nonce, plaintext.as_bytes())
-            .expect("AES-256-GCM encryption is infallible for in-memory inputs");
+        let aad = local_aad(&self.active_key_id, storage_key);
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| KvCryptoError::new("KV encryption failed"))?;
         let mut blob = nonce.to_vec();
         blob.extend_from_slice(&ciphertext);
-        format!(
-            "{KV_ENVELOPE_PREFIX}{}",
+        Ok(format!(
+            "{KV_ENVELOPE_V2_PREFIX}{}:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.active_key_id),
             base64::engine::general_purpose::STANDARD.encode(blob)
-        )
+        ))
     }
 
-    /// Return the plaintext when `stored` is one of our envelopes and
-    /// authenticates; otherwise return `stored` unchanged. A plaintext-declared
-    /// value (no prefix) or a value written when encryption was off simply
-    /// passes through — so reads never fail because of a representation
-    /// mismatch.
-    pub fn unseal(&self, stored: &str) -> String {
-        let Some(b64) = stored.strip_prefix(KV_ENVELOPE_PREFIX) else {
-            return stored.to_string();
-        };
-        let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-            return stored.to_string();
-        };
-        if blob.len() < 12 + 16 {
-            return stored.to_string(); // need a nonce and a GCM tag
+    fn unseal(&self, storage_key: &str, stored: &str) -> Result<UnsealedValue, KvCryptoError> {
+        if let Some(rest) = stored.strip_prefix(KV_ENVELOPE_V2_PREFIX) {
+            let (encoded_key_id, encoded_blob) = rest
+                .split_once(':')
+                .ok_or_else(|| KvCryptoError::new("malformed fcenc:v2 KV envelope"))?;
+            let key_id = String::from_utf8(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded_key_id)
+                    .map_err(|_| KvCryptoError::new("malformed fcenc:v2 key id"))?,
+            )
+            .map_err(|_| KvCryptoError::new("fcenc:v2 key id is not UTF-8"))?;
+            let cipher = self.keys.get(&key_id).ok_or_else(|| {
+                KvCryptoError::new(format!(
+                    "KV ciphertext references unavailable key id {key_id:?}"
+                ))
+            })?;
+            let blob = decode_cipher_blob(encoded_blob)?;
+            let (nonce, ciphertext) = blob.split_at(12);
+            let aad = local_aad(&key_id, storage_key);
+            let plaintext = cipher
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|_| KvCryptoError::new("KV ciphertext authentication failed"))?;
+            return decoded_plaintext(
+                plaintext,
+                KvProtection {
+                    at_rest: "encrypted",
+                    provider: Some("local_keyring"),
+                    key_id: Some(key_id),
+                    key_version: None,
+                },
+            );
         }
-        let (nonce, ciphertext) = blob.split_at(12);
-        match self.cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
-            Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_else(|_| stored.to_string()),
-            Err(_) => stored.to_string(),
+
+        if let Some(encoded_blob) = stored.strip_prefix(KV_ENVELOPE_V1_PREFIX) {
+            let blob = decode_cipher_blob(encoded_blob)?;
+            let (nonce, ciphertext) = blob.split_at(12);
+            for (key_id, cipher) in &self.keys {
+                if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+                    return decoded_plaintext(
+                        plaintext,
+                        KvProtection {
+                            at_rest: "encrypted",
+                            provider: Some("local_keyring_legacy"),
+                            key_id: Some(key_id.clone()),
+                            key_version: None,
+                        },
+                    );
+                }
+            }
+            return Err(KvCryptoError::new(
+                "legacy KV ciphertext did not authenticate with any configured key",
+            ));
         }
+
+        if is_fiducia_envelope(stored) {
+            return Err(KvCryptoError::new(
+                "KV ciphertext was created by a different protection provider",
+            ));
+        }
+        Ok(UnsealedValue {
+            value: stored.to_string(),
+            protection: KvProtection::plaintext(),
+        })
     }
+}
+
+impl VaultTransit {
+    fn endpoint(&self, operation: &str) -> Result<Url, KvCryptoError> {
+        let mut url = self.address.clone();
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| KvCryptoError::new("Vault address cannot hold path segments"))?;
+            path.pop_if_empty();
+            for segment in ["v1", self.mount.as_str(), operation, self.key_name.as_str()] {
+                path.push(segment);
+            }
+        }
+        Ok(url)
+    }
+
+    fn request(&self, url: Url) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(url)
+            .header("x-vault-token", self.token.as_str());
+        if let Some(namespace) = &self.namespace {
+            request = request.header("x-vault-namespace", namespace);
+        }
+        request
+    }
+
+    async fn seal(&self, storage_key: &str, plaintext: &str) -> Result<String, KvCryptoError> {
+        let response = self
+            .request(self.endpoint("encrypt")?)
+            .json(&json!({
+                "plaintext": base64::engine::general_purpose::STANDARD.encode(plaintext),
+                "context": base64::engine::general_purpose::STANDARD.encode(storage_key),
+            }))
+            .send()
+            .await
+            .map_err(|_| KvCryptoError::new("Vault Transit encrypt request failed"))?;
+        if !response.status().is_success() {
+            return Err(KvCryptoError::new(format!(
+                "Vault Transit encrypt rejected with HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let body = bounded_vault_json(response, "encrypt").await?;
+        let ciphertext = body
+            .pointer("/data/ciphertext")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| KvCryptoError::new("Vault Transit encrypt omitted ciphertext"))?;
+        Ok(format!(
+            "{KV_VAULT_ENVELOPE_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(ciphertext)
+        ))
+    }
+
+    async fn unseal(
+        &self,
+        storage_key: &str,
+        stored: &str,
+    ) -> Result<UnsealedValue, KvCryptoError> {
+        let Some(encoded) = stored.strip_prefix(KV_VAULT_ENVELOPE_PREFIX) else {
+            if is_fiducia_envelope(stored) {
+                return Err(KvCryptoError::new(
+                    "KV ciphertext was created by a different protection provider",
+                ));
+            }
+            return Ok(UnsealedValue {
+                value: stored.to_string(),
+                protection: KvProtection::plaintext(),
+            });
+        };
+        let ciphertext = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| KvCryptoError::new("malformed Vault KV envelope"))?,
+        )
+        .map_err(|_| KvCryptoError::new("Vault KV envelope is not UTF-8"))?;
+        let response = self
+            .request(self.endpoint("decrypt")?)
+            .json(&json!({
+                "ciphertext": ciphertext,
+                "context": base64::engine::general_purpose::STANDARD.encode(storage_key),
+            }))
+            .send()
+            .await
+            .map_err(|_| KvCryptoError::new("Vault Transit decrypt request failed"))?;
+        if !response.status().is_success() {
+            return Err(KvCryptoError::new(format!(
+                "Vault Transit decrypt rejected with HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let body = bounded_vault_json(response, "decrypt").await?;
+        let encoded_plaintext = body
+            .pointer("/data/plaintext")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| KvCryptoError::new("Vault Transit decrypt omitted plaintext"))?;
+        let plaintext = base64::engine::general_purpose::STANDARD
+            .decode(encoded_plaintext)
+            .map_err(|_| KvCryptoError::new("Vault Transit plaintext was not base64"))?;
+        let key_version = ciphertext
+            .split(':')
+            .nth(1)
+            .and_then(|value| value.strip_prefix('v'))
+            .and_then(|value| value.parse().ok());
+        decoded_plaintext(
+            plaintext,
+            KvProtection {
+                at_rest: "encrypted",
+                provider: Some("vault_transit"),
+                key_id: Some(self.key_name.clone()),
+                key_version,
+            },
+        )
+    }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn bounded_vault_json(
+    mut response: reqwest::Response,
+    operation: &'static str,
+) -> Result<serde_json::Value, KvCryptoError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > VAULT_RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(KvCryptoError::new(format!(
+            "Vault Transit {operation} response exceeded {VAULT_RESPONSE_MAX_BYTES} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| KvCryptoError::new(format!("Vault Transit {operation} response failed")))?
+    {
+        if body.len().saturating_add(chunk.len()) > VAULT_RESPONSE_MAX_BYTES {
+            return Err(KvCryptoError::new(format!(
+                "Vault Transit {operation} response exceeded {VAULT_RESPONSE_MAX_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| KvCryptoError::new(format!("Vault Transit {operation} response was not JSON")))
+}
+
+fn validate_key_id(key_id: &str) -> Result<(), KvCryptoError> {
+    if key_id.is_empty()
+        || key_id.len() > 128
+        || !key_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(KvCryptoError::new(
+            "KV key ids must be 1-128 ASCII letters, numbers, '.', '_' or '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vault_segment(name: &str, value: &str) -> Result<(), KvCryptoError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(KvCryptoError::new(format!(
+            "{name} must be 1-128 ASCII letters, numbers, '_' or '-'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_vault_address(raw: &str) -> Result<Url, KvCryptoError> {
+    let mut url = Url::parse(raw)
+        .map_err(|_| KvCryptoError::new("FIDUCIA_KV_VAULT_ADDR is not a valid URL"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| KvCryptoError::new("FIDUCIA_KV_VAULT_ADDR must include a host"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+        || !matches!(url.scheme(), "http" | "https")
+        || (url.scheme() == "http" && !cleartext_internal_host_allowed(host))
+    {
+        return Err(KvCryptoError::new(
+            "Vault address must be HTTPS (or trusted internal HTTP) without credentials, path, query, or fragment",
+        ));
+    }
+    url.set_path("");
+    Ok(url)
+}
+
+fn cleartext_internal_host_allowed(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return match address {
+            IpAddr::V4(address) => {
+                address.is_loopback() || address.is_private() || address.is_link_local()
+            }
+            IpAddr::V6(address) => {
+                let first = address.segments()[0];
+                address.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    !host.contains('.')
+        || [
+            ".svc",
+            ".svc.cluster.local",
+            ".cluster.local",
+            ".internal",
+            ".local",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+}
+
+fn local_aad(key_id: &str, storage_key: &str) -> String {
+    format!("fiducia-kv:v2:{key_id}:{storage_key}")
+}
+
+fn decode_cipher_blob(encoded: &str) -> Result<Vec<u8>, KvCryptoError> {
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| KvCryptoError::new("KV ciphertext is not valid base64"))?;
+    if blob.len() < 12 + 16 {
+        return Err(KvCryptoError::new(
+            "KV ciphertext is too short for a nonce and authentication tag",
+        ));
+    }
+    Ok(blob)
+}
+
+fn decoded_plaintext(
+    plaintext: Vec<u8>,
+    protection: KvProtection,
+) -> Result<UnsealedValue, KvCryptoError> {
+    Ok(UnsealedValue {
+        value: String::from_utf8(plaintext)
+            .map_err(|_| KvCryptoError::new("decrypted KV value is not UTF-8"))?,
+        protection,
+    })
+}
+
+fn is_fiducia_envelope(value: &str) -> bool {
+    value.starts_with("fcenc:")
 }
 
 /// Seal a to-be-written value with the node's cipher unless the caller opted
 /// out or encryption is disabled.
-fn seal_for_write(node: &Node, value: String, plaintext_opt_out: bool) -> String {
+async fn seal_for_write(
+    node: &Node,
+    storage_key: &str,
+    value: String,
+    plaintext_opt_out: bool,
+) -> Result<String, KvCryptoError> {
     match node.kv_cipher() {
-        Some(cipher) if !plaintext_opt_out => cipher.seal(&value),
-        _ => value,
+        Some(cipher) if !plaintext_opt_out => cipher.seal(storage_key, &value).await,
+        _ => Ok(value),
     }
 }
 
 /// Unseal a read value with the node's cipher if configured.
-fn unseal_for_read(node: &Node, value: &str) -> String {
+async fn unseal_for_read(
+    node: &Node,
+    storage_key: &str,
+    value: &str,
+) -> Result<UnsealedValue, KvCryptoError> {
     match node.kv_cipher() {
-        Some(cipher) => cipher.unseal(value),
-        None => value.to_string(),
+        Some(cipher) => cipher.unseal(storage_key, value).await,
+        None if is_fiducia_envelope(value) => Err(KvCryptoError::new(
+            "encrypted KV value is unreadable because no protection backend is configured",
+        )),
+        None => Ok(UnsealedValue {
+            value: value.to_string(),
+            protection: KvProtection::plaintext(),
+        }),
     }
 }
 
@@ -145,7 +730,7 @@ pub struct PutBody {
     /// equals this. `0` means "must not exist".
     pub prev_revision: Option<u64>,
     /// Opt this write out of at-rest encryption (stored verbatim). Defaults to
-    /// encrypted whenever the cluster has a KV key configured.
+    /// encrypted whenever the cluster has a KV protection backend configured.
     #[serde(default)]
     pub plaintext: bool,
 }
@@ -182,22 +767,35 @@ async fn get_or_list(
         // The caller's key is namespaced into their org before it reaches the
         // state machine; the response echoes the caller-facing key, not the scoped
         // one, so the isolation is invisible to the client.
-        Some(key) => match node
-            .query(ReadRequest::Kv {
-                key: org.scope(&key),
-            })
-            .await
-        {
-            Ok(ReadResponse::Kv(Some(mut entry))) => {
-                entry.value = unseal_for_read(&node, &entry.value);
-                Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
+        Some(key) => {
+            let storage_key = org.scope(&key);
+            match node
+                .query(ReadRequest::Kv {
+                    key: storage_key.clone(),
+                })
+                .await
+            {
+                Ok(ReadResponse::Kv(Some(mut entry))) => {
+                    let unsealed = match unseal_for_read(&node, &storage_key, &entry.value).await {
+                        Ok(value) => value,
+                        Err(error) => return crypto_failure("decrypt", &error),
+                    };
+                    entry.value = unsealed.value;
+                    Json(json!({
+                        "key": key,
+                        "found": true,
+                        "entry": entry,
+                        "protection": unsealed.protection,
+                    }))
+                    .into_response()
+                }
+                Ok(ReadResponse::Kv(None)) => {
+                    Json(json!({ "key": key, "found": false })).into_response()
+                }
+                Err(err) => read_error_response(err, &uri),
+                _ => Json(json!({ "error": "unavailable" })).into_response(),
             }
-            Ok(ReadResponse::Kv(None)) => {
-                Json(json!({ "key": key, "found": false })).into_response()
-            }
-            Err(err) => read_error_response(err, &uri),
-            _ => Json(json!({ "error": "unavailable" })).into_response(),
-        },
+        }
         None => list(node, org, q.prefix.unwrap_or_default()).await,
     }
 }
@@ -216,10 +814,14 @@ async fn put_key(
     // Seal before the value enters the log, so ciphertext is what gets
     // replicated and persisted (log + snapshot). Sealing here (once) keeps the
     // replicated command byte-identical across replicas.
-    let value = seal_for_write(&node, body.value, body.plaintext);
+    let storage_key = org.scope(&key);
+    let value = match seal_for_write(&node, &storage_key, body.value, body.plaintext).await {
+        Ok(value) => value,
+        Err(error) => return crypto_failure("encrypt", &error),
+    };
     let result = node
         .propose(Command::KvPut {
-            key: org.scope(&key),
+            key: storage_key,
             value,
             ttl_ms: body.ttl_ms,
             prev_revision: body.prev_revision,
@@ -252,17 +854,27 @@ async fn delete_key(
 /// (they never share the prefix), which is what makes the list read tenant-safe.
 async fn list(node: Arc<Node>, org: OrgScope, prefix: String) -> Response {
     let scoped_prefix = org.scope(&prefix);
-    let keys: Vec<_> = node
-        .list_kv(&scoped_prefix)
-        .await
-        .into_iter()
-        .filter_map(|mut item| {
-            let unscoped = org.unscope(&item.key)?.to_string();
-            item.key = unscoped;
-            item.entry.value = unseal_for_read(&node, &item.entry.value);
-            Some(item)
-        })
-        .collect();
+    let mut keys = Vec::new();
+    for item in node.list_kv(&scoped_prefix).await {
+        let storage_key = item.key.clone();
+        let Some(unscoped) = org.unscope(&storage_key) else {
+            continue;
+        };
+        let unsealed = match unseal_for_read(&node, &storage_key, &item.entry.value).await {
+            Ok(value) => value,
+            Err(error) => return crypto_failure("decrypt", &error),
+        };
+        let mut row = json!({
+            "key": unscoped,
+            "value": unsealed.value,
+            "mod_revision": item.entry.mod_revision,
+            "protection": unsealed.protection,
+        });
+        if let Some(expires_at_ms) = item.entry.expires_at_ms {
+            row["expires_at_ms"] = json!(expires_at_ms);
+        }
+        keys.push(row);
+    }
     Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response()
 }
 
@@ -349,63 +961,278 @@ fn bad_request(detail: &str) -> Response {
         .into_response()
 }
 
+fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {
+    tracing::error!(operation, error = %error, "KV protection operation failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "kv_protection_unavailable",
+            "detail": "the KV value could not be protected or read safely",
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod kv_cipher_tests {
     use super::*;
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
 
-    fn cipher() -> KvCipher {
-        // Deterministic 32-byte test key.
-        let key: [u8; 32] = [7u8; 32];
-        KvCipher {
-            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
-        }
+    fn encoded_key(byte: u8) -> String {
+        base64::engine::general_purpose::STANDARD.encode([byte; 32])
+    }
+
+    fn keyring(active_key_id: &str, keys: &[(&str, u8)]) -> LocalKeyring {
+        LocalKeyring::new(
+            active_key_id.to_string(),
+            keys.iter()
+                .map(|(key_id, byte)| ((*key_id).to_string(), encoded_key(*byte)))
+                .collect(),
+        )
+        .expect("valid test keyring")
     }
 
     #[test]
-    fn seal_then_unseal_round_trips() {
-        let c = cipher();
-        let sealed = c.seal("flags/new-checkout=on");
-        assert!(sealed.starts_with(KV_ENVELOPE_PREFIX));
+    fn seal_then_unseal_round_trips_with_protection_metadata() {
+        let c = keyring("2026-07", &[("2026-07", 7)]);
+        let sealed = c
+            .seal("org/acme/flags/new-checkout", "flags/new-checkout=on")
+            .expect("seal");
+        assert!(sealed.starts_with(KV_ENVELOPE_V2_PREFIX));
         assert!(!sealed.contains("new-checkout")); // ciphertext hides plaintext
-        assert_eq!(c.unseal(&sealed), "flags/new-checkout=on");
-    }
-
-    #[test]
-    fn unseal_passes_through_plaintext_and_foreign_values() {
-        let c = cipher();
-        // A plaintext-declared value (no envelope prefix) is returned verbatim.
-        assert_eq!(c.unseal("just-plaintext"), "just-plaintext");
-        // A value that looks prefixed but isn't valid base64/ciphertext also
-        // passes through rather than erroring the read.
+        let unsealed = c
+            .unseal("org/acme/flags/new-checkout", &sealed)
+            .expect("unseal");
+        assert_eq!(unsealed.value, "flags/new-checkout=on");
         assert_eq!(
-            c.unseal(&format!("{KV_ENVELOPE_PREFIX}not-base64!!")),
-            format!("{KV_ENVELOPE_PREFIX}not-base64!!")
+            unsealed.protection,
+            KvProtection {
+                at_rest: "encrypted",
+                provider: Some("local_keyring"),
+                key_id: Some("2026-07".to_string()),
+                key_version: None,
+            }
         );
     }
 
     #[test]
-    fn nonce_is_random_so_ciphertexts_differ_but_both_decrypt() {
-        let c = cipher();
-        let a = c.seal("same");
-        let b = c.seal("same");
-        assert_ne!(a, b, "random nonce should vary the ciphertext");
-        assert_eq!(c.unseal(&a), "same");
-        assert_eq!(c.unseal(&b), "same");
+    fn plaintext_passes_through_but_malformed_envelopes_fail_closed() {
+        let c = keyring("current", &[("current", 7)]);
+        let unsealed = c.unseal("org/acme/key", "just-plaintext").expect("plain");
+        assert_eq!(unsealed.value, "just-plaintext");
+        assert_eq!(unsealed.protection, KvProtection::plaintext());
+        assert!(c.unseal("org/acme/key", "fcenc:v2:missing-fields").is_err());
+        assert!(c
+            .unseal("org/acme/key", "fcenc:vault:v1:not-base64!!")
+            .is_err());
     }
 
     #[test]
-    fn wrong_key_and_tamper_do_not_yield_plaintext() {
-        let c = cipher();
-        let sealed = c.seal("secret-value");
-        // A different key can't authenticate the envelope; unseal must not
-        // return the true plaintext (it returns the opaque stored string).
-        let other = KvCipher {
-            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[9u8; 32])),
-        };
-        assert_ne!(other.unseal(&sealed), "secret-value");
-        // Tampered ciphertext fails the GCM tag and does not decrypt.
+    fn nonce_is_random_so_ciphertexts_differ_but_both_decrypt() {
+        let c = keyring("current", &[("current", 7)]);
+        let a = c.seal("org/acme/key", "same").expect("seal a");
+        let b = c.seal("org/acme/key", "same").expect("seal b");
+        assert_ne!(a, b, "random nonce should vary the ciphertext");
+        assert_eq!(
+            c.unseal("org/acme/key", &a).expect("unseal a").value,
+            "same"
+        );
+        assert_eq!(
+            c.unseal("org/acme/key", &b).expect("unseal b").value,
+            "same"
+        );
+    }
+
+    #[test]
+    fn wrong_key_tamper_and_cross_key_copy_fail_closed() {
+        let c = keyring("current", &[("current", 7)]);
+        let sealed = c.seal("org/acme/source", "secret-value").expect("seal");
+        let other = keyring("current", &[("current", 9)]);
+        assert!(other.unseal("org/acme/source", &sealed).is_err());
+        assert!(c.unseal("org/acme/destination", &sealed).is_err());
         let mut tampered = sealed.clone();
         tampered.push('A');
-        assert_ne!(c.unseal(&tampered), "secret-value");
+        assert!(c.unseal("org/acme/source", &tampered).is_err());
+    }
+
+    #[test]
+    fn keyring_rotation_reads_old_values_and_writes_with_the_active_key() {
+        let old = keyring("key-1", &[("key-1", 1)]);
+        let old_value = old.seal("org/acme/key", "old value").expect("old seal");
+
+        let rotated = keyring("key-2", &[("key-1", 1), ("key-2", 2)]);
+        assert_eq!(
+            rotated
+                .unseal("org/acme/key", &old_value)
+                .expect("old value remains readable")
+                .value,
+            "old value"
+        );
+        let new_value = rotated.seal("org/acme/key", "new value").expect("new seal");
+        assert!(new_value.contains("a2V5LTI:"));
+        assert!(old.unseal("org/acme/key", &new_value).is_err());
+    }
+
+    #[test]
+    fn backend_configuration_rejects_partial_and_conflicting_inputs() {
+        let load = |values: &[(&str, &str)]| {
+            KvCipher::from_lookup(|name| {
+                values
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(_, value)| (*value).to_string())
+            })
+        };
+
+        assert!(load(&[]).expect("empty config").is_none());
+        assert!(load(&[("FIDUCIA_KV_VAULT_MOUNT", "transit")])
+            .expect_err("partial Vault config")
+            .to_string()
+            .contains("FIDUCIA_KV_VAULT_ADDR"));
+        assert!(load(&[("FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID", "current")])
+            .expect_err("partial keyring")
+            .to_string()
+            .contains("FIDUCIA_KV_ENCRYPTION_KEYS"));
+        assert!(load(&[("FIDUCIA_KV_ENCRYPTION_KEY_ID", "legacy-1")])
+            .expect_err("partial legacy config")
+            .to_string()
+            .contains("FIDUCIA_KV_ENCRYPTION_KEY is required"));
+        assert!(load(&[
+            ("FIDUCIA_KV_VAULT_ADDR", "https://vault.example.com"),
+            ("FIDUCIA_KV_VAULT_TOKEN", "token"),
+            ("FIDUCIA_KV_VAULT_KEY", "fiducia-kv"),
+            ("FIDUCIA_KV_ENCRYPTION_KEY", "not-inspected"),
+        ])
+        .expect_err("conflicting backends")
+        .to_string()
+        .contains("exactly one KV protection backend"));
+
+        let encoded = encoded_key(7);
+        let keyring_json = format!(r#"{{"current":"{encoded}"}}"#);
+        let cipher = load(&[
+            ("FIDUCIA_KV_ENCRYPTION_KEYS", keyring_json.as_str()),
+            ("FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID", "current"),
+        ])
+        .expect("valid keyring")
+        .expect("configured cipher");
+        assert!(matches!(cipher, KvCipher::Local(_)));
+    }
+
+    #[tokio::test]
+    async fn vault_transit_round_trip_binds_context_and_reports_key_version() {
+        async fn transit(
+            Path((operation, key_name)): Path<(String, String)>,
+            headers: HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(key_name, "fiducia-kv");
+            assert_eq!(headers["x-vault-token"], "test-token");
+            assert_eq!(headers["x-vault-namespace"], "engineering");
+            assert_eq!(
+                body["context"],
+                base64::engine::general_purpose::STANDARD.encode("org/acme/database/password")
+            );
+            match operation.as_str() {
+                "encrypt" => Json(json!({
+                    "data": {
+                        "ciphertext": format!("vault:v7:{}", body["plaintext"].as_str().unwrap())
+                    }
+                })),
+                "decrypt" => {
+                    let plaintext = body["ciphertext"]
+                        .as_str()
+                        .and_then(|value| value.split_once("vault:v7:"))
+                        .map(|(_, plaintext)| plaintext)
+                        .expect("test ciphertext");
+                    Json(json!({ "data": { "plaintext": plaintext } }))
+                }
+                other => panic!("unexpected Vault operation: {other}"),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Vault");
+        let address = listener.local_addr().expect("fake Vault address");
+        let app = Router::new().route("/v1/transit/:operation/:key", post(transit));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake Vault");
+        });
+        let vault = VaultTransit {
+            address: Url::parse(&format!("http://{address}")).expect("Vault URL"),
+            mount: "transit".to_string(),
+            key_name: "fiducia-kv".to_string(),
+            token: "test-token".to_string(),
+            namespace: Some("engineering".to_string()),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("HTTP client"),
+        };
+
+        let sealed = vault
+            .seal("org/acme/database/password", "correct horse")
+            .await
+            .expect("Vault encrypt");
+        assert!(sealed.starts_with(KV_VAULT_ENVELOPE_PREFIX));
+        assert!(!sealed.contains("correct horse"));
+        let unsealed = vault
+            .unseal("org/acme/database/password", &sealed)
+            .await
+            .expect("Vault decrypt");
+        assert_eq!(unsealed.value, "correct horse");
+        assert_eq!(
+            unsealed.protection,
+            KvProtection {
+                at_rest: "encrypted",
+                provider: Some("vault_transit"),
+                key_id: Some("fiducia-kv".to_string()),
+                key_version: Some(7),
+            }
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vault_transit_rejects_oversized_responses() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Vault");
+        let address = listener.local_addr().expect("fake Vault address");
+        let app = Router::new().route(
+            "/v1/transit/encrypt/fiducia-kv",
+            post(|| async { "x".repeat(VAULT_RESPONSE_MAX_BYTES + 1) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake Vault");
+        });
+        let vault = VaultTransit {
+            address: Url::parse(&format!("http://{address}")).expect("Vault URL"),
+            mount: "transit".to_string(),
+            key_name: "fiducia-kv".to_string(),
+            token: "test-token".to_string(),
+            namespace: None,
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("HTTP client"),
+        };
+
+        let error = vault
+            .seal("org/acme/key", "secret")
+            .await
+            .expect_err("oversized response must fail closed");
+        assert!(error.to_string().contains("exceeded"));
+        server.abort();
+    }
+
+    #[test]
+    fn vault_address_rejects_cleartext_public_and_credentialed_urls() {
+        assert!(validate_vault_address("http://vault.example.com").is_err());
+        assert!(validate_vault_address("https://user:pass@vault.example.com").is_err());
+        assert!(validate_vault_address("http://vault.vault.svc:8200").is_ok());
+        assert!(validate_vault_address("https://vault.example.com:8200").is_ok());
     }
 }
