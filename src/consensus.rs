@@ -3191,6 +3191,33 @@ mod tests {
     use crate::persist::PersistOp;
     use axum::body::to_bytes;
 
+    // Peer resolution feeds `members = peers.len()+1` and the quorum
+    // `members/2+1`, so it must yield exactly the distinct OTHER members: self and
+    // duplicates dropped, first-occurrence order preserved. A stray entry would
+    // over-count commit acks and can make the quorum threshold exceed the distinct
+    // voter count (no leader electable).
+    #[test]
+    fn resolve_peers_drops_self_and_duplicates() {
+        let peers = resolve_peers(
+            vec![
+                "node.vultr.fiducia.cloud:9090".to_string(),
+                " node-a:8090 ".to_string(), // self (padded) — dropped
+                "node.vultr.fiducia.cloud:9090".to_string(), // duplicate — collapsed
+                "".to_string(),              // empty — dropped
+                "node.civo.fiducia.cloud:9090".to_string(),
+            ],
+            "node-a:8090",
+        );
+        assert_eq!(
+            peers,
+            vec![
+                "node.vultr.fiducia.cloud:9090".to_string(),
+                "node.civo.fiducia.cloud:9090".to_string(),
+            ]
+        );
+        assert_eq!(peers.len() + 1, 3, "3-member group, quorum 2, tolerates 1 loss");
+    }
+
     // --- response-shaping unit test (no cluster) --------------------------
 
     // --- shared-interface contract (node wire types ⇄ fiducia-interfaces) -
