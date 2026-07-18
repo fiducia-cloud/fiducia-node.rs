@@ -188,7 +188,8 @@ async fn get_or_list(
             })
             .await
         {
-            Ok(ReadResponse::Kv(Some(entry))) => {
+            Ok(ReadResponse::Kv(Some(mut entry))) => {
+                entry.value = unseal_for_read(&node, &entry.value);
                 Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
             }
             Ok(ReadResponse::Kv(None)) => {
