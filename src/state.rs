@@ -3197,16 +3197,18 @@ impl Store {
             return json!({ "acquired": false, "reason": "no_keys", "revision": revision });
         }
 
-        // Idempotent re-acquire: if this exact holder already holds a grant for
-        // exactly these keys, return it unchanged. A lost-response retry must
-        // recover its existing fencing token, never mint a new one or report
-        // acquired:false for a lock the caller already owns.
+        // Idempotent re-acquire also acts as lease renewal: the exact holder and
+        // key set keep their fencing token while extending the expiry from the
+        // replicated command timestamp. A lost-response retry therefore cannot
+        // mint a second grant, and long-running guarded work can renew safely.
         if let Some(&tok) = self.locks.held.get(&keys[0]) {
-            if let Some(grant) = self.locks.grants.get(&tok) {
+            if let Some(grant) = self.locks.grants.get_mut(&tok) {
                 if grant.holder == holder && grant.keys == keys {
+                    grant.lease_expires_ms = grant.lease_expires_ms.max(now.saturating_add(ttl_ms));
                     return json!({
                         "acquired": true,
                         "queued": false,
+                        "renewed": true,
                         "keys": keys,
                         "holder": holder,
                         "fencing_token": tok,
@@ -4228,6 +4230,38 @@ mod tests {
         assert_eq!(
             retry["fencing_token"], token1,
             "retry should return the original fencing token"
+        );
+    }
+
+    #[test]
+    fn lock_reacquire_renews_expiry_without_changing_fencing_token() {
+        let sm = StateMachine::new();
+        let command = || Command::LockAcquire {
+            keys: vec!["customers/acme".to_string()],
+            holder: "billing-request-7".to_string(),
+            ttl_ms: 100,
+            wait: false,
+        };
+        let first = sm.apply_at(command(), 1_000).output;
+        assert_eq!(first["lease_expires_ms"], 1_100);
+        let token = first["fencing_token"].clone();
+
+        let renewed = sm.apply_at(command(), 1_050).output;
+        assert_eq!(renewed["acquired"], true);
+        assert_eq!(renewed["renewed"], true);
+        assert_eq!(renewed["fencing_token"], token);
+        assert_eq!(renewed["lease_expires_ms"], 1_150);
+        let fencing_token = token.as_u64().expect("numeric fencing token");
+        assert_eq!(
+            sm.store
+                .lock()
+                .unwrap()
+                .locks
+                .grants
+                .get(&fencing_token)
+                .expect("renewed grant")
+                .lease_expires_ms,
+            1_150
         );
     }
 
