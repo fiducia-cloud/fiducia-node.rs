@@ -212,10 +212,14 @@ async fn put_key(
     let Some(key) = q.key else {
         return bad_request("missing `key`");
     };
+    // Seal before the value enters the log, so ciphertext is what gets
+    // replicated and persisted (log + snapshot). Sealing here (once) keeps the
+    // replicated command byte-identical across replicas.
+    let value = seal_for_write(&node, body.value, body.plaintext);
     let result = node
         .propose(Command::KvPut {
             key: org.scope(&key),
-            value: body.value,
+            value,
             ttl_ms: body.ttl_ms,
             prev_revision: body.prev_revision,
         })
