@@ -2058,9 +2058,14 @@ impl StateMachine {
     }
 
     pub fn kv_get(&self, key: &str) -> Option<KvEntry> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.kv.get(key).cloned()
+        let now = now_ms();
+        self.store
+            .lock()
+            .unwrap()
+            .kv
+            .get(key)
+            .filter(|entry| entry.expires_at_ms.is_none_or(|expires| expires > now))
+            .cloned()
     }
 
     /// Read a counter's current value and revision. Counters do not expire.
@@ -2136,12 +2141,14 @@ impl StateMachine {
     }
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let now = now_ms();
+        let store = self.store.lock().unwrap();
         let mut entries: Vec<_> = store
             .kv
             .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
+            .filter(|(key, entry)| {
+                key.starts_with(prefix) && entry.expires_at_ms.is_none_or(|expires| expires > now)
+            })
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -2149,33 +2156,43 @@ impl StateMachine {
     }
 
     pub fn lock_get(&self, key: &str) -> LockState {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.lock_snapshot(key)
+        self.store
+            .lock()
+            .unwrap()
+            .lock_snapshot_live_at(key, now_ms())
     }
 
     pub fn semaphore_get(&self, key: &str) -> SemaphoreState {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.semaphore_snapshot(key)
+        self.store
+            .lock()
+            .unwrap()
+            .semaphore_snapshot_live_at(key, now_ms())
     }
 
     pub fn rate_limit_get(&self, tenant: &str, key: &str) -> Option<RateLimitSnapshot> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.rate_limit_snapshot(tenant, key)
+        self.store.lock().unwrap().rate_limit_snapshot(tenant, key)
     }
 
     pub fn idempotency_get(&self, key: &str) -> Option<IdempotencyRecord> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.idempotency.get(key).cloned()
+        let now = now_ms();
+        self.store
+            .lock()
+            .unwrap()
+            .idempotency
+            .get(key)
+            .filter(|record| record.lease_expires_ms > now)
+            .cloned()
     }
 
     pub fn election_get(&self, name: &str) -> Option<Leadership> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        store.elections.get(name).cloned()
+        let now = now_ms();
+        self.store
+            .lock()
+            .unwrap()
+            .elections
+            .get(name)
+            .filter(|leadership| leadership.lease_expires_ms > now)
+            .cloned()
     }
 
     pub fn schedule_get(&self, name: &str) -> Option<Schedule> {
@@ -2209,12 +2226,18 @@ impl StateMachine {
     }
 
     pub fn service_list(&self, service: &str) -> Vec<ServiceInstance> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let now = now_ms();
+        let store = self.store.lock().unwrap();
         store
             .services
             .get(service)
-            .map(|instances| instances.values().cloned().collect())
+            .map(|instances| {
+                instances
+                    .values()
+                    .filter(|instance| instance.lease_expires_ms > now)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -2222,12 +2245,14 @@ impl StateMachine {
     /// the keyspace). Serializable read off applied state; callers fan this out
     /// across shards and merge.
     pub fn kv_list(&self, prefix: &str) -> Vec<KvListItem> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let now = now_ms();
+        let store = self.store.lock().unwrap();
         store
             .kv
             .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
+            .filter(|(key, entry)| {
+                key.starts_with(prefix) && entry.expires_at_ms.is_none_or(|expires| expires > now)
+            })
             .map(|(key, entry)| KvListItem {
                 key: key.clone(),
                 entry: entry.clone(),
@@ -2238,77 +2263,50 @@ impl StateMachine {
     /// Every service that has at least one live instance on this shard, with the
     /// live-instance count. Callers fan this out across shards and sum.
     pub fn service_names(&self) -> Vec<ServiceSummary> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
+        let now = now_ms();
+        let store = self.store.lock().unwrap();
         store
             .services
             .iter()
-            .filter(|(_, instances)| !instances.is_empty())
-            .map(|(service, instances)| ServiceSummary {
-                service: service.clone(),
-                instances: instances.len(),
+            .filter_map(|(service, instances)| {
+                let live_instances = instances
+                    .values()
+                    .filter(|instance| instance.lease_expires_ms > now)
+                    .count();
+                (live_instances > 0).then(|| ServiceSummary {
+                    service: service.clone(),
+                    instances: live_instances,
+                })
             })
             .collect()
     }
 
     /// Every live lock grant plus the FIFO wait queue — the observability view of
     /// the whole lock coordinator (all lock state lives on one shard, so this is a
-    /// single-shard read). Expired grants/waiters are dropped first so the
-    /// inventory reflects only live state. Grants are sorted by fencing token and
-    /// the queue by request time, so the output is deterministic for tests/diffs.
+    /// single-shard read). The view filters expired grants without promoting
+    /// waiters or otherwise changing applied state. Grants are sorted by fencing
+    /// token and the queue by request time, so output is deterministic for
+    /// tests/diffs.
     pub fn lock_inventory(&self) -> LockInventory {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        let mut held: Vec<LockHolding> = store
-            .locks
-            .grants
-            .values()
-            .map(|g| LockHolding {
-                holder: g.holder.clone(),
-                keys: g.keys.clone(),
-                fencing_token: g.fencing_token,
-                lease_expires_ms: g.lease_expires_ms,
-            })
-            .collect();
-        held.sort_by_key(|h| h.fencing_token);
-        let wait_queue: Vec<LockWaiter> = store
-            .locks
-            .queue
-            .iter()
-            .map(|(_, q)| LockWaiter {
-                holder: q.holder.clone(),
-                keys: q.keys.clone(),
-                requested_ms: q.requested_ms,
-            })
-            .collect();
-        LockInventory { held, wait_queue }
+        self.store.lock().unwrap().lock_inventory_live_at(now_ms())
     }
 
     /// A snapshot of every counting semaphore on this shard (holders, free
     /// permits, wait queue). Sorted by key for deterministic output.
     pub fn semaphore_inventory(&self) -> Vec<SemaphoreState> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        let mut keys: Vec<String> = store.semaphores.keys().cloned().collect();
-        keys.sort();
-        keys.iter().map(|k| store.semaphore_snapshot(k)).collect()
+        self.store
+            .lock()
+            .unwrap()
+            .semaphore_inventory_live_at(now_ms())
     }
 
     /// Every named election with live leadership on this shard, sorted by name.
     /// Callers fan this out across shards (elections route by name) and merge.
     pub fn election_inventory(&self) -> Vec<ElectionEntry> {
-        let mut store = self.store.lock().unwrap();
-        store.expire_due(now_ms());
-        let mut out: Vec<ElectionEntry> = store
-            .elections
-            .iter()
-            .map(|(name, leadership)| ElectionEntry {
-                name: name.clone(),
-                leadership: leadership.clone(),
-            })
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+        self.store
+            .lock()
+            .unwrap()
+            .election_inventory_live_at(now_ms())
     }
 }
 
@@ -4027,12 +4025,16 @@ impl Store {
         json!({ "deregistered": removed, "service": service, "instance_id": instance_id })
     }
 
-    fn lock_snapshot(&self, key: &str) -> LockState {
+    /// Construct a point-in-time lock view without expiring a grant or
+    /// promoting its queue. Promotion mints fencing tokens, so it is strictly a
+    /// committed `apply_at` concern.
+    fn lock_snapshot_live_at(&self, key: &str, now: u64) -> LockState {
         let grant = self
             .locks
             .held
             .get(key)
-            .and_then(|token| self.locks.grants.get(token));
+            .and_then(|token| self.locks.grants.get(token))
+            .filter(|grant| grant.lease_expires_ms > now);
         let wait_queue = self
             .locks
             .queue
@@ -4054,7 +4056,10 @@ impl Store {
         }
     }
 
-    fn semaphore_snapshot(&self, key: &str) -> SemaphoreState {
+    /// Construct a point-in-time semaphore view without expiring permits or
+    /// admitting waiters. A timed-out permit is absent from the view, while its
+    /// queued successor remains queued until a committed command sweeps it.
+    fn semaphore_snapshot_live_at(&self, key: &str, now: u64) -> SemaphoreState {
         let Some(sem) = self.semaphores.get(key) else {
             return SemaphoreState {
                 key: key.to_string(),
@@ -4067,10 +4072,16 @@ impl Store {
         SemaphoreState {
             key: key.to_string(),
             limit: sem.limit,
-            available: sem.limit.saturating_sub(sem.holders.len() as u32),
+            available: sem.limit.saturating_sub(
+                sem.holders
+                    .iter()
+                    .filter(|slot| slot.lease_expires_ms > now)
+                    .count() as u32,
+            ),
             holders: sem
                 .holders
                 .iter()
+                .filter(|slot| slot.lease_expires_ms > now)
                 .map(|slot| SemaphoreHolder {
                     holder: slot.holder.clone(),
                     fencing_token: slot.fencing_token,
@@ -4087,6 +4098,55 @@ impl Store {
                 })
                 .collect(),
         }
+    }
+
+    fn lock_inventory_live_at(&self, now: u64) -> LockInventory {
+        let mut held: Vec<LockHolding> = self
+            .locks
+            .grants
+            .values()
+            .filter(|grant| grant.lease_expires_ms > now)
+            .map(|grant| LockHolding {
+                holder: grant.holder.clone(),
+                keys: grant.keys.clone(),
+                fencing_token: grant.fencing_token,
+                lease_expires_ms: grant.lease_expires_ms,
+            })
+            .collect();
+        held.sort_by_key(|holding| holding.fencing_token);
+        let wait_queue = self
+            .locks
+            .queue
+            .iter()
+            .map(|(_, queued)| LockWaiter {
+                holder: queued.holder.clone(),
+                keys: queued.keys.clone(),
+                requested_ms: queued.requested_ms,
+            })
+            .collect();
+        LockInventory { held, wait_queue }
+    }
+
+    fn semaphore_inventory_live_at(&self, now: u64) -> Vec<SemaphoreState> {
+        let mut keys: Vec<_> = self.semaphores.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| self.semaphore_snapshot_live_at(key, now))
+            .collect()
+    }
+
+    fn election_inventory_live_at(&self, now: u64) -> Vec<ElectionEntry> {
+        let mut out: Vec<_> = self
+            .elections
+            .iter()
+            .filter(|(_, leadership)| leadership.lease_expires_ms > now)
+            .map(|(name, leadership)| ElectionEntry {
+                name: name.clone(),
+                leadership: leadership.clone(),
+            })
+            .collect();
+        out.sort_by(|left, right| left.name.cmp(&right.name));
+        out
     }
 
     fn rate_limit_snapshot(&self, tenant: &str, key: &str) -> Option<RateLimitSnapshot> {
@@ -4344,6 +4404,52 @@ mod tests {
     }
 
     #[test]
+    fn follower_observation_of_an_expired_semaphore_is_pure_and_never_mints() {
+        // This models a follower serving a local inventory fan-out. The first
+        // permit has expired, while the second holder is queued. A read may
+        // hide the expired permit, but must not promote the waiter or alter the
+        // applied snapshot: promotion mints a fencing token and belongs only in
+        // an ordered Raft apply.
+        let sm = StateMachine::new();
+        let expired_at = now_ms().saturating_sub(10_000);
+        let held = sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "pool".to_string(),
+                holder: "expired-holder".to_string(),
+                limit: 1,
+                ttl_ms: 1,
+                wait: true,
+            },
+            expired_at,
+        );
+        assert_eq!(held.output["fencing_token"], 1);
+        let queued = sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "pool".to_string(),
+                holder: "waiter".to_string(),
+                limit: 1,
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            expired_at,
+        );
+        assert_eq!(queued.output["queued"], true);
+
+        let before = sm.snapshot().unwrap();
+        let inventory = sm.semaphore_inventory();
+        assert!(
+            inventory[0].holders.is_empty(),
+            "expired permits are not live"
+        );
+        assert_eq!(inventory[0].wait_queue[0].holder, "waiter");
+        assert_eq!(
+            sm.snapshot().unwrap(),
+            before,
+            "a local read must not mutate applied state or mint a fencing token"
+        );
+    }
+
+    #[test]
     fn election_inventory_lists_current_leaders_sorted_by_name() {
         let sm = StateMachine::new();
         let campaign = |name: &str, candidate: &str| {
@@ -4363,6 +4469,30 @@ mod tests {
         assert_eq!(inv[0].leadership.leader, "node-a");
         assert_eq!(inv[1].name, "scheduler");
         assert_eq!(inv[1].leadership.leader, "node-z");
+    }
+
+    #[test]
+    fn expired_election_get_and_inventory_are_live_but_do_not_sweep_state() {
+        let sm = StateMachine::new();
+        let expired_at = now_ms().saturating_sub(10_000);
+        sm.apply_at(
+            Command::ElectionCampaign {
+                name: "expired-election".to_string(),
+                candidate: "node-a".to_string(),
+                ttl_ms: 1,
+                metadata: HashMap::new(),
+            },
+            expired_at,
+        );
+
+        let before = sm.snapshot().unwrap();
+        assert!(sm.election_get("expired-election").is_none());
+        assert!(sm.election_inventory().is_empty());
+        assert_eq!(
+            sm.snapshot().unwrap(),
+            before,
+            "an expired lease is hidden by reads, not deleted outside the Raft log"
+        );
     }
 
     #[test]
@@ -4571,21 +4701,43 @@ mod tests {
     }
 
     #[test]
-    fn expired_lock_grant_promotes_waiter_with_new_token() {
+    fn committed_apply_promotes_an_expired_lock_grant_with_a_new_token() {
         let sm = StateMachine::new();
+        let base = now_ms();
         let first = sm
-            .apply(Command::LockAcquire {
-                keys: vec!["lease-key".to_string()],
-                holder: "holder-1".to_string(),
-                ttl_ms: 50,
-                wait: false,
-            })
+            .apply_at(
+                Command::LockAcquire {
+                    keys: vec!["lease-key".to_string()],
+                    holder: "holder-1".to_string(),
+                    ttl_ms: 1,
+                    wait: false,
+                },
+                base,
+            )
             .output;
         let token1 = first["fencing_token"].as_u64().unwrap();
-        let queued = acquire(&sm, &["lease-key"], "holder-2", true);
-        assert_eq!(queued["queued"], true);
+        let queued = sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["lease-key".to_string()],
+                holder: "holder-2".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            base,
+        );
+        assert_eq!(queued.output["queued"], true);
 
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        // A subsequent committed entry sweeps the expired grant and admits the
+        // waiter. A read may observe the expiry, but must never perform this
+        // state transition or mint its token.
+        sm.apply_at(
+            Command::CounterAdd {
+                key: "trigger-expiry-sweep".to_string(),
+                delta: 1,
+                prev_revision: None,
+            },
+            base.saturating_add(1),
+        );
 
         let state = sm.lock_get("lease-key");
         assert_eq!(state.holder.as_deref(), Some("holder-2"));
@@ -4643,22 +4795,42 @@ mod tests {
     }
 
     #[test]
-    fn expired_semaphore_permit_promotes_fifo_waiter() {
+    fn committed_apply_promotes_an_expired_semaphore_permit_in_fifo_order() {
         let sm = StateMachine::new();
+        let base = now_ms();
         let first = sm
-            .apply(Command::SemaphoreAcquire {
-                key: "lease-pool".to_string(),
-                holder: "holder-1".to_string(),
-                limit: 1,
-                ttl_ms: 50,
-                wait: false,
-            })
+            .apply_at(
+                Command::SemaphoreAcquire {
+                    key: "lease-pool".to_string(),
+                    holder: "holder-1".to_string(),
+                    limit: 1,
+                    ttl_ms: 1,
+                    wait: false,
+                },
+                base,
+            )
             .output;
         let token1 = first["fencing_token"].as_u64().unwrap();
-        let queued = semaphore_acquire(&sm, "lease-pool", "holder-2", 1, true);
-        assert_eq!(queued["queued"], true);
+        let queued = sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "lease-pool".to_string(),
+                holder: "holder-2".to_string(),
+                limit: 1,
+                ttl_ms: 30_000,
+                wait: true,
+            },
+            base,
+        );
+        assert_eq!(queued.output["queued"], true);
 
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        sm.apply_at(
+            Command::CounterAdd {
+                key: "trigger-expiry-sweep".to_string(),
+                delta: 1,
+                prev_revision: None,
+            },
+            base.saturating_add(1),
+        );
 
         let state = sm.semaphore_get("lease-pool");
         assert_eq!(state.holders.len(), 1);
@@ -6145,6 +6317,38 @@ mod tests {
         assert_eq!(inventory.wait_queue.len(), 1);
         assert_eq!(inventory.held[0].fencing_token, 1);
         assert_eq!(inventory.wait_queue[0].holder, "waiter");
+    }
+
+    #[test]
+    fn snapshot_restore_keeps_the_fencing_counter_ahead_of_prior_grants() {
+        let original = StateMachine::new();
+        let base = now_ms();
+        let first = original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["before-restart".to_string()],
+                holder: "owner-a".to_string(),
+                ttl_ms: 300_000,
+                wait: false,
+            },
+            base,
+        );
+        let first_token = first.output["fencing_token"].as_u64().unwrap();
+
+        let restored = StateMachine::new();
+        restored.restore(&original.snapshot().unwrap()).unwrap();
+        let next = restored.apply_at(
+            Command::LockAcquire {
+                keys: vec!["after-restart".to_string()],
+                holder: "owner-b".to_string(),
+                ttl_ms: 300_000,
+                wait: false,
+            },
+            base.saturating_add(1),
+        );
+        assert!(
+            next.output["fencing_token"].as_u64().unwrap() > first_token,
+            "a restored state machine must not reissue a fencing token"
+        );
     }
 
     #[test]
