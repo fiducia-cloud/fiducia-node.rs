@@ -2456,6 +2456,10 @@ pub struct Node {
     tasks: Vec<JoinHandle<()>>,
     /// In-process per-operation latency + outcome metrics (see `/v1/observe/metrics`).
     metrics: Arc<crate::metrics::Metrics>,
+    /// KV value encryption at rest. `Some` when `FIDUCIA_KV_ENCRYPTION_KEY` is
+    /// configured (the default posture); `None` disables sealing. See
+    /// [`crate::kv::KvCipher`].
+    kv_cipher: Option<Arc<crate::kv::KvCipher>>,
 }
 
 impl Node {
@@ -2540,7 +2544,14 @@ impl Node {
             transport,
             tasks,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            kv_cipher: crate::kv::KvCipher::from_env().map(Arc::new),
         }
+    }
+
+    /// The KV-at-rest cipher, when configured. `None` means values are stored
+    /// verbatim (encryption disabled).
+    pub fn kv_cipher(&self) -> Option<&crate::kv::KvCipher> {
+        self.kv_cipher.as_deref()
     }
 
     /// Convenience for `main`: boot with the production HTTP transport.

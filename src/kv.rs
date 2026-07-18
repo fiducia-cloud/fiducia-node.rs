@@ -23,6 +23,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use axum::{
     extract::{Query, State},
     http::{StatusCode, Uri},
@@ -33,6 +35,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
@@ -41,6 +44,99 @@ use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
 use crate::org_scope::OrgScope;
 use crate::state::Command;
 
+/// Marker prefix on a sealed KV value. Self-describing so a value can be
+/// recognised as ciphertext on read without a schema flag, which is what lets
+/// encrypted and plaintext-declared values coexist in the same keyspace.
+const KV_ENVELOPE_PREFIX: &str = "fcenc:v1:";
+
+/// KV value encryption at rest (AES-256-GCM).
+///
+/// **Default posture:** when `FIDUCIA_KV_ENCRYPTION_KEY` is set (base64 of a
+/// 32-byte key, the same on every replica), values are sealed *before* they
+/// enter the Raft log — so the on-disk log, the snapshots, and the in-memory
+/// state machine all hold ciphertext only, closing the plaintext-at-rest hole.
+/// A client may opt a specific write out with `"plaintext": true` (a hot key
+/// it would rather not pay decrypt-on-read for); that value is stored verbatim.
+///
+/// Sealing happens once, on the node that receives the PUT, and the resulting
+/// envelope string is what gets replicated — so every replica stores identical
+/// bytes and the state machine stays deterministic despite the random nonce.
+pub struct KvCipher {
+    cipher: Aes256Gcm,
+}
+
+impl KvCipher {
+    /// Load the cluster KV key from `FIDUCIA_KV_ENCRYPTION_KEY`. `None` (env
+    /// unset/empty/malformed) means encryption is disabled and values are
+    /// stored as-is — the pre-existing behaviour.
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var("FIDUCIA_KV_ENCRYPTION_KEY").ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+        let key: [u8; 32] = bytes.try_into().ok()?;
+        Some(Self {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+        })
+    }
+
+    /// Seal plaintext into `PREFIX + base64(nonce ‖ ciphertext ‖ tag)`.
+    pub fn seal(&self, plaintext: &str) -> String {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = self
+            .cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .expect("AES-256-GCM encryption is infallible for in-memory inputs");
+        let mut blob = nonce.to_vec();
+        blob.extend_from_slice(&ciphertext);
+        format!(
+            "{KV_ENVELOPE_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(blob)
+        )
+    }
+
+    /// Return the plaintext when `stored` is one of our envelopes and
+    /// authenticates; otherwise return `stored` unchanged. A plaintext-declared
+    /// value (no prefix) or a value written when encryption was off simply
+    /// passes through — so reads never fail because of a representation
+    /// mismatch.
+    pub fn unseal(&self, stored: &str) -> String {
+        let Some(b64) = stored.strip_prefix(KV_ENVELOPE_PREFIX) else {
+            return stored.to_string();
+        };
+        let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            return stored.to_string();
+        };
+        if blob.len() < 12 + 16 {
+            return stored.to_string(); // need a nonce and a GCM tag
+        }
+        let (nonce, ciphertext) = blob.split_at(12);
+        match self.cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+            Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_else(|_| stored.to_string()),
+            Err(_) => stored.to_string(),
+        }
+    }
+}
+
+/// Seal a to-be-written value with the node's cipher unless the caller opted
+/// out or encryption is disabled.
+fn seal_for_write(node: &Node, value: String, plaintext_opt_out: bool) -> String {
+    match node.kv_cipher() {
+        Some(cipher) if !plaintext_opt_out => cipher.seal(&value),
+        _ => value,
+    }
+}
+
+/// Unseal a read value with the node's cipher if configured.
+fn unseal_for_read(node: &Node, value: &str) -> String {
+    match node.kv_cipher() {
+        Some(cipher) => cipher.unseal(value),
+        None => value.to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PutBody {
     pub value: String,
@@ -48,6 +144,10 @@ pub struct PutBody {
     /// Optional compare-and-swap guard: only write if the current revision
     /// equals this. `0` means "must not exist".
     pub prev_revision: Option<u64>,
+    /// Opt this write out of at-rest encryption (stored verbatim). Defaults to
+    /// encrypted whenever the cluster has a KV key configured.
+    #[serde(default)]
+    pub plaintext: bool,
 }
 
 /// Query parameters shared by the KV verbs. `key` selects a single key;
@@ -88,7 +188,8 @@ async fn get_or_list(
             })
             .await
         {
-            Ok(ReadResponse::Kv(Some(entry))) => {
+            Ok(ReadResponse::Kv(Some(mut entry))) => {
+                entry.value = unseal_for_read(&node, &entry.value);
                 Json(json!({ "key": key, "found": true, "entry": entry })).into_response()
             }
             Ok(ReadResponse::Kv(None)) => {
@@ -112,10 +213,14 @@ async fn put_key(
     let Some(key) = q.key else {
         return bad_request("missing `key`");
     };
+    // Seal before the value enters the log, so ciphertext is what gets
+    // replicated and persisted (log + snapshot). Sealing here (once) keeps the
+    // replicated command byte-identical across replicas.
+    let value = seal_for_write(&node, body.value, body.plaintext);
     let result = node
         .propose(Command::KvPut {
             key: org.scope(&key),
-            value: body.value,
+            value,
             ttl_ms: body.ttl_ms,
             prev_revision: body.prev_revision,
         })
@@ -154,6 +259,7 @@ async fn list(node: Arc<Node>, org: OrgScope, prefix: String) -> Response {
         .filter_map(|mut item| {
             let unscoped = org.unscope(&item.key)?.to_string();
             item.key = unscoped;
+            item.entry.value = unseal_for_read(&node, &item.entry.value);
             Some(item)
         })
         .collect();
@@ -241,4 +347,65 @@ fn bad_request(detail: &str) -> Response {
         Json(json!({ "error": "bad_request", "detail": detail })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod kv_cipher_tests {
+    use super::*;
+
+    fn cipher() -> KvCipher {
+        // Deterministic 32-byte test key.
+        let key: [u8; 32] = [7u8; 32];
+        KvCipher {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+        }
+    }
+
+    #[test]
+    fn seal_then_unseal_round_trips() {
+        let c = cipher();
+        let sealed = c.seal("flags/new-checkout=on");
+        assert!(sealed.starts_with(KV_ENVELOPE_PREFIX));
+        assert!(!sealed.contains("new-checkout")); // ciphertext hides plaintext
+        assert_eq!(c.unseal(&sealed), "flags/new-checkout=on");
+    }
+
+    #[test]
+    fn unseal_passes_through_plaintext_and_foreign_values() {
+        let c = cipher();
+        // A plaintext-declared value (no envelope prefix) is returned verbatim.
+        assert_eq!(c.unseal("just-plaintext"), "just-plaintext");
+        // A value that looks prefixed but isn't valid base64/ciphertext also
+        // passes through rather than erroring the read.
+        assert_eq!(
+            c.unseal(&format!("{KV_ENVELOPE_PREFIX}not-base64!!")),
+            format!("{KV_ENVELOPE_PREFIX}not-base64!!")
+        );
+    }
+
+    #[test]
+    fn nonce_is_random_so_ciphertexts_differ_but_both_decrypt() {
+        let c = cipher();
+        let a = c.seal("same");
+        let b = c.seal("same");
+        assert_ne!(a, b, "random nonce should vary the ciphertext");
+        assert_eq!(c.unseal(&a), "same");
+        assert_eq!(c.unseal(&b), "same");
+    }
+
+    #[test]
+    fn wrong_key_and_tamper_do_not_yield_plaintext() {
+        let c = cipher();
+        let sealed = c.seal("secret-value");
+        // A different key can't authenticate the envelope; unseal must not
+        // return the true plaintext (it returns the opaque stored string).
+        let other = KvCipher {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[9u8; 32])),
+        };
+        assert_ne!(other.unseal(&sealed), "secret-value");
+        // Tampered ciphertext fails the GCM tag and does not decrypt.
+        let mut tampered = sealed.clone();
+        tampered.push('A');
+        assert_ne!(c.unseal(&tampered), "secret-value");
+    }
 }

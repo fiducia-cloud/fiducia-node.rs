@@ -22,7 +22,7 @@ All over HTTP (`/v1`):
 | **Locks (multi-key)** | `/v1/locks/*`      | Mutual exclusion over a **union** of keys — the flagship. Atomic all-or-nothing, FIFO, deadlock-free, fencing tokens, TTL leases. |
 | **Semaphores**        | `/v1/semaphores/*` | Counting locks: up to `limit` concurrent holders, FIFO queue beyond the cap. |
 | **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
-| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). |
+| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted at rest by default** (AES-256-GCM) when `FIDUCIA_KV_ENCRYPTION_KEY` is set; per-write `{"plaintext": true}` opt-out. |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
@@ -429,6 +429,7 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_RAFT_RPC_TIMEOUT_MS` | integer | `10000` | no | Total timeout for vote and bounded AppendEntries HTTP requests. |
 | `FIDUCIA_RAFT_SNAPSHOT_TIMEOUT_MS` | integer | `120000` | no | Longer total timeout for InstallSnapshot HTTP requests. |
 | `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
+| `FIDUCIA_KV_ENCRYPTION_KEY` | base64 32 bytes | *(unset ⇒ KV plaintext at rest)* | recommended | Cluster-wide AES-256 key for **KV encryption at rest**. When set, `/v1/kv` values are sealed (AES-256-GCM) before entering the Raft log, so the on-disk log, snapshots, and in-memory state all hold ciphertext. Must be **identical on every replica**. A client may opt a single write out with `{"plaintext": true}`. |
 | `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Debug-build-only local-dev opt-out. Release binaries compile the bypass out. |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
 | `FIDUCIA_RAFT_CHECK_QUORUM` | bool | `true` | no | Leader steps down without a quorum of live followers. Disable with `0`/`false`/`off`. |

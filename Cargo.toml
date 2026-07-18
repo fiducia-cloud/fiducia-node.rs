@@ -11,6 +11,14 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# KV encryption-at-rest (default on when FIDUCIA_KV_ENCRYPTION_KEY is set):
+# AES-256-GCM with a deterministic per-(key,revision) nonce so every replica
+# produces byte-identical ciphertext and the Raft state machine stays
+# deterministic. See KvCipher in src/state.rs.
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
 tower-http = { version = "0.5", features = ["trace", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
