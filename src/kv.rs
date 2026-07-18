@@ -348,3 +348,64 @@ fn bad_request(detail: &str) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod kv_cipher_tests {
+    use super::*;
+
+    fn cipher() -> KvCipher {
+        // Deterministic 32-byte test key.
+        let key: [u8; 32] = [7u8; 32];
+        KvCipher {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+        }
+    }
+
+    #[test]
+    fn seal_then_unseal_round_trips() {
+        let c = cipher();
+        let sealed = c.seal("flags/new-checkout=on");
+        assert!(sealed.starts_with(KV_ENVELOPE_PREFIX));
+        assert!(!sealed.contains("new-checkout")); // ciphertext hides plaintext
+        assert_eq!(c.unseal(&sealed), "flags/new-checkout=on");
+    }
+
+    #[test]
+    fn unseal_passes_through_plaintext_and_foreign_values() {
+        let c = cipher();
+        // A plaintext-declared value (no envelope prefix) is returned verbatim.
+        assert_eq!(c.unseal("just-plaintext"), "just-plaintext");
+        // A value that looks prefixed but isn't valid base64/ciphertext also
+        // passes through rather than erroring the read.
+        assert_eq!(
+            c.unseal(&format!("{KV_ENVELOPE_PREFIX}not-base64!!")),
+            format!("{KV_ENVELOPE_PREFIX}not-base64!!")
+        );
+    }
+
+    #[test]
+    fn nonce_is_random_so_ciphertexts_differ_but_both_decrypt() {
+        let c = cipher();
+        let a = c.seal("same");
+        let b = c.seal("same");
+        assert_ne!(a, b, "random nonce should vary the ciphertext");
+        assert_eq!(c.unseal(&a), "same");
+        assert_eq!(c.unseal(&b), "same");
+    }
+
+    #[test]
+    fn wrong_key_and_tamper_do_not_yield_plaintext() {
+        let c = cipher();
+        let sealed = c.seal("secret-value");
+        // A different key can't authenticate the envelope; unseal must not
+        // return the true plaintext (it returns the opaque stored string).
+        let other = KvCipher {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[9u8; 32])),
+        };
+        assert_ne!(other.unseal(&sealed), "secret-value");
+        // Tampered ciphertext fails the GCM tag and does not decrypt.
+        let mut tampered = sealed.clone();
+        tampered.push('A');
+        assert_ne!(c.unseal(&tampered), "secret-value");
+    }
+}
