@@ -289,19 +289,36 @@ pub struct NodeConfig {
     pub data_dir: Option<PathBuf>,
 }
 
+/// De-duplicate the configured peer list and drop any entry equal to this node's
+/// own id, preserving first-occurrence order. `members = peers.len()+1` and the
+/// quorum derived from it (`members/2+1`) must count exactly the distinct OTHER
+/// members. A peer listed twice — or this node accidentally listing itself in
+/// `FIDUCIA_PEERS` — inflates `members`, so a single follower's ack is over-counted
+/// toward commit (a leader could advance `commit_index` without a real majority),
+/// and because votes are tracked in a set the quorum threshold can exceed the
+/// number of distinct voters so no leader is ever elected.
+fn resolve_peers(raw: impl IntoIterator<Item = String>, self_id: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty() && p != self_id)
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
-        Self {
-            node_id: std::env::var("FIDUCIA_NODE_ID").unwrap_or_else(|_| "node-a".to_string()),
-            peers: std::env::var("FIDUCIA_PEERS")
+        let node_id = std::env::var("FIDUCIA_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
+        let peers = resolve_peers(
+            std::env::var("FIDUCIA_PEERS")
                 .ok()
-                .map(|s| {
-                    s.split(',')
-                        .filter(|p| !p.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
+                .map(|s| s.split(',').map(String::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
+            &node_id,
+        );
+        Self {
+            node_id,
+            peers,
             shard_count: std::env::var("FIDUCIA_SHARD_COUNT")
                 .ok()
                 .and_then(|s| s.parse().ok())
