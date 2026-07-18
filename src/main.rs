@@ -82,6 +82,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let node = Arc::new(Node::bootstrap_http(config));
 
+    // KV values are encrypted at rest by default; surface which posture booted.
+    if node.kv_cipher().is_some() {
+        tracing::info!("KV encryption at rest: ENABLED (FIDUCIA_KV_ENCRYPTION_KEY set)");
+    } else {
+        tracing::warn!(
+            "KV encryption at rest: DISABLED (FIDUCIA_KV_ENCRYPTION_KEY unset). KV values, \
+             including the Raft log and snapshots on disk, are stored in cleartext. Set a base64 \
+             32-byte key to encrypt by default; clients may still opt individual writes out with \
+             \"plaintext\": true."
+        );
+    }
+
     // The cron firing loop: fires due schedules on the shards this node leads.
     schedule_runner::spawn(node.clone());
 
