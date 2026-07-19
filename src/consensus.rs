@@ -53,7 +53,7 @@ use crate::state::{
     BarrierState, BudgetState, ClaimState, Command, CounterEntry, DecisionState, EffectState,
     ElectionEntry, HandoffState, IdempotencyRecord, KvEntry, KvListItem, Leadership, LockInventory,
     LockState, RateLimitSnapshot, Schedule, ScheduleRun, SemaphoreState, ServiceInstance,
-    ServiceSummary, StateMachine, TaskState,
+    ServiceSummary, StateMachine, TaskState, CURRENT_COMMAND_PROTOCOL, LEGACY_COMMAND_PROTOCOL,
 };
 use crate::transport::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LoopbackRegistry,
@@ -573,6 +573,10 @@ struct LeaderState {
     /// timeout, we may have been partitioned and must step down (see
     /// [`RaftTiming::check_quorum`]).
     last_contact: HashMap<String, Instant>,
+    /// Parser capability positively advertised by each configured peer in this
+    /// leadership term. Missing peers remain V1 and block the V2 activation
+    /// barrier; capability is deliberately not inferred from reachability.
+    peer_command_protocol: HashMap<String, u16>,
 }
 
 struct PendingProposal {
@@ -617,6 +621,32 @@ fn bounded_append_request(
         }
     }
     request
+}
+
+/// Before a peer has advertised the current parser, send only the contiguous
+/// legacy-compatible prefix. This matters not just for newly emitted entries
+/// (which are gated elsewhere) but for recovery from a pre-gate build that may
+/// already have left an uncommitted V2 entry on disk. A safe empty heartbeat lets
+/// a current peer advertise capability without making an older peer parse an
+/// unknown command variant.
+fn appendable_protocol_prefix(
+    suffix: &[LogEntry],
+    peer_protocol: u16,
+    active_protocol: u16,
+) -> &[LogEntry] {
+    if active_protocol >= CURRENT_COMMAND_PROTOCOL || peer_protocol >= CURRENT_COMMAND_PROTOCOL {
+        return suffix;
+    }
+    let compatible = suffix
+        .iter()
+        .take_while(|entry| {
+            entry
+                .command
+                .as_ref()
+                .is_none_or(|command| !command.requires_current_protocol())
+        })
+        .count();
+    &suffix[..compatible]
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +971,13 @@ impl ShardActor {
         let now = Instant::now();
         match self.role {
             Role::Leader => {
+                // A single-member shard can activate immediately; a replicated
+                // shard waits until AppendEntries replies have populated every
+                // peer's parser capability below.
+                self.maybe_activate_command_protocol();
+                if self.storage_fault.is_some() {
+                    return;
+                }
                 if now >= self.heartbeat_deadline {
                     self.heartbeat_deadline = now + self.timing.heartbeat;
                     self.broadcast_append_entries();
@@ -1157,6 +1194,8 @@ impl ShardActor {
             ls.next_index.insert(peer.clone(), next);
             ls.match_index.insert(peer.clone(), 0);
             ls.in_flight.insert(peer.clone(), false);
+            ls.peer_command_protocol
+                .insert(peer.clone(), LEGACY_COMMAND_PROTOCOL);
             if voters.contains(peer) {
                 ls.last_contact.insert(peer.clone(), now);
             }
@@ -1310,6 +1349,86 @@ impl ShardActor {
         }
     }
 
+    fn all_peers_support_current_command_protocol(&self) -> bool {
+        self.members == 1
+            || self.leader.as_ref().is_some_and(|leader| {
+                self.peers.iter().all(|peer| {
+                    leader
+                        .peer_command_protocol
+                        .get(peer)
+                        .copied()
+                        .unwrap_or(LEGACY_COMMAND_PROTOCOL)
+                        >= CURRENT_COMMAND_PROTOCOL
+                })
+            })
+    }
+
+    /// Phase two of the rolling command upgrade. Phase one is passive: every
+    /// current follower advertises parser V2 in ordinary AppendEntries replies,
+    /// while leaders continue emitting legacy-compatible commands. Only after
+    /// *all* configured peers have positively advertised V2 do we append this
+    /// replicated activation record. Its commit, not the volatile advertisements,
+    /// is the durable emission gate.
+    fn maybe_activate_command_protocol(&mut self) {
+        if self.storage_fault.is_some()
+            || self.role != Role::Leader
+            || self.state.command_protocol() >= CURRENT_COMMAND_PROTOCOL
+        {
+            return;
+        }
+        if !self.all_peers_support_current_command_protocol() {
+            return;
+        }
+        // A prior leader may already have appended the barrier without getting
+        // it committed. Replicate that exact record; never grow duplicates on
+        // each heartbeat or leadership term.
+        let activation_already_logged = self.log.iter().any(|entry| {
+            matches!(
+                entry.command.as_ref(),
+                Some(Command::ActivateCommandProtocol { version })
+                    if *version == CURRENT_COMMAND_PROTOCOL
+            )
+        });
+        if activation_already_logged {
+            // A single-member restart can recover the activation after its log
+            // fsync succeeded but its commit-index fsync failed. Finish that
+            // existing record rather than waiting forever or appending another.
+            if self.members == 1 {
+                self.maybe_advance_commit();
+            }
+            return;
+        }
+        let Some(index) = self.last_log_index().checked_add(1) else {
+            self.fail_storage(
+                "allocating command-protocol activation index",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Raft log index overflow"),
+            );
+            return;
+        };
+        self.log.push(LogEntry {
+            term: self.current_term,
+            index,
+            proposed_at_ms: now_ms(),
+            command: Some(Command::ActivateCommandProtocol {
+                version: CURRENT_COMMAND_PROTOCOL,
+            }),
+        });
+        if let Err(error) = self.persist_log_append() {
+            self.fail_storage("persisting command-protocol activation", error);
+            return;
+        }
+        if self.members == 1 {
+            if let Err(error) = self.persist_hard_state_at(index) {
+                self.fail_storage("persisting command-protocol activation commit", error);
+                return;
+            }
+            self.commit_index = index;
+            self.apply_committed();
+        } else {
+            self.broadcast_append_entries();
+        }
+    }
+
     fn send_append_to(&mut self, peer: &str) {
         let Some(ls) = self.leader.as_mut() else {
             return;
@@ -1318,6 +1437,11 @@ impl ShardActor {
             return;
         }
         let next = *ls.next_index.get(peer).unwrap_or(&1);
+        let peer_command_protocol = ls
+            .peer_command_protocol
+            .get(peer)
+            .copied()
+            .unwrap_or(LEGACY_COMMAND_PROTOCOL);
         ls.in_flight.insert(peer.to_string(), true);
         if next <= self.snapshot_index {
             let req = InstallSnapshotReq {
@@ -1350,6 +1474,11 @@ impl ShardActor {
         let max_entries = crate::peer_config::append_max_entries();
         let max_bytes = crate::peer_config::append_max_bytes();
         let suffix_start = prev_log_index.saturating_sub(self.snapshot_index) as usize;
+        let suffix = appendable_protocol_prefix(
+            self.log.get(suffix_start..).unwrap_or(&[]),
+            peer_command_protocol,
+            self.state.command_protocol(),
+        );
         let req = bounded_append_request(
             AppendEntriesReq {
                 term: self.current_term,
@@ -1358,8 +1487,9 @@ impl ShardActor {
                 prev_log_term,
                 entries: Vec::new(),
                 leader_commit: self.commit_index,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             },
-            self.log.get(suffix_start..).unwrap_or(&[]),
+            suffix,
             max_entries,
             max_bytes,
         );
@@ -1429,6 +1559,10 @@ impl ShardActor {
         if self.role != Role::Leader || resp.term != self.current_term {
             return;
         }
+        if let Some(ls) = self.leader.as_mut() {
+            ls.peer_command_protocol
+                .insert(from.clone(), resp.command_protocol);
+        }
         let leader_last_log_index = self.last_log_index();
         let successful = resp.success && resp.match_index >= up_to;
         let mut more = false;
@@ -1460,6 +1594,7 @@ impl ShardActor {
         if successful {
             self.maybe_advance_commit();
         }
+        self.maybe_activate_command_protocol();
         self.refresh_follower_lag_metric();
         if more {
             self.send_append_to(&from);
@@ -1512,7 +1647,23 @@ impl ShardActor {
             }
         }
         matches.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        let n = matches[self.majority() - 1]; // highest index on ≥ majority
+        let mut n = matches[self.majority() - 1]; // highest index on ≥ majority
+        if self.state.command_protocol() < CURRENT_COMMAND_PROTOCOL
+            && !self.all_peers_support_current_command_protocol()
+        {
+            if let Some(first_current) = self.log.iter().find(|entry| {
+                entry.index > self.commit_index
+                    && entry
+                        .command
+                        .as_ref()
+                        .is_some_and(Command::requires_current_protocol)
+            }) {
+                // A pre-gate build may have persisted an uncommitted V2 entry.
+                // Even a current-version quorum must not commit across it until
+                // every configured member has completed parser phase one.
+                n = n.min(first_current.index.saturating_sub(1));
+            }
+        }
         if n > self.commit_index && self.term_at(n) == self.current_term {
             // Persist the new commit pointer before applying or resolving any
             // client waiter. A successful apply must always be restartable.
@@ -1722,6 +1873,7 @@ impl ShardActor {
                 term: self.current_term,
                 success: false,
                 match_index: self.commit_index,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             };
         }
         // Reject a stale leader.
@@ -1730,6 +1882,7 @@ impl ShardActor {
                 term: self.current_term,
                 success: false,
                 match_index: self.last_log_index(),
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             };
         }
         // Recognize this leader for our term (or a newer one).
@@ -1743,6 +1896,7 @@ impl ShardActor {
                     term: self.current_term,
                     success: false,
                     match_index: self.commit_index,
+                    command_protocol: CURRENT_COMMAND_PROTOCOL,
                 };
             }
         }
@@ -1754,6 +1908,7 @@ impl ShardActor {
                 term: self.current_term,
                 success: false,
                 match_index: self.last_log_index(),
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             };
         }
         let mut expected_index = req.prev_log_index;
@@ -1763,6 +1918,7 @@ impl ShardActor {
                     term: self.current_term,
                     success: false,
                     match_index: self.last_log_index(),
+                    command_protocol: CURRENT_COMMAND_PROTOCOL,
                 };
             };
             if entry.index != next || entry.term == 0 || entry.term > req.term {
@@ -1777,6 +1933,7 @@ impl ShardActor {
                     term: self.current_term,
                     success: false,
                     match_index: self.last_log_index(),
+                    command_protocol: CURRENT_COMMAND_PROTOCOL,
                 };
             }
             expected_index = next;
@@ -1804,6 +1961,7 @@ impl ShardActor {
                 match_index: self
                     .last_log_index()
                     .min(req.prev_log_index.saturating_sub(1)),
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             };
         }
 
@@ -1831,6 +1989,7 @@ impl ShardActor {
                             term: self.current_term,
                             success: false,
                             match_index: self.commit_index,
+                            command_protocol: CURRENT_COMMAND_PROTOCOL,
                         };
                     }
                     self.log.truncate(offset);
@@ -1858,6 +2017,7 @@ impl ShardActor {
                 term: self.current_term,
                 success: false,
                 match_index: self.commit_index,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             };
         }
 
@@ -1870,6 +2030,7 @@ impl ShardActor {
                         term: self.current_term,
                         success: false,
                         match_index: self.commit_index,
+                        command_protocol: CURRENT_COMMAND_PROTOCOL,
                     };
                 }
                 self.commit_index = new_commit_index;
@@ -1879,6 +2040,7 @@ impl ShardActor {
                         term: self.current_term,
                         success: false,
                         match_index: self.commit_index,
+                        command_protocol: CURRENT_COMMAND_PROTOCOL,
                     };
                 }
             }
@@ -1888,6 +2050,7 @@ impl ShardActor {
             term: self.current_term,
             success: true,
             match_index: self.last_log_index(),
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         }
     }
 
@@ -2033,6 +2196,36 @@ impl ShardActor {
             }));
             return;
         }
+        // The activation record is consensus-internal. Never let a client route
+        // one arbitrary shard across the compatibility boundary.
+        if matches!(command, Command::ActivateCommandProtocol { .. }) {
+            let _ = resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            }));
+            return;
+        }
+        self.maybe_activate_command_protocol();
+        if self.storage_fault.is_some() {
+            let _ = resp.send(Err(ProposeError::Unavailable {
+                shard: self.shard_id,
+            }));
+            return;
+        }
+        let command = match command.for_active_protocol(self.state.command_protocol()) {
+            Ok(command) => command,
+            Err(required) => {
+                tracing::warn!(
+                    shard = self.shard_id,
+                    active_command_protocol = self.state.command_protocol(),
+                    required_command_protocol = required,
+                    "proposal held behind rolling command-protocol activation"
+                );
+                let _ = resp.send(Err(ProposeError::Unavailable {
+                    shard: self.shard_id,
+                }));
+                return;
+            }
+        };
         let Some(index) = self.last_log_index().checked_add(1) else {
             let _ = resp.send(Err(ProposeError::Unavailable {
                 shard: self.shard_id,
@@ -2428,6 +2621,11 @@ impl ShardActor {
                         match_index,
                         lag: last.saturating_sub(match_index),
                         in_flight: ls.in_flight.get(peer).copied().unwrap_or(false),
+                        command_protocol: ls
+                            .peer_command_protocol
+                            .get(peer)
+                            .copied()
+                            .unwrap_or(LEGACY_COMMAND_PROTOCOL),
                     });
                 }
             }
@@ -2448,6 +2646,8 @@ impl ShardActor {
             retained_log_entries: self.log.len(),
             storage_healthy: self.storage_fault.is_none(),
             storage_error: self.storage_fault.clone(),
+            parser_command_protocol: CURRENT_COMMAND_PROTOCOL,
+            active_command_protocol: self.state.command_protocol(),
             healthy_replicas,
             has_quorum,
             replication,
@@ -3047,6 +3247,10 @@ pub struct ShardStatus {
     pub storage_healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_error: Option<String>,
+    /// Highest command protocol this binary can parse (phase-one capability).
+    pub parser_command_protocol: u16,
+    /// Replicated command protocol currently allowed for emission on this shard.
+    pub active_command_protocol: u16,
     /// Replicas (incl. self) caught up to `commit_index`. Leader-only; 0 elsewhere.
     pub healthy_replicas: usize,
     /// Whether a majority of the group is caught up — i.e. the shard can survive
@@ -3068,6 +3272,8 @@ pub struct PeerReplication {
     pub lag: u64,
     /// Whether an `AppendEntries` to this peer is currently outstanding.
     pub in_flight: bool,
+    /// Parser capability last advertised by this peer in the current term.
+    pub command_protocol: u16,
 }
 
 /// Whole-node status: identity, membership, and a row per hosted shard.
@@ -3340,6 +3546,7 @@ mod tests {
             prev_log_term: 0,
             entries: Vec::new(),
             leader_commit: 0,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         };
 
         let by_count = bounded_append_request(request(), &entries, 2, usize::MAX);
@@ -3357,6 +3564,160 @@ mod tests {
         // absolute peer-body preflight decide whether it can be sent.
         let indivisible = bounded_append_request(request(), &entries, 4, 1);
         assert_eq!(indivisible.entries.len(), 1);
+    }
+
+    #[test]
+    fn append_capability_exchange_is_previous_release_wire_compatible() {
+        #[allow(dead_code)]
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum PreviousCommand {
+            LockAcquire {
+                keys: Vec<String>,
+                holder: String,
+                ttl_ms: u64,
+                wait: bool,
+            },
+        }
+        #[allow(dead_code)]
+        #[derive(Debug, Serialize, Deserialize)]
+        struct PreviousLogEntry {
+            term: u64,
+            index: u64,
+            proposed_at_ms: u64,
+            command: Option<PreviousCommand>,
+        }
+        #[allow(dead_code)]
+        #[derive(Debug, Serialize, Deserialize)]
+        struct PreviousAppendEntriesReq {
+            term: u64,
+            leader_id: String,
+            prev_log_index: u64,
+            prev_log_term: u64,
+            entries: Vec<PreviousLogEntry>,
+            leader_commit: u64,
+        }
+        #[allow(dead_code)]
+        #[derive(Debug, Serialize, Deserialize)]
+        struct PreviousAppendEntriesResp {
+            term: u64,
+            success: bool,
+            match_index: u64,
+        }
+
+        let current_request = AppendEntriesReq {
+            term: 7,
+            leader_id: "current".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 7,
+                index: 1,
+                proposed_at_ms: 100,
+                command: Some(Command::LockAcquire {
+                    keys: vec!["legacy-shape".to_string()],
+                    holder: "worker".to_string(),
+                    ttl_ms: 1_000,
+                    wait: false,
+                    wait_timeout_ms: None,
+                }),
+            }],
+            leader_commit: 0,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
+        };
+        let previous: PreviousAppendEntriesReq =
+            serde_json::from_slice(&serde_json::to_vec(&current_request).unwrap()).unwrap();
+        assert_eq!(previous.entries.len(), 1);
+        assert!(matches!(
+            previous.entries[0].command,
+            Some(PreviousCommand::LockAcquire { .. })
+        ));
+
+        let previous_request = PreviousAppendEntriesReq {
+            term: 7,
+            leader_id: "previous".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
+        let current: AppendEntriesReq =
+            serde_json::from_slice(&serde_json::to_vec(&previous_request).unwrap()).unwrap();
+        assert_eq!(current.command_protocol, LEGACY_COMMAND_PROTOCOL);
+
+        let current_response = AppendEntriesResp {
+            term: 7,
+            success: true,
+            match_index: 1,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
+        };
+        let previous_response: PreviousAppendEntriesResp =
+            serde_json::from_slice(&serde_json::to_vec(&current_response).unwrap()).unwrap();
+        assert!(previous_response.success);
+        let previous_response = PreviousAppendEntriesResp {
+            term: 7,
+            success: true,
+            match_index: 1,
+        };
+        let current_response: AppendEntriesResp =
+            serde_json::from_slice(&serde_json::to_vec(&previous_response).unwrap()).unwrap();
+        assert_eq!(current_response.command_protocol, LEGACY_COMMAND_PROTOCOL);
+
+        let activation = serde_json::to_value(Command::ActivateCommandProtocol {
+            version: CURRENT_COMMAND_PROTOCOL,
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_value::<PreviousCommand>(activation).is_err(),
+            "the activation record itself is the persisted downgrade refusal"
+        );
+    }
+
+    #[test]
+    fn append_prefix_withholds_recovered_v2_entries_until_the_peer_advertises() {
+        let entries = vec![
+            LogEntry {
+                term: 3,
+                index: 1,
+                proposed_at_ms: 1,
+                command: Some(put("legacy", "safe")),
+            },
+            LogEntry {
+                term: 3,
+                index: 2,
+                proposed_at_ms: 2,
+                command: Some(Command::LockAcquireAttempt {
+                    keys: vec!["unsafe-before-advertisement".to_string()],
+                    holder: "worker".to_string(),
+                    request_id: "recovered-attempt".to_string(),
+                    ttl_ms: 1_000,
+                    wait: false,
+                    wait_timeout_ms: None,
+                }),
+            },
+            LogEntry {
+                term: 3,
+                index: 3,
+                proposed_at_ms: 3,
+                command: Some(put("after", "not-contiguous-yet")),
+            },
+        ];
+        assert_eq!(
+            appendable_protocol_prefix(&entries, LEGACY_COMMAND_PROTOCOL, LEGACY_COMMAND_PROTOCOL)
+                .len(),
+            1
+        );
+        assert_eq!(
+            appendable_protocol_prefix(&entries, CURRENT_COMMAND_PROTOCOL, LEGACY_COMMAND_PROTOCOL)
+                .len(),
+            3
+        );
+        assert_eq!(
+            appendable_protocol_prefix(&entries, LEGACY_COMMAND_PROTOCOL, CURRENT_COMMAND_PROTOCOL)
+                .len(),
+            3,
+            "after durable activation, a downgraded peer must fail closed"
+        );
     }
 
     #[tokio::test]
@@ -3406,6 +3767,30 @@ mod tests {
         let out = n.propose(put("flags/x", "on")).await.expect("commit");
         assert!(out.output["ok"].as_bool().unwrap());
 
+        let attempt = n
+            .propose(Command::LockAcquireAttempt {
+                keys: vec!["single-node-v2".to_string()],
+                holder: "worker".to_string(),
+                request_id: "first-v2-attempt".to_string(),
+                ttl_ms: 1_000,
+                wait: false,
+                wait_timeout_ms: None,
+            })
+            .await
+            .expect("single member activates before its first V2-only proposal");
+        assert_eq!(attempt.output["acquired"], true);
+        let lock_shard = n.shard_for(crate::state::LOCK_DOMAIN);
+        assert_eq!(
+            n.status()
+                .await
+                .shards
+                .iter()
+                .find(|status| status.shard_id == lock_shard)
+                .unwrap()
+                .active_command_protocol,
+            CURRENT_COMMAND_PROTOCOL
+        );
+
         match n
             .query(ReadRequest::Kv {
                 key: "flags/x".to_string(),
@@ -3429,6 +3814,7 @@ mod tests {
             holder: "worker-a".to_string(),
             ttl_ms: 30_000,
             wait: false,
+            wait_timeout_ms: None,
         })
         .await
         .expect("lock commit");
@@ -4348,6 +4734,7 @@ mod tests {
                 command: Some(put("unsafe", "value")),
             }],
             leader_commit: 1,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         });
 
         assert!(!response.success);
@@ -4382,6 +4769,7 @@ mod tests {
                 command: Some(put("new", "value")),
             }],
             leader_commit: 0,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         });
 
         assert!(!response.success);
@@ -4422,6 +4810,7 @@ mod tests {
                 command: Some(put("protected", "new")),
             }],
             leader_commit: 1,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         });
 
         assert!(!response.success);
@@ -4445,6 +4834,7 @@ mod tests {
                 command: Some(put("gap", "value")),
             }],
             leader_commit: 0,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         });
 
         assert!(!response.success);
@@ -4472,6 +4862,7 @@ mod tests {
             prev_log_term: actor.current_term,
             entries: vec![],
             leader_commit: 1,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         });
 
         assert!(!response.success);
@@ -4592,6 +4983,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_protocol_activation_requires_every_peers_parser_advertisement() {
+        let mut actor = leader_actor();
+        assert_eq!(actor.state.command_protocol(), LEGACY_COMMAND_PROTOCOL);
+
+        let (legacy_tx, mut legacy_rx) = oneshot::channel();
+        actor.on_propose(
+            Command::LockAcquireV2 {
+                keys: vec!["rolling-lock".to_string()],
+                holder: "worker".to_string(),
+                ttl_ms: 1_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            legacy_tx,
+        );
+        assert!(matches!(
+            actor.log[0].command,
+            Some(Command::LockAcquire { .. })
+        ));
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "proposal still awaits quorum"
+        );
+
+        let before_rejected = actor.log.len();
+        let (blocked_tx, mut blocked_rx) = oneshot::channel();
+        actor.on_propose(
+            Command::LockAcquireAttempt {
+                keys: vec!["rolling-lock".to_string()],
+                holder: "worker-2".to_string(),
+                request_id: "attempt-before-activation".to_string(),
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(1_000),
+            },
+            blocked_tx,
+        );
+        assert!(matches!(
+            blocked_rx.try_recv().unwrap(),
+            Err(ProposeError::Unavailable { .. })
+        ));
+        assert_eq!(actor.log.len(), before_rejected);
+
+        actor.handle_append_reply(
+            "b".to_string(),
+            0,
+            None,
+            Some(AppendEntriesResp {
+                term: actor.current_term,
+                success: true,
+                match_index: 0,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
+            }),
+        );
+        assert!(actor
+            .log
+            .iter()
+            .all(|entry| !matches!(entry.command, Some(Command::ActivateCommandProtocol { .. }))));
+        actor.handle_append_reply(
+            "c".to_string(),
+            0,
+            None,
+            Some(AppendEntriesResp {
+                term: actor.current_term,
+                success: true,
+                match_index: 0,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
+            }),
+        );
+        let activation_index = actor.last_log_index();
+        assert!(matches!(
+            actor.log.last().unwrap().command,
+            Some(Command::ActivateCommandProtocol {
+                version: CURRENT_COMMAND_PROTOCOL
+            })
+        ));
+        assert_eq!(
+            actor.state.command_protocol(),
+            LEGACY_COMMAND_PROTOCOL,
+            "advertisement alone is not the emission gate"
+        );
+
+        actor.handle_append_reply(
+            "b".to_string(),
+            activation_index,
+            None,
+            Some(AppendEntriesResp {
+                term: actor.current_term,
+                success: true,
+                match_index: activation_index,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
+            }),
+        );
+        assert_eq!(actor.state.command_protocol(), CURRENT_COMMAND_PROTOCOL);
+        assert!(legacy_rx.try_recv().unwrap().is_ok());
+        let status = actor.status();
+        assert_eq!(status.parser_command_protocol, CURRENT_COMMAND_PROTOCOL);
+        assert_eq!(status.active_command_protocol, CURRENT_COMMAND_PROTOCOL);
+
+        let (attempt_tx, _attempt_rx) = oneshot::channel();
+        actor.on_propose(
+            Command::LockAcquireAttempt {
+                keys: vec!["rolling-lock".to_string()],
+                holder: "worker-2".to_string(),
+                request_id: "attempt-after-activation".to_string(),
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(1_000),
+            },
+            attempt_tx,
+        );
+        assert!(matches!(
+            actor.log.last().unwrap().command,
+            Some(Command::LockAcquireAttempt { .. })
+        ));
+    }
+
+    #[test]
+    fn recovered_v2_entry_cannot_commit_on_only_a_current_quorum() {
+        let mut actor = leader_actor();
+        actor.log.push(LogEntry {
+            term: actor.current_term,
+            index: 1,
+            proposed_at_ms: 1_000,
+            command: Some(Command::LockAcquireAttempt {
+                keys: vec!["recovered".to_string()],
+                holder: "worker".to_string(),
+                request_id: "pre-gate-entry".to_string(),
+                ttl_ms: 1_000,
+                wait: false,
+                wait_timeout_ms: None,
+            }),
+        });
+        {
+            let leader = actor.leader.as_mut().unwrap();
+            leader.match_index.insert("b".to_string(), 1);
+            leader.match_index.insert("c".to_string(), 1);
+            leader
+                .peer_command_protocol
+                .insert("b".to_string(), CURRENT_COMMAND_PROTOCOL);
+            leader
+                .peer_command_protocol
+                .insert("c".to_string(), LEGACY_COMMAND_PROTOCOL);
+        }
+        actor.maybe_advance_commit();
+        assert_eq!(actor.commit_index, 0);
+        assert_eq!(actor.state.command_protocol(), LEGACY_COMMAND_PROTOCOL);
+
+        actor
+            .leader
+            .as_mut()
+            .unwrap()
+            .peer_command_protocol
+            .insert("c".to_string(), CURRENT_COMMAND_PROTOCOL);
+        actor.maybe_advance_commit();
+        assert_eq!(actor.commit_index, 1);
+        assert_eq!(actor.state.command_protocol(), CURRENT_COMMAND_PROTOCOL);
+        assert!(
+            actor
+                .state
+                .snapshot()
+                .unwrap()
+                .starts_with(crate::state::CURRENT_PROTOCOL_SNAPSHOT_MAGIC),
+            "implicit recovery activation still persists downgrade refusal"
+        );
+    }
+
+    #[tokio::test]
     async fn successful_partial_append_immediately_schedules_the_next_batch() {
         let mut actor = leader_actor();
         actor.log = (1..=3)
@@ -4611,6 +5170,7 @@ mod tests {
                 term: actor.current_term,
                 success: true,
                 match_index: 1,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             }),
         );
 
@@ -4635,6 +5195,7 @@ mod tests {
                 term: actor.current_term,
                 success: false,
                 match_index: 4,
+                command_protocol: CURRENT_COMMAND_PROTOCOL,
             }),
         );
 
@@ -4884,6 +5445,7 @@ mod tests {
                 }),
             }],
             leader_commit: 6,
+            command_protocol: CURRENT_COMMAND_PROTOCOL,
         });
         assert!(appended.success);
         assert_eq!(follower.last_applied, 6);

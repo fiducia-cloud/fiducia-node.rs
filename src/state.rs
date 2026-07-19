@@ -4,14 +4,25 @@
 //! in committed-log order. The log may be local in single-node development, but
 //! the state-machine semantics are the same ones the replicated path uses.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::indexed_queue::IndexedQueue;
+
+/// Command protocol understood by the release immediately before the hardened
+/// lock/semaphore command variants were introduced.
+pub const LEGACY_COMMAND_PROTOCOL: u16 = 1;
+/// Highest command protocol this binary can parse and apply.
+pub const CURRENT_COMMAND_PROTOCOL: u16 = 2;
+const COMMAND_PROTOCOL_ROUTING_KEY: &str = "\0fiducia-command-protocol";
+/// A non-JSON prefix is deliberate: an older binary must reject, rather than
+/// deserialize as an empty/default Store, a snapshot created after activation.
+pub(crate) const CURRENT_PROTOCOL_SNAPSHOT_MAGIC: &[u8] = b"FIDUCIA-STATE-MACHINE\0V2\n";
 
 /// Every mutation in the system, as it travels through the replicated log.
 ///
@@ -20,6 +31,15 @@ use crate::indexed_queue::IndexedQueue;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Command {
+    // --- Replicated compatibility barrier ---------------------------------
+    /// Internal, per-shard activation record. Leaders append this only after
+    /// every configured peer has advertised parser support over AppendEntries.
+    /// Its committed state stamp and snapshot envelope make downgrade refusal
+    /// durable after the activating log prefix is compacted.
+    ActivateCommandProtocol {
+        version: u16,
+    },
+
     // --- Config KV ---------------------------------------------------------
     KvPut {
         key: String,
@@ -263,12 +283,57 @@ pub enum Command {
         holder: String,
         ttl_ms: u64,
         wait: bool,
+        /// Historical entries omit this and retain their original indefinite
+        /// waits; newly accepted V2/attempt commands use a bounded default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_timeout_ms: Option<u64>,
+    },
+    /// Hardened acquire for callers that do not yet supply an attempt id. This
+    /// separate log variant keeps historical `LockAcquire` replay byte-for-byte
+    /// compatible while applying bounded queue leases and non-renewing retries
+    /// to all newly accepted HTTP requests.
+    LockAcquireV2 {
+        keys: Vec<String>,
+        holder: String,
+        ttl_ms: u64,
+        wait: bool,
+        wait_timeout_ms: Option<u64>,
+    },
+    /// Attempt-scoped acquire used by hardened clients. `request_id` is a
+    /// cryptographically unique acquisition identity reused only for retries.
+    LockAcquireAttempt {
+        keys: Vec<String>,
+        holder: String,
+        request_id: String,
+        ttl_ms: u64,
+        wait: bool,
+        wait_timeout_ms: Option<u64>,
+    },
+    /// Extend an active union-lock lease only when holder, exact key set, and
+    /// fencing token all match. The token is preserved.
+    LockRenew {
+        keys: Vec<String>,
+        holder: String,
+        fencing_token: u64,
+        ttl_ms: u64,
     },
     /// Release a held lock by its fencing token, freeing every member key at once
     /// and promoting the next grantable waiter(s).
     LockRelease {
         holder: String,
         fencing_token: u64,
+    },
+    /// Idempotently remove one queued `(holder, canonical key-set)` request.
+    LockCancel {
+        keys: Vec<String>,
+        holder: String,
+    },
+    /// Attempt-scoped cancellation. Its tombstone prevents a late acquire with
+    /// the same request_id from committing after cancellation was acknowledged.
+    LockCancelAttempt {
+        keys: Vec<String>,
+        holder: String,
+        request_id: String,
     },
 
     // --- Counting semaphores ----------------------------------------------
@@ -280,12 +345,53 @@ pub enum Command {
         limit: u32,
         ttl_ms: u64,
         wait: bool,
+        /// Historical entries omit this and retain their original indefinite
+        /// waits; newly accepted V2/attempt commands use a bounded default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_timeout_ms: Option<u64>,
+    },
+    /// Hardened, immutable-limit acquire without an attempt id. Historical
+    /// `SemaphoreAcquire` entries retain their old reconfiguration semantics so
+    /// uncompacted logs replay identically during rolling upgrades.
+    SemaphoreAcquireV2 {
+        key: String,
+        holder: String,
+        limit: u32,
+        ttl_ms: u64,
+        wait: bool,
+        wait_timeout_ms: Option<u64>,
+    },
+    SemaphoreAcquireAttempt {
+        key: String,
+        holder: String,
+        request_id: String,
+        limit: u32,
+        ttl_ms: u64,
+        wait: bool,
+        wait_timeout_ms: Option<u64>,
+    },
+    /// Extend one active permit lease without changing its fencing token.
+    SemaphoreRenew {
+        key: String,
+        holder: String,
+        fencing_token: u64,
+        ttl_ms: u64,
     },
     /// Release one held permit by its fencing token, admitting the next waiter.
     SemaphoreRelease {
         key: String,
         holder: String,
         fencing_token: u64,
+    },
+    /// Idempotently remove one queued holder from a semaphore.
+    SemaphoreCancel {
+        key: String,
+        holder: String,
+    },
+    SemaphoreCancelAttempt {
+        key: String,
+        holder: String,
+        request_id: String,
     },
 
     // --- Rate limiting -----------------------------------------------------
@@ -455,10 +561,21 @@ impl Command {
     /// Key used to route this command to its owning shard.
     pub fn routing_key(&self) -> &str {
         match self {
+            Command::ActivateCommandProtocol { .. } => COMMAND_PROTOCOL_ROUTING_KEY,
             Command::LockAcquire { .. }
+            | Command::LockAcquireV2 { .. }
+            | Command::LockAcquireAttempt { .. }
+            | Command::LockRenew { .. }
             | Command::LockRelease { .. }
+            | Command::LockCancel { .. }
+            | Command::LockCancelAttempt { .. }
             | Command::SemaphoreAcquire { .. }
-            | Command::SemaphoreRelease { .. } => LOCK_DOMAIN,
+            | Command::SemaphoreAcquireV2 { .. }
+            | Command::SemaphoreAcquireAttempt { .. }
+            | Command::SemaphoreRenew { .. }
+            | Command::SemaphoreRelease { .. }
+            | Command::SemaphoreCancel { .. }
+            | Command::SemaphoreCancelAttempt { .. } => LOCK_DOMAIN,
             Command::KvPut { key, .. }
             | Command::KvDelete { key }
             | Command::CounterAdd { key, .. }
@@ -509,6 +626,7 @@ impl Command {
     /// attribute on telemetry spans/events so traces group by primitive.
     pub fn kind(&self) -> &'static str {
         match self {
+            Command::ActivateCommandProtocol { .. } => "raft.command_protocol.activate",
             Command::KvPut { .. } => "kv.put",
             Command::KvDelete { .. } => "kv.delete",
             Command::CounterAdd { .. } => "counter.add",
@@ -539,10 +657,20 @@ impl Command {
             Command::ClaimContest { .. } => "claim.contest",
             Command::ClaimResolve { .. } => "claim.resolve",
             Command::ClaimSupersede { .. } => "claim.supersede",
-            Command::LockAcquire { .. } => "lock.acquire",
+            Command::LockAcquire { .. }
+            | Command::LockAcquireV2 { .. }
+            | Command::LockAcquireAttempt { .. } => "lock.acquire",
+            Command::LockRenew { .. } => "lock.renew",
             Command::LockRelease { .. } => "lock.release",
-            Command::SemaphoreAcquire { .. } => "semaphore.acquire",
+            Command::LockCancel { .. } | Command::LockCancelAttempt { .. } => "lock.cancel",
+            Command::SemaphoreAcquire { .. }
+            | Command::SemaphoreAcquireV2 { .. }
+            | Command::SemaphoreAcquireAttempt { .. } => "semaphore.acquire",
+            Command::SemaphoreRenew { .. } => "semaphore.renew",
             Command::SemaphoreRelease { .. } => "semaphore.release",
+            Command::SemaphoreCancel { .. } | Command::SemaphoreCancelAttempt { .. } => {
+                "semaphore.cancel"
+            }
             Command::RateLimitCheck { .. } => "ratelimit.check",
             Command::IdempotencyClaim { .. } => "idempotency.claim",
             Command::IdempotencyComplete { .. } => "idempotency.complete",
@@ -558,6 +686,73 @@ impl Command {
             Command::ServiceRegister { .. } => "service.register",
             Command::ServiceHeartbeat { .. } => "service.heartbeat",
             Command::ServiceDeregister { .. } => "service.deregister",
+        }
+    }
+
+    /// Convert availability-compatible V2 acquire requests to their historical
+    /// command shapes while a mixed-version cluster is still in phase one.
+    /// Operations with no safe legacy expression stay unavailable until the
+    /// replicated protocol activation commits.
+    pub(crate) fn for_active_protocol(self, active: u16) -> Result<Self, u16> {
+        if active >= CURRENT_COMMAND_PROTOCOL {
+            return Ok(self);
+        }
+        match self {
+            Command::LockAcquireV2 {
+                keys,
+                holder,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            } => Ok(Command::LockAcquire {
+                keys,
+                holder,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            }),
+            Command::SemaphoreAcquireV2 {
+                key,
+                holder,
+                limit,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            } => Ok(Command::SemaphoreAcquire {
+                key,
+                holder,
+                limit,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            }),
+            Command::LockAcquireAttempt { .. }
+            | Command::LockRenew { .. }
+            | Command::LockCancel { .. }
+            | Command::LockCancelAttempt { .. }
+            | Command::SemaphoreAcquireAttempt { .. }
+            | Command::SemaphoreRenew { .. }
+            | Command::SemaphoreCancel { .. }
+            | Command::SemaphoreCancelAttempt { .. }
+            | Command::ActivateCommandProtocol { .. } => Err(CURRENT_COMMAND_PROTOCOL),
+            command => Ok(command),
+        }
+    }
+
+    pub(crate) fn requires_current_protocol(&self) -> bool {
+        match self {
+            Command::ActivateCommandProtocol { version } => *version == CURRENT_COMMAND_PROTOCOL,
+            Command::LockAcquireV2 { .. }
+            | Command::LockAcquireAttempt { .. }
+            | Command::LockRenew { .. }
+            | Command::LockCancel { .. }
+            | Command::LockCancelAttempt { .. }
+            | Command::SemaphoreAcquireV2 { .. }
+            | Command::SemaphoreAcquireAttempt { .. }
+            | Command::SemaphoreRenew { .. }
+            | Command::SemaphoreCancel { .. }
+            | Command::SemaphoreCancelAttempt { .. } => true,
+            _ => false,
         }
     }
 }
@@ -752,6 +947,9 @@ pub struct LockWaiter {
     /// The full key set this waiter is trying to acquire.
     pub keys: Vec<String>,
     pub requested_ms: u64,
+    /// Absolute replicated deadline after which this queue entry is no longer
+    /// eligible for promotion. `None` only represents a legacy snapshot entry.
+    pub wait_expires_ms: Option<u64>,
 }
 
 /// One held union-lock grant, as surfaced by the observability inventory: who
@@ -779,6 +977,8 @@ struct LockGrant {
     keys: Vec<String>,
     fencing_token: u64,
     lease_expires_ms: u64,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// One queued union-lock request awaiting its whole key set.
@@ -788,6 +988,11 @@ struct QueuedLock {
     keys: Vec<String>,
     ttl_ms: u64,
     requested_ms: u64,
+    /// Absent in snapshots written before queue deadlines were introduced.
+    #[serde(default)]
+    wait_expires_ms: Option<u64>,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// The multi-key lock table: which member key is held by which grant, the grants
@@ -827,6 +1032,8 @@ struct SemaphoreSlot {
     holder: String,
     fencing_token: u64,
     lease_expires_ms: u64,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,6 +1041,11 @@ struct QueuedPermit {
     holder: String,
     ttl_ms: u64,
     requested_ms: u64,
+    /// Absent in snapshots written before queue deadlines were introduced.
+    #[serde(default)]
+    wait_expires_ms: Option<u64>,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// A counting semaphore: up to `limit` permits, plus a FIFO queue for the rest.
@@ -1651,9 +1863,10 @@ impl ClaimRecord {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Store {
+    command_protocol: u16,
     revision: u64,
     next_fencing_token: u64,
     kv: HashMap<String, KvEntry>,
@@ -1667,11 +1880,54 @@ struct Store {
     claims: HashMap<String, ClaimRecord>,
     locks: LockManager,
     semaphores: HashMap<String, Semaphore>,
+    /// Recently cancelled acquisition identities. Fixed-size digests close the
+    /// ordering race where cancel commits before an ambiguous acquire reaches
+    /// the Raft log without retaining attacker-controlled keys in memory.
+    lock_cancellations: CancellationLedger,
+    semaphore_cancellations: CancellationLedger,
     rate_limits: HashMap<String, RateLimitRecord>,
     idempotency: HashMap<String, IdempotencyRecord>,
     elections: HashMap<String, Leadership>,
     schedules: HashMap<String, ScheduleRecord>,
     services: HashMap<String, HashMap<String, ServiceInstance>>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            command_protocol: LEGACY_COMMAND_PROTOCOL,
+            revision: 0,
+            next_fencing_token: 0,
+            kv: HashMap::new(),
+            counters: HashMap::new(),
+            barriers: HashMap::new(),
+            tasks: HashMap::new(),
+            effects: HashMap::new(),
+            handoffs: HashMap::new(),
+            decisions: HashMap::new(),
+            budgets: HashMap::new(),
+            claims: HashMap::new(),
+            locks: LockManager::default(),
+            semaphores: HashMap::new(),
+            lock_cancellations: CancellationLedger::default(),
+            semaphore_cancellations: CancellationLedger::default(),
+            rate_limits: HashMap::new(),
+            idempotency: HashMap::new(),
+            elections: HashMap::new(),
+            schedules: HashMap::new(),
+            services: HashMap::new(),
+        }
+    }
+}
+
+struct LockAcquireInput {
+    keys: Vec<String>,
+    holder: String,
+    ttl_ms: u64,
+    wait: bool,
+    wait_timeout_ms: Option<u64>,
+    request_id: Option<String>,
+    legacy_semantics: bool,
 }
 
 struct SemaphoreAcquireInput {
@@ -1680,6 +1936,191 @@ struct SemaphoreAcquireInput {
     limit: u32,
     ttl_ms: u64,
     wait: bool,
+    wait_timeout_ms: Option<u64>,
+    request_id: Option<String>,
+    legacy_semantics: bool,
+}
+
+const CANCELLATION_TOMBSTONE_TTL_MS: u64 = crate::validate::MAX_TTL_MS;
+const MAX_CANCELLATION_TOMBSTONES_PER_TENANT: u32 = 10_000;
+const MAX_CANCELLATION_TOMBSTONES_TOTAL: usize = 250_000;
+/// Keep a slice of the global ledger available to tenants that have not yet
+/// consumed a modest fair share. Without this reserve, 25 tenants at the hard
+/// per-tenant cap could starve every other tenant until the 24-hour expiry.
+const CANCELLATION_TOMBSTONE_GLOBAL_RESERVE: usize = 25_000;
+const CANCELLATION_TOMBSTONE_FAIR_SHARE_PER_TENANT: u32 = 256;
+
+#[derive(Debug, Clone, Copy)]
+struct CancellationLimits {
+    per_tenant: u32,
+    total: usize,
+    global_reserve: usize,
+    fair_share_per_tenant: u32,
+}
+
+const CANCELLATION_LIMITS: CancellationLimits = CancellationLimits {
+    per_tenant: MAX_CANCELLATION_TOMBSTONES_PER_TENANT,
+    total: MAX_CANCELLATION_TOMBSTONES_TOTAL,
+    global_reserve: CANCELLATION_TOMBSTONE_GLOBAL_RESERVE,
+    fair_share_per_tenant: CANCELLATION_TOMBSTONE_FAIR_SHARE_PER_TENANT,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CancellationEntry {
+    expires_at_ms: u64,
+    tenant: String,
+}
+
+/// Replicated attempt-cancellation ledger. Both identity and tenant are SHA-256
+/// digests, so each entry has a fixed upper bound regardless of union-key size.
+/// The expiry index makes insertion/expiry O(log n); capacity is fail-closed and
+/// never evicts another tenant's still-live safety record.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct CancellationLedger {
+    entries: HashMap<String, CancellationEntry>,
+    expirations: BTreeMap<u64, BTreeSet<String>>,
+    tenant_counts: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RememberCancellation {
+    Remembered,
+    CapacityExceeded,
+}
+
+fn hash_segment(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn digest_string(mut hasher: Sha256) -> String {
+    let digest = hasher.finalize_reset();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn acquisition_identity(kind: &str, holder: &str, keys: &[String], request_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_segment(&mut hasher, kind.as_bytes());
+    hash_segment(&mut hasher, holder.as_bytes());
+    for key in keys {
+        hash_segment(&mut hasher, key.as_bytes());
+    }
+    hash_segment(&mut hasher, request_id.as_bytes());
+    digest_string(hasher)
+}
+
+fn cancellation_tenant(holder: &str) -> String {
+    let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+    let scope = holder
+        .strip_prefix(delimiter)
+        .and_then(|rest| rest.find(delimiter).map(|end| &rest[..end]))
+        .unwrap_or("legacy-unscoped");
+    let mut hasher = Sha256::new();
+    hash_segment(&mut hasher, scope.as_bytes());
+    digest_string(hasher)
+}
+
+impl CancellationLedger {
+    fn contains(&self, identity: &str) -> bool {
+        self.entries.contains_key(identity)
+    }
+
+    fn remember(&mut self, identity: String, tenant: String, now: u64) -> RememberCancellation {
+        self.remember_with_limits(identity, tenant, now, CANCELLATION_LIMITS)
+    }
+
+    fn remember_with_limits(
+        &mut self,
+        identity: String,
+        tenant: String,
+        now: u64,
+        limits: CancellationLimits,
+    ) -> RememberCancellation {
+        if self.entries.contains_key(&identity) {
+            return RememberCancellation::Remembered;
+        }
+        let tenant_count = self.tenant_counts.get(&tenant).copied().unwrap_or(0);
+        let reserve_starts_at = limits.total.saturating_sub(limits.global_reserve);
+        let consuming_reserved_capacity =
+            self.entries.len() >= reserve_starts_at && tenant_count >= limits.fair_share_per_tenant;
+        if self.entries.len() >= limits.total
+            || tenant_count >= limits.per_tenant
+            || consuming_reserved_capacity
+        {
+            return RememberCancellation::CapacityExceeded;
+        }
+
+        let expires_at_ms = now.saturating_add(CANCELLATION_TOMBSTONE_TTL_MS);
+        self.entries.insert(
+            identity.clone(),
+            CancellationEntry {
+                expires_at_ms,
+                tenant: tenant.clone(),
+            },
+        );
+        self.expirations
+            .entry(expires_at_ms)
+            .or_default()
+            .insert(identity);
+        *self.tenant_counts.entry(tenant).or_default() += 1;
+        RememberCancellation::Remembered
+    }
+
+    fn expire(&mut self, now: u64) {
+        let deadlines: Vec<u64> = self.expirations.range(..=now).map(|(at, _)| *at).collect();
+        for deadline in deadlines {
+            let Some(identities) = self.expirations.remove(&deadline) else {
+                continue;
+            };
+            for identity in identities {
+                let Some(entry) = self.entries.get(&identity) else {
+                    continue;
+                };
+                if entry.expires_at_ms != deadline {
+                    continue;
+                }
+                let tenant = entry.tenant.clone();
+                self.entries.remove(&identity);
+                if let Some(count) = self.tenant_counts.get_mut(&tenant) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.tenant_counts.remove(&tenant);
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate(&self, label: &str) -> Result<(), String> {
+        let mut counts = HashMap::<&str, u32>::new();
+        for (identity, entry) in &self.entries {
+            if !self
+                .expirations
+                .get(&entry.expires_at_ms)
+                .is_some_and(|bucket| bucket.contains(identity))
+            {
+                return Err(format!(
+                    "{label} cancellation '{identity}' is absent from expiry index"
+                ));
+            }
+            *counts.entry(entry.tenant.as_str()).or_default() += 1;
+        }
+        for (tenant, count) in &self.tenant_counts {
+            if counts.get(tenant.as_str()).copied().unwrap_or(0) != *count {
+                return Err(format!("{label} cancellation tenant count is inconsistent"));
+            }
+        }
+        if counts.len() != self.tenant_counts.len() {
+            return Err(format!("{label} cancellation tenant index is incomplete"));
+        }
+        Ok(())
+    }
 }
 
 struct RateLimitCheckInput {
@@ -1706,7 +2147,15 @@ impl StateMachine {
 
     /// Serialize the complete applied state for Raft log compaction.
     pub fn snapshot(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(&*self.store.lock().unwrap())
+        let store = self.store.lock().unwrap();
+        let payload = serde_json::to_vec(&*store)?;
+        if store.command_protocol < CURRENT_COMMAND_PROTOCOL {
+            return Ok(payload);
+        }
+        let mut stamped = Vec::with_capacity(CURRENT_PROTOCOL_SNAPSHOT_MAGIC.len() + payload.len());
+        stamped.extend_from_slice(CURRENT_PROTOCOL_SNAPSHOT_MAGIC);
+        stamped.extend_from_slice(&payload);
+        Ok(stamped)
     }
 
     /// Restore an atomically persisted state-machine snapshot.
@@ -1716,12 +2165,27 @@ impl StateMachine {
     /// regress the fencing counter, or carries an inconsistent lock table, is
     /// rejected here instead of silently serving wrong authority.
     pub fn restore(&self, bytes: &[u8]) -> Result<(), serde_json::Error> {
-        let restored: Store = serde_json::from_slice(bytes)?;
+        let (stamped, payload) =
+            if let Some(payload) = bytes.strip_prefix(CURRENT_PROTOCOL_SNAPSHOT_MAGIC) {
+                (true, payload)
+            } else {
+                (false, bytes)
+            };
+        let restored: Store = serde_json::from_slice(payload)?;
+        if stamped != (restored.command_protocol >= CURRENT_COMMAND_PROTOCOL) {
+            return Err(<serde_json::Error as serde::de::Error>::custom(
+                "state-machine command protocol and snapshot compatibility stamp disagree",
+            ));
+        }
         restored
             .validate_restored()
             .map_err(<serde_json::Error as serde::de::Error>::custom)?;
         *self.store.lock().unwrap() = restored;
         Ok(())
+    }
+
+    pub fn command_protocol(&self) -> u16 {
+        self.store.lock().unwrap().command_protocol
     }
 
     #[allow(dead_code)]
@@ -1735,11 +2199,42 @@ impl StateMachine {
     pub fn apply_at(&self, command: Command, proposed_at_ms: u64) -> ApplyResult {
         let mut store = self.store.lock().unwrap();
         let now = proposed_at_ms;
-        store.expire_due(now);
-        store.revision += 1;
+        let protocol_activation = matches!(command, Command::ActivateCommandProtocol { .. });
+        // Recovery defense: builds that predate the explicit activation barrier
+        // may already have committed one of these variants. That log is already
+        // unreadable by V1, so stamp the materialized state V2 as well; otherwise
+        // compaction could accidentally turn an incompatible log into a raw JSON
+        // snapshot an older binary would accept.
+        if command.requires_current_protocol() {
+            store.command_protocol = CURRENT_COMMAND_PROTOCOL;
+        }
+        if !protocol_activation {
+            store.expire_due(now);
+            store.revision += 1;
+        }
         let revision = store.revision;
 
         let output = match command {
+            Command::ActivateCommandProtocol { version } => {
+                if version == CURRENT_COMMAND_PROTOCOL
+                    && store.command_protocol <= CURRENT_COMMAND_PROTOCOL
+                {
+                    store.command_protocol = version;
+                    json!({
+                        "activated": true,
+                        "command_protocol": store.command_protocol,
+                        "revision": revision,
+                    })
+                } else {
+                    json!({
+                        "activated": false,
+                        "reason": "unsupported_command_protocol",
+                        "requested": version,
+                        "command_protocol": store.command_protocol,
+                        "revision": revision,
+                    })
+                }
+            }
             Command::KvPut {
                 key,
                 value,
@@ -1903,17 +2398,84 @@ impl StateMachine {
                 holder,
                 ttl_ms,
                 wait,
-            } => store.apply_lock_acquire(revision, now, keys, holder, ttl_ms, wait),
+                wait_timeout_ms,
+            } => store.apply_lock_acquire(
+                revision,
+                now,
+                LockAcquireInput {
+                    keys,
+                    holder,
+                    ttl_ms,
+                    wait,
+                    wait_timeout_ms,
+                    request_id: None,
+                    legacy_semantics: true,
+                },
+            ),
+            Command::LockAcquireV2 {
+                keys,
+                holder,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            } => store.apply_lock_acquire(
+                revision,
+                now,
+                LockAcquireInput {
+                    keys,
+                    holder,
+                    ttl_ms,
+                    wait,
+                    wait_timeout_ms,
+                    request_id: None,
+                    legacy_semantics: false,
+                },
+            ),
+            Command::LockAcquireAttempt {
+                keys,
+                holder,
+                request_id,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            } => store.apply_lock_acquire(
+                revision,
+                now,
+                LockAcquireInput {
+                    keys,
+                    holder,
+                    ttl_ms,
+                    wait,
+                    wait_timeout_ms,
+                    request_id: Some(request_id),
+                    legacy_semantics: false,
+                },
+            ),
+            Command::LockRenew {
+                keys,
+                holder,
+                fencing_token,
+                ttl_ms,
+            } => store.apply_lock_renew(revision, now, keys, holder, fencing_token, ttl_ms),
             Command::LockRelease {
                 holder,
                 fencing_token,
             } => store.apply_lock_release(revision, now, holder, fencing_token),
+            Command::LockCancel { keys, holder } => {
+                store.apply_lock_cancel(revision, now, keys, holder, None)
+            }
+            Command::LockCancelAttempt {
+                keys,
+                holder,
+                request_id,
+            } => store.apply_lock_cancel(revision, now, keys, holder, Some(request_id)),
             Command::SemaphoreAcquire {
                 key,
                 holder,
                 limit,
                 ttl_ms,
                 wait,
+                wait_timeout_ms,
             } => store.apply_semaphore_acquire(
                 revision,
                 now,
@@ -1923,13 +2485,73 @@ impl StateMachine {
                     limit,
                     ttl_ms,
                     wait,
+                    wait_timeout_ms,
+                    request_id: None,
+                    legacy_semantics: true,
                 },
             ),
+            Command::SemaphoreAcquireV2 {
+                key,
+                holder,
+                limit,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            } => store.apply_semaphore_acquire(
+                revision,
+                now,
+                SemaphoreAcquireInput {
+                    key,
+                    holder,
+                    limit,
+                    ttl_ms,
+                    wait,
+                    wait_timeout_ms,
+                    request_id: None,
+                    legacy_semantics: false,
+                },
+            ),
+            Command::SemaphoreAcquireAttempt {
+                key,
+                holder,
+                request_id,
+                limit,
+                ttl_ms,
+                wait,
+                wait_timeout_ms,
+            } => store.apply_semaphore_acquire(
+                revision,
+                now,
+                SemaphoreAcquireInput {
+                    key,
+                    holder,
+                    limit,
+                    ttl_ms,
+                    wait,
+                    wait_timeout_ms,
+                    request_id: Some(request_id),
+                    legacy_semantics: false,
+                },
+            ),
+            Command::SemaphoreRenew {
+                key,
+                holder,
+                fencing_token,
+                ttl_ms,
+            } => store.apply_semaphore_renew(revision, now, key, holder, fencing_token, ttl_ms),
             Command::SemaphoreRelease {
                 key,
                 holder,
                 fencing_token,
             } => store.apply_semaphore_release(revision, now, key, holder, fencing_token),
+            Command::SemaphoreCancel { key, holder } => {
+                store.apply_semaphore_cancel(revision, now, key, holder, None)
+            }
+            Command::SemaphoreCancelAttempt {
+                key,
+                holder,
+                request_id,
+            } => store.apply_semaphore_cancel(revision, now, key, holder, Some(request_id)),
             Command::RateLimitCheck {
                 key,
                 tenant,
@@ -2371,6 +2993,15 @@ impl Store {
     /// lock). Callers surface the error (InstallSnapshot rejects; boot fail-stops)
     /// rather than serving from silently-wrong state.
     fn validate_restored(&self) -> Result<(), String> {
+        if !matches!(
+            self.command_protocol,
+            LEGACY_COMMAND_PROTOCOL | CURRENT_COMMAND_PROTOCOL
+        ) {
+            return Err(format!(
+                "unsupported state-machine command protocol {}",
+                self.command_protocol
+            ));
+        }
         let floor = self.max_referenced_fencing_token();
         if self.next_fencing_token < floor {
             return Err(format!(
@@ -2401,6 +3032,8 @@ impl Store {
                 }
             }
         }
+        self.lock_cancellations.validate("lock")?;
+        self.semaphore_cancellations.validate("semaphore")?;
         Ok(())
     }
 
@@ -2411,8 +3044,26 @@ impl Store {
                 .map(|expires| expires > now)
                 .unwrap_or(true)
         });
+        self.lock_cancellations.expire(now);
+        self.semaphore_cancellations.expire(now);
+        // Queue deadlines are checked before any promotion. Otherwise a waiter
+        // whose patience lease elapsed could be granted authority by this very
+        // sweep. Legacy snapshot entries have no deadline and retain their old
+        // indefinite-wait behavior.
+        let expired_waiters: Vec<(String, Vec<String>)> = self
+            .locks
+            .queue
+            .iter()
+            .filter(|(_, waiter)| !waiter_is_live(waiter.wait_expires_ms, now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired_waiters {
+            self.locks.queue.remove(&id);
+        }
+
         // Expire any union-lock grants whose lease lapsed, freeing their member
-        // keys, then promote whatever the freed keys now unblock.
+        // keys, then promote whatever the freed keys or expired reservations now
+        // unblock.
         let expired: Vec<u64> = self
             .locks
             .grants
@@ -2420,19 +3071,24 @@ impl Store {
             .filter(|(_, g)| g.lease_expires_ms <= now)
             .map(|(token, _)| *token)
             .collect();
-        if !expired.is_empty() {
-            for token in expired {
-                self.release_grant(token);
-            }
-            self.lock_promote(now);
+        for token in expired {
+            self.release_grant(token);
         }
-        // Expire semaphore permits, then admit whoever was waiting.
+        self.lock_promote(now);
+
+        // Expire semaphore waiters before permits, then admit only live FIFO
+        // successors. Collecting ids first keeps keyed removals O(1) each.
         for sem in self.semaphores.values_mut() {
-            let before = sem.holders.len();
-            sem.holders.retain(|slot| slot.lease_expires_ms > now);
-            if sem.holders.len() != before {
-                // A slot freed up; admit FIFO waiters up to the limit below.
+            let expired_waiters: Vec<String> = sem
+                .queue
+                .iter()
+                .filter(|(_, waiter)| !waiter_is_live(waiter.wait_expires_ms, now))
+                .map(|(holder, _)| holder.clone())
+                .collect();
+            for holder in expired_waiters {
+                sem.queue.remove(&holder);
             }
+            sem.holders.retain(|slot| slot.lease_expires_ms > now);
         }
         self.semaphores_promote(now);
         self.elections
@@ -3181,32 +3837,55 @@ impl Store {
     }
 
     /// Acquire the **union** of `keys` (multi-key lock), all-or-nothing.
-    fn apply_lock_acquire(
-        &mut self,
-        revision: u64,
-        now: u64,
-        keys: Vec<String>,
-        holder: String,
-        ttl_ms: u64,
-        wait: bool,
-    ) -> Value {
+    fn apply_lock_acquire(&mut self, revision: u64, now: u64, input: LockAcquireInput) -> Value {
+        let LockAcquireInput {
+            keys,
+            holder,
+            ttl_ms,
+            wait,
+            wait_timeout_ms,
+            request_id,
+            legacy_semantics,
+        } = input;
         let keys = canonical_keys(&keys);
         if keys.is_empty() {
             return json!({ "acquired": false, "reason": "no_keys", "revision": revision });
         }
 
-        // Idempotent re-acquire also acts as lease renewal: the exact holder and
-        // key set keep their fencing token while extending the expiry from the
-        // replicated command timestamp. A lost-response retry therefore cannot
-        // mint a second grant, and long-running guarded work can renew safely.
+        if request_id.as_ref().is_some_and(|request_id| {
+            self.lock_cancellations
+                .contains(&acquisition_identity("lock", &holder, &keys, request_id))
+        }) {
+            return json!({
+                "acquired": false,
+                "queued": false,
+                "position": null,
+                "wait_expires_ms": null,
+                "keys": keys,
+                "holder": holder,
+                "conflicts": [],
+                "revision": revision,
+            });
+        }
+
+        // Historical log entries used an exact-holder re-acquire as renewal, so
+        // preserve that behavior only while replaying the legacy command. New
+        // command variants discover the original token without extending it;
+        // only the token-bound renew command may extend new authority.
         if let Some(&tok) = self.locks.held.get(&keys[0]) {
             if let Some(grant) = self.locks.grants.get_mut(&tok) {
-                if grant.holder == holder && grant.keys == keys {
-                    grant.lease_expires_ms = grant.lease_expires_ms.max(now.saturating_add(ttl_ms));
+                if grant.holder == holder
+                    && grant.keys == keys
+                    && (legacy_semantics || grant.request_id == request_id)
+                {
+                    if legacy_semantics {
+                        grant.lease_expires_ms =
+                            grant.lease_expires_ms.max(now.saturating_add(ttl_ms));
+                    }
                     return json!({
                         "acquired": true,
                         "queued": false,
-                        "renewed": true,
+                        "renewed": legacy_semantics,
                         "keys": keys,
                         "holder": holder,
                         "fencing_token": tok,
@@ -3236,6 +3915,7 @@ impl Store {
                 keys: keys.clone(),
                 fencing_token: token,
                 lease_expires_ms,
+                request_id,
             });
             return json!({
                 "acquired": true,
@@ -3251,8 +3931,13 @@ impl Store {
         // Not grantable. Queue it (idempotently) when the caller wants to wait.
         // Identity is (holder, key-set), so the dedup and place-in-line are O(1).
         let id = (holder.clone(), keys.clone());
-        let already = self.locks.queue.contains(&id);
-        if wait && !already {
+        let already = self
+            .locks
+            .queue
+            .get(&id)
+            .is_some_and(|queued| queued.request_id == request_id);
+        let identity_in_use = self.locks.queue.contains(&id) && !already;
+        if wait && !already && !identity_in_use {
             self.locks.queue.push_back(
                 id.clone(),
                 QueuedLock {
@@ -3260,10 +3945,26 @@ impl Store {
                     keys: keys.clone(),
                     ttl_ms,
                     requested_ms: now,
+                    wait_expires_ms: (!legacy_semantics).then(|| {
+                        now.saturating_add(
+                            wait_timeout_ms.unwrap_or(crate::validate::DEFAULT_WAIT_TIMEOUT_MS),
+                        )
+                    }),
+                    request_id,
                 },
             );
         }
-        let position = self.locks.queue.position(&id).map(|idx| idx + 1);
+        let position = (!identity_in_use)
+            .then(|| self.locks.queue.position(&id).map(|idx| idx + 1))
+            .flatten();
+        let wait_expires_ms = (!identity_in_use)
+            .then(|| {
+                self.locks
+                    .queue
+                    .get(&id)
+                    .and_then(|waiter| waiter.wait_expires_ms)
+            })
+            .flatten();
         let conflicts: Vec<String> = keys
             .iter()
             .filter(|k| self.locks.held.contains_key(*k))
@@ -3271,11 +3972,46 @@ impl Store {
             .collect();
         json!({
             "acquired": false,
-            "queued": wait && position.is_some(),
+            // If this identity was already queued, a retry with `wait:false`
+            // reports the durable truth without deleting, duplicating, or
+            // extending its original queue entry.
+            "queued": if legacy_semantics { wait && position.is_some() } else { position.is_some() },
             "position": position,
+            "wait_expires_ms": wait_expires_ms,
             "keys": keys,
             "holder": holder,
             "conflicts": conflicts,
+            "revision": revision,
+        })
+    }
+
+    /// Renew an active union grant only when all authority-bearing fields match.
+    fn apply_lock_renew(
+        &mut self,
+        revision: u64,
+        now: u64,
+        keys: Vec<String>,
+        holder: String,
+        fencing_token: u64,
+        ttl_ms: u64,
+    ) -> Value {
+        let keys = canonical_keys(&keys);
+        let Some(grant) = self.locks.grants.get_mut(&fencing_token) else {
+            return json!({ "renewed": false, "reason": "not_found", "revision": revision });
+        };
+        if grant.holder != holder {
+            return json!({ "renewed": false, "reason": "not_holder", "revision": revision });
+        }
+        if grant.keys != keys {
+            return json!({ "renewed": false, "reason": "key_mismatch", "revision": revision });
+        }
+        grant.lease_expires_ms = grant.lease_expires_ms.max(now.saturating_add(ttl_ms));
+        json!({
+            "renewed": true,
+            "keys": keys,
+            "holder": holder,
+            "fencing_token": fencing_token,
+            "lease_expires_ms": grant.lease_expires_ms,
             "revision": revision,
         })
     }
@@ -3301,6 +4037,116 @@ impl Store {
         json!({
             "released": true,
             "keys": keys,
+            "promoted": promoted,
+            "revision": revision,
+        })
+    }
+
+    /// Idempotently cancel one exact queued union-lock identity. Removing an
+    /// earlier reservation may make later disjoint/overlapping entries
+    /// grantable, so promotion is part of this same committed command.
+    fn apply_lock_cancel(
+        &mut self,
+        revision: u64,
+        now: u64,
+        keys: Vec<String>,
+        holder: String,
+        request_id: Option<String>,
+    ) -> Value {
+        let keys = canonical_keys(&keys);
+        let id = (holder.clone(), keys.clone());
+        if let Some(request_id) = &request_id {
+            // The command-level expiry sweep runs before this method and may
+            // have promoted this exact attempt. Returning its fencing authority
+            // is more important than allocating a cancellation tombstone: an
+            // aborting client must be able to release a raced grant even when
+            // the bounded tombstone ledger is full.
+            if let Some(grant) = self.locks.grants.values().find(|grant| {
+                grant.holder == holder
+                    && grant.keys == keys
+                    && grant.request_id.as_ref() == Some(request_id)
+            }) {
+                return json!({
+                    "cancelled": false,
+                    "acquired": true,
+                    "keys": keys,
+                    "holder": holder,
+                    "fencing_token": grant.fencing_token,
+                    "lease_expires_ms": grant.lease_expires_ms,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+            let identity = acquisition_identity("lock", &holder, &keys, request_id);
+            if self
+                .lock_cancellations
+                .remember(identity, cancellation_tenant(&holder), now)
+                == RememberCancellation::CapacityExceeded
+            {
+                return json!({
+                    "cancelled": false,
+                    "acquired": false,
+                    "reason": "cancellation_capacity",
+                    "keys": keys,
+                    "holder": holder,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+        }
+        let queued_matches = self
+            .locks
+            .queue
+            .get(&id)
+            .is_some_and(|queued| request_id.is_none() || queued.request_id == request_id);
+        let cancelled = queued_matches && self.locks.queue.remove(&id).is_some();
+        if !cancelled {
+            // Cancellation can race the release/expiry that promoted this exact
+            // waiter. Report the acquired authority so an aborting client can
+            // immediately release it; cancellation itself must never release a
+            // live grant behind the holder's back.
+            if let Some(grant) = self.locks.grants.values().find(|grant| {
+                grant.holder == holder
+                    && grant.keys == keys
+                    && (request_id.is_none() || grant.request_id == request_id)
+            }) {
+                return json!({
+                    "cancelled": false,
+                    "acquired": true,
+                    "keys": keys,
+                    "holder": holder,
+                    "fencing_token": grant.fencing_token,
+                    "lease_expires_ms": grant.lease_expires_ms,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+            if request_id.is_some() {
+                return json!({
+                    "cancelled": true,
+                    "acquired": false,
+                    "keys": keys,
+                    "holder": holder,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+            return json!({
+                "cancelled": false,
+                "acquired": false,
+                "reason": "not_found",
+                "keys": keys,
+                "holder": holder,
+                "promoted": [],
+                "revision": revision,
+            });
+        }
+        let promoted = self.lock_promote(now);
+        json!({
+            "cancelled": true,
+            "acquired": false,
+            "keys": keys,
+            "holder": holder,
             "promoted": promoted,
             "revision": revision,
         })
@@ -3364,6 +4210,7 @@ impl Store {
                 keys: waiter.keys,
                 fencing_token: token,
                 lease_expires_ms,
+                request_id: waiter.request_id,
             });
         }
         promoted
@@ -3383,30 +4230,82 @@ impl Store {
             limit,
             ttl_ms,
             wait,
+            wait_timeout_ms,
+            request_id,
+            legacy_semantics,
         } = input;
+        if request_id.as_ref().is_some_and(|request_id| {
+            self.semaphore_cancellations.contains(&acquisition_identity(
+                "semaphore",
+                &holder,
+                std::slice::from_ref(&key),
+                request_id,
+            ))
+        }) {
+            return json!({
+                "acquired": false,
+                "queued": false,
+                "position": null,
+                "wait_expires_ms": null,
+                "key": key,
+                "holder": holder,
+                "limit": limit,
+                "available": 0,
+                "revision": revision,
+            });
+        }
+        if !legacy_semantics {
+            if let Some(existing) = self.semaphores.get(&key) {
+                // Capacity is part of the semaphore's identity. Letting any
+                // acquire silently raise it would break callers relying on the
+                // original exclusion bound; changing it requires a future
+                // fenced/admin API.
+                if existing.limit != limit {
+                    return json!({
+                        "acquired": false,
+                        "queued": false,
+                        "reason": "limit_mismatch",
+                        "key": key,
+                        "holder": holder,
+                        "requested_limit": limit,
+                        "limit": existing.limit,
+                        "revision": revision,
+                    });
+                }
+            }
+        }
         let sem = self
             .semaphores
             .entry(key.clone())
             .or_insert_with(|| Semaphore {
-                limit: limit.max(1),
+                limit: if legacy_semantics {
+                    limit.max(1)
+                } else {
+                    limit
+                },
                 holders: Vec::new(),
                 queue: IndexedQueue::new(),
             });
-        // Let callers re-tune the cap; shrinking just stops new grants until it
-        // drains back under the new limit.
-        sem.limit = limit.max(1);
+        if legacy_semantics {
+            // Preserve the exact behavior of historical log entries. Newly
+            // accepted HTTP requests use the versioned immutable-limit command.
+            sem.limit = limit.max(1);
+        }
 
-        // Idempotent re-acquire: holder is the permit identity (the queue already
-        // dedups on it), so if this holder already holds a permit, return that one
-        // rather than consuming a second. A lost-response retry must not leak a
-        // permit / double-count the holder.
-        if let Some(slot) = sem.holders.iter().find(|s| s.holder == holder) {
+        // Idempotent re-acquire returns the existing permit rather than consuming
+        // a second one, but does not extend it. Holder is a queue identity, not
+        // fenced renewal authority; use SemaphoreRenew with the token to extend.
+        if let Some(index) = sem.holders.iter().position(|slot| {
+            slot.holder == holder && (legacy_semantics || slot.request_id == request_id)
+        }) {
+            let slot = &sem.holders[index];
             let token = slot.fencing_token;
             let lease_expires_ms = slot.lease_expires_ms;
             let available = sem.limit.saturating_sub(sem.holders.len() as u32);
             return json!({
                 "acquired": true,
                 "queued": false,
+                "renewed": false,
                 "key": key,
                 "holder": holder,
                 "fencing_token": token,
@@ -3427,6 +4326,7 @@ impl Store {
                 holder: holder.clone(),
                 fencing_token: token,
                 lease_expires_ms,
+                request_id,
             });
             let available = sem.limit.saturating_sub(sem.holders.len() as u32);
             return json!({
@@ -3442,26 +4342,79 @@ impl Store {
             });
         }
 
-        let already = sem.queue.contains(&holder);
-        if wait && !already {
+        let already = sem
+            .queue
+            .get(&holder)
+            .is_some_and(|queued| queued.request_id == request_id);
+        let identity_in_use = sem.queue.contains(&holder) && !already;
+        if wait && !already && !identity_in_use {
             sem.queue.push_back(
                 holder.clone(),
                 QueuedPermit {
                     holder: holder.clone(),
                     ttl_ms,
                     requested_ms: now,
+                    wait_expires_ms: (!legacy_semantics).then(|| {
+                        now.saturating_add(
+                            wait_timeout_ms.unwrap_or(crate::validate::DEFAULT_WAIT_TIMEOUT_MS),
+                        )
+                    }),
+                    request_id,
                 },
             );
         }
-        let position = sem.queue.position(&holder).map(|idx| idx + 1);
+        let position = (!identity_in_use)
+            .then(|| sem.queue.position(&holder).map(|idx| idx + 1))
+            .flatten();
+        let wait_expires_ms = (!identity_in_use)
+            .then(|| {
+                sem.queue
+                    .get(&holder)
+                    .and_then(|waiter| waiter.wait_expires_ms)
+            })
+            .flatten();
         json!({
             "acquired": false,
-            "queued": wait && position.is_some(),
+            "queued": if legacy_semantics { wait && position.is_some() } else { position.is_some() },
             "position": position,
+            "wait_expires_ms": wait_expires_ms,
             "key": key,
             "holder": holder,
             "limit": sem.limit,
             "available": 0,
+            "revision": revision,
+        })
+    }
+
+    fn apply_semaphore_renew(
+        &mut self,
+        revision: u64,
+        now: u64,
+        key: String,
+        holder: String,
+        fencing_token: u64,
+        ttl_ms: u64,
+    ) -> Value {
+        let Some(sem) = self.semaphores.get_mut(&key) else {
+            return json!({ "renewed": false, "reason": "not_found", "revision": revision });
+        };
+        let Some(slot) = sem
+            .holders
+            .iter_mut()
+            .find(|slot| slot.fencing_token == fencing_token)
+        else {
+            return json!({ "renewed": false, "reason": "not_found", "revision": revision });
+        };
+        if slot.holder != holder {
+            return json!({ "renewed": false, "reason": "not_holder", "revision": revision });
+        }
+        slot.lease_expires_ms = slot.lease_expires_ms.max(now.saturating_add(ttl_ms));
+        json!({
+            "renewed": true,
+            "key": key,
+            "holder": holder,
+            "fencing_token": fencing_token,
+            "lease_expires_ms": slot.lease_expires_ms,
             "revision": revision,
         })
     }
@@ -3492,6 +4445,108 @@ impl Store {
         })
     }
 
+    fn apply_semaphore_cancel(
+        &mut self,
+        revision: u64,
+        now: u64,
+        key: String,
+        holder: String,
+        request_id: Option<String>,
+    ) -> Value {
+        if let Some(request_id) = &request_id {
+            if let Some(slot) = self.semaphores.get(&key).and_then(|sem| {
+                sem.holders.iter().find(|slot| {
+                    slot.holder == holder && slot.request_id.as_ref() == Some(request_id)
+                })
+            }) {
+                return json!({
+                    "cancelled": false,
+                    "acquired": true,
+                    "key": key,
+                    "holder": holder,
+                    "fencing_token": slot.fencing_token,
+                    "lease_expires_ms": slot.lease_expires_ms,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+            let identity =
+                acquisition_identity("semaphore", &holder, std::slice::from_ref(&key), request_id);
+            if self
+                .semaphore_cancellations
+                .remember(identity, cancellation_tenant(&holder), now)
+                == RememberCancellation::CapacityExceeded
+            {
+                return json!({
+                    "cancelled": false,
+                    "acquired": false,
+                    "reason": "cancellation_capacity",
+                    "key": key,
+                    "holder": holder,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+        }
+        let queued_matches = self
+            .semaphores
+            .get(&key)
+            .and_then(|sem| sem.queue.get(&holder))
+            .is_some_and(|queued| request_id.is_none() || queued.request_id == request_id);
+        let cancelled = queued_matches
+            && self
+                .semaphores
+                .get_mut(&key)
+                .and_then(|sem| sem.queue.remove(&holder))
+                .is_some();
+        if !cancelled {
+            if let Some(slot) = self.semaphores.get(&key).and_then(|sem| {
+                sem.holders.iter().find(|slot| {
+                    slot.holder == holder && (request_id.is_none() || slot.request_id == request_id)
+                })
+            }) {
+                return json!({
+                    "cancelled": false,
+                    "acquired": true,
+                    "key": key,
+                    "holder": holder,
+                    "fencing_token": slot.fencing_token,
+                    "lease_expires_ms": slot.lease_expires_ms,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+            if request_id.is_some() {
+                return json!({
+                    "cancelled": true,
+                    "acquired": false,
+                    "key": key,
+                    "holder": holder,
+                    "promoted": [],
+                    "revision": revision,
+                });
+            }
+            return json!({
+                "cancelled": false,
+                "acquired": false,
+                "reason": "not_found",
+                "key": key,
+                "holder": holder,
+                "promoted": [],
+                "revision": revision,
+            });
+        }
+        let promoted = self.semaphore_promote(&key, now);
+        json!({
+            "cancelled": true,
+            "acquired": false,
+            "key": key,
+            "holder": holder,
+            "promoted": promoted,
+            "revision": revision,
+        })
+    }
+
     /// Admit FIFO waiters of one semaphore up to its limit.
     fn semaphore_promote(&mut self, key: &str, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
@@ -3507,6 +4562,7 @@ impl Store {
                 holder: waiter.holder.clone(),
                 fencing_token: token,
                 lease_expires_ms,
+                request_id: waiter.request_id,
             });
             promoted.push(json!({
                 "holder": waiter.holder,
@@ -4039,11 +5095,14 @@ impl Store {
             .locks
             .queue
             .iter()
-            .filter(|(_, q)| q.keys.iter().any(|k| k == key))
+            .filter(|(_, q)| {
+                waiter_is_live(q.wait_expires_ms, now) && q.keys.iter().any(|k| k == key)
+            })
             .map(|(_, q)| LockWaiter {
                 holder: q.holder.clone(),
                 keys: q.keys.clone(),
                 requested_ms: q.requested_ms,
+                wait_expires_ms: q.wait_expires_ms,
             })
             .collect();
         LockState {
@@ -4091,10 +5150,12 @@ impl Store {
             wait_queue: sem
                 .queue
                 .iter()
+                .filter(|(_, q)| waiter_is_live(q.wait_expires_ms, now))
                 .map(|(_, q)| LockWaiter {
                     holder: q.holder.clone(),
                     keys: vec![key.to_string()],
                     requested_ms: q.requested_ms,
+                    wait_expires_ms: q.wait_expires_ms,
                 })
                 .collect(),
         }
@@ -4118,10 +5179,12 @@ impl Store {
             .locks
             .queue
             .iter()
+            .filter(|(_, queued)| waiter_is_live(queued.wait_expires_ms, now))
             .map(|(_, queued)| LockWaiter {
                 holder: queued.holder.clone(),
                 keys: queued.keys.clone(),
                 requested_ms: queued.requested_ms,
+                wait_expires_ms: queued.wait_expires_ms,
             })
             .collect();
         LockInventory { held, wait_queue }
@@ -4180,6 +5243,12 @@ fn canonical_keys(keys: &[String]) -> Vec<String> {
     out
 }
 
+/// Historical snapshots did not carry queue deadlines. Preserve those entries
+/// on restore (`None`), while every newly queued request has a bounded deadline.
+fn waiter_is_live(wait_expires_ms: Option<u64>, now: u64) -> bool {
+    wait_expires_ms.map(|expires| expires > now).unwrap_or(true)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4217,12 +5286,22 @@ fn trim_history(record: &mut ScheduleRecord) {
 mod tests {
     use super::*;
 
+    fn fill_tenant_cancellation_capacity(ledger: &mut CancellationLedger, tenant: &str, now: u64) {
+        for index in 0..MAX_CANCELLATION_TOMBSTONES_PER_TENANT {
+            assert_eq!(
+                ledger.remember(format!("{index:064x}"), tenant.to_string(), now),
+                RememberCancellation::Remembered
+            );
+        }
+    }
+
     fn acquire(sm: &StateMachine, keys: &[&str], holder: &str, wait: bool) -> Value {
-        sm.apply(Command::LockAcquire {
+        sm.apply(Command::LockAcquireV2 {
             keys: keys.iter().map(|s| s.to_string()).collect(),
             holder: holder.to_string(),
             ttl_ms: 30_000,
             wait,
+            wait_timeout_ms: None,
         })
         .output
     }
@@ -4234,12 +5313,13 @@ mod tests {
         limit: u32,
         wait: bool,
     ) -> Value {
-        sm.apply(Command::SemaphoreAcquire {
+        sm.apply(Command::SemaphoreAcquireV2 {
             key: key.to_string(),
             holder: holder.to_string(),
             limit,
             ttl_ms: 30_000,
             wait,
+            wait_timeout_ms: None,
         })
         .output
     }
@@ -4272,6 +5352,22 @@ mod tests {
             retry["fencing_token"], token1,
             "retry should return the original fencing token"
         );
+        assert_eq!(retry["renewed"], false);
+    }
+
+    #[test]
+    fn semaphore_acquire_cannot_silently_change_the_configured_limit() {
+        let sm = StateMachine::new();
+        let first = semaphore_acquire(&sm, "pool", "holder-a", 1, false);
+        assert_eq!(first["acquired"], true);
+
+        let raised = semaphore_acquire(&sm, "pool", "holder-b", 2, false);
+        assert_eq!(raised["acquired"], false);
+        assert_eq!(raised["reason"], "limit_mismatch");
+        assert_eq!(raised["limit"], 1);
+        assert_eq!(raised["requested_limit"], 2);
+        assert_eq!(sm.semaphore_get("pool").holders.len(), 1);
+        assert_eq!(sm.semaphore_get("pool").limit, 1);
     }
 
     #[test]
@@ -4291,26 +5387,28 @@ mod tests {
             retry["fencing_token"], token1,
             "retry should return the original fencing token"
         );
+        assert_eq!(retry["renewed"], false);
     }
 
     #[test]
-    fn lock_reacquire_renews_expiry_without_changing_fencing_token() {
+    fn lock_reacquire_does_not_renew_without_the_fencing_token() {
         let sm = StateMachine::new();
-        let command = || Command::LockAcquire {
+        let command = || Command::LockAcquireV2 {
             keys: vec!["customers/acme".to_string()],
             holder: "billing-request-7".to_string(),
             ttl_ms: 100,
             wait: false,
+            wait_timeout_ms: None,
         };
         let first = sm.apply_at(command(), 1_000).output;
         assert_eq!(first["lease_expires_ms"], 1_100);
         let token = first["fencing_token"].clone();
 
-        let renewed = sm.apply_at(command(), 1_050).output;
-        assert_eq!(renewed["acquired"], true);
-        assert_eq!(renewed["renewed"], true);
-        assert_eq!(renewed["fencing_token"], token);
-        assert_eq!(renewed["lease_expires_ms"], 1_150);
+        let retry = sm.apply_at(command(), 1_050).output;
+        assert_eq!(retry["acquired"], true);
+        assert_eq!(retry["renewed"], false);
+        assert_eq!(retry["fencing_token"], token);
+        assert_eq!(retry["lease_expires_ms"], 1_100);
         let fencing_token = token.as_u64().expect("numeric fencing token");
         assert_eq!(
             sm.store
@@ -4319,9 +5417,720 @@ mod tests {
                 .locks
                 .grants
                 .get(&fencing_token)
-                .expect("renewed grant")
+                .expect("idempotently returned grant")
                 .lease_expires_ms,
-            1_150
+            1_100
+        );
+    }
+
+    #[test]
+    fn explicit_lock_renew_is_token_holder_and_exact_key_set_bound() {
+        let sm = StateMachine::new();
+        let first = sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["b".to_string(), "a".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 100,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        let token = first.output["fencing_token"].as_u64().unwrap();
+
+        let wrong_holder = sm.apply_at(
+            Command::LockRenew {
+                keys: vec!["a".to_string(), "b".to_string()],
+                holder: "intruder".to_string(),
+                fencing_token: token,
+                ttl_ms: 500,
+            },
+            1_010,
+        );
+        assert_eq!(wrong_holder.output["renewed"], false);
+        assert_eq!(wrong_holder.output["reason"], "not_holder");
+
+        let wrong_keys = sm.apply_at(
+            Command::LockRenew {
+                keys: vec!["a".to_string()],
+                holder: "owner".to_string(),
+                fencing_token: token,
+                ttl_ms: 500,
+            },
+            1_020,
+        );
+        assert_eq!(wrong_keys.output["renewed"], false);
+        assert_eq!(wrong_keys.output["reason"], "key_mismatch");
+
+        let renewed = sm.apply_at(
+            Command::LockRenew {
+                keys: vec!["a".to_string(), "b".to_string()],
+                holder: "owner".to_string(),
+                fencing_token: token,
+                ttl_ms: 500,
+            },
+            1_050,
+        );
+        assert_eq!(renewed.output["renewed"], true);
+        assert_eq!(renewed.output["fencing_token"], token);
+        assert_eq!(renewed.output["lease_expires_ms"], 1_550);
+    }
+
+    #[test]
+    fn semaphore_reacquire_requires_explicit_token_bound_renewal_to_extend() {
+        let sm = StateMachine::new();
+        let first = sm.apply_at(
+            Command::SemaphoreAcquireV2 {
+                key: "pool".to_string(),
+                holder: "worker".to_string(),
+                limit: 1,
+                ttl_ms: 100,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        let token = first.output["fencing_token"].as_u64().unwrap();
+
+        let retry = sm.apply_at(
+            Command::SemaphoreAcquireV2 {
+                key: "pool".to_string(),
+                holder: "worker".to_string(),
+                limit: 1,
+                ttl_ms: 200,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_050,
+        );
+        assert_eq!(retry.output["renewed"], false);
+        assert_eq!(retry.output["fencing_token"], token);
+        assert_eq!(retry.output["lease_expires_ms"], 1_100);
+
+        let wrong_holder = sm.apply_at(
+            Command::SemaphoreRenew {
+                key: "pool".to_string(),
+                holder: "intruder".to_string(),
+                fencing_token: token,
+                ttl_ms: 500,
+            },
+            1_060,
+        );
+        assert_eq!(wrong_holder.output["renewed"], false);
+        assert_eq!(wrong_holder.output["reason"], "not_holder");
+
+        let renewed = sm.apply_at(
+            Command::SemaphoreRenew {
+                key: "pool".to_string(),
+                holder: "worker".to_string(),
+                fencing_token: token,
+                ttl_ms: 500,
+            },
+            1_090,
+        );
+        assert_eq!(renewed.output["renewed"], true);
+        assert_eq!(renewed.output["fencing_token"], token);
+        assert_eq!(renewed.output["lease_expires_ms"], 1_590);
+    }
+
+    #[test]
+    fn queued_lock_retry_does_not_duplicate_or_extend_its_deadline() {
+        let sm = StateMachine::new();
+        let held = sm.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["resource".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 10_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        let token = held.output["fencing_token"].as_u64().unwrap();
+        let queued = sm.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["resource".to_string()],
+                holder: "waiter".to_string(),
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(100),
+            },
+            1_001,
+        );
+        assert_eq!(queued.output["wait_expires_ms"], 1_101);
+
+        let retry = sm.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["resource".to_string()],
+                holder: "waiter".to_string(),
+                ttl_ms: 9_000,
+                wait: true,
+                wait_timeout_ms: Some(9_000),
+            },
+            1_050,
+        );
+        assert_eq!(retry.output["queued"], true);
+        assert_eq!(retry.output["position"], 1);
+        assert_eq!(retry.output["wait_expires_ms"], 1_101);
+        assert_eq!(sm.store.lock().unwrap().locks.queue.len(), 1);
+
+        // The sweep runs before release/promotion, so the timed-out waiter can
+        // never receive a grant in the same committed command.
+        let released = sm.apply_at(
+            Command::LockRelease {
+                holder: "owner".to_string(),
+                fencing_token: token,
+            },
+            1_101,
+        );
+        assert_eq!(released.output["promoted"], json!([]));
+        assert!(sm.store.lock().unwrap().locks.queue.is_empty());
+    }
+
+    #[test]
+    fn queued_semaphore_retry_does_not_duplicate_or_extend_its_deadline() {
+        let sm = StateMachine::new();
+        let held = sm.apply_at(
+            Command::SemaphoreAcquireV2 {
+                key: "pool".to_string(),
+                holder: "owner".to_string(),
+                limit: 1,
+                ttl_ms: 10_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            2_000,
+        );
+        let token = held.output["fencing_token"].as_u64().unwrap();
+        let queued = sm.apply_at(
+            Command::SemaphoreAcquireV2 {
+                key: "pool".to_string(),
+                holder: "waiter".to_string(),
+                limit: 1,
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(100),
+            },
+            2_001,
+        );
+        assert_eq!(queued.output["wait_expires_ms"], 2_101);
+        let retry = sm.apply_at(
+            Command::SemaphoreAcquireV2 {
+                key: "pool".to_string(),
+                holder: "waiter".to_string(),
+                limit: 1,
+                ttl_ms: 9_000,
+                wait: true,
+                wait_timeout_ms: Some(9_000),
+            },
+            2_050,
+        );
+        assert_eq!(retry.output["wait_expires_ms"], 2_101);
+        assert_eq!(sm.store.lock().unwrap().semaphores["pool"].queue.len(), 1);
+
+        let released = sm.apply_at(
+            Command::SemaphoreRelease {
+                key: "pool".to_string(),
+                holder: "owner".to_string(),
+                fencing_token: token,
+            },
+            2_101,
+        );
+        assert_eq!(released.output["promoted"], json!([]));
+        assert!(sm.store.lock().unwrap().semaphores["pool"].queue.is_empty());
+    }
+
+    #[test]
+    fn queued_lock_and_semaphore_cancellation_is_committed_and_idempotent() {
+        let sm = StateMachine::new();
+        acquire(&sm, &["lock"], "lock-owner", false);
+        acquire(&sm, &["lock"], "lock-waiter", true);
+        semaphore_acquire(&sm, "pool", "permit-owner", 1, false);
+        semaphore_acquire(&sm, "pool", "permit-waiter", 1, true);
+
+        let lock_cancel = || {
+            sm.apply(Command::LockCancel {
+                keys: vec!["lock".to_string()],
+                holder: "lock-waiter".to_string(),
+            })
+            .output
+        };
+        assert_eq!(lock_cancel()["cancelled"], true);
+        let missing_lock = lock_cancel();
+        assert_eq!(missing_lock["cancelled"], false);
+        assert_eq!(missing_lock["acquired"], false);
+        assert_eq!(missing_lock["reason"], "not_found");
+
+        let semaphore_cancel = || {
+            sm.apply(Command::SemaphoreCancel {
+                key: "pool".to_string(),
+                holder: "permit-waiter".to_string(),
+            })
+            .output
+        };
+        assert_eq!(semaphore_cancel()["cancelled"], true);
+        let missing_permit = semaphore_cancel();
+        assert_eq!(missing_permit["cancelled"], false);
+        assert_eq!(missing_permit["acquired"], false);
+        assert_eq!(missing_permit["reason"], "not_found");
+        assert!(sm.lock_get("lock").wait_queue.is_empty());
+        assert!(sm.semaphore_get("pool").wait_queue.is_empty());
+    }
+
+    #[test]
+    fn cancellation_tombstone_suppresses_a_late_ambiguous_acquire() {
+        let sm = StateMachine::new();
+        let base = 10_000;
+
+        let cancelled = sm.apply_at(
+            Command::LockCancelAttempt {
+                keys: vec!["orders/42".to_string(), "inventory/7".to_string()],
+                holder: "worker-a".to_string(),
+                request_id: "unique-attempt-a".to_string(),
+            },
+            base,
+        );
+        assert_eq!(cancelled.output["cancelled"], true);
+        let late = sm.apply_at(
+            Command::LockAcquireAttempt {
+                keys: vec!["inventory/7".to_string(), "orders/42".to_string()],
+                holder: "worker-a".to_string(),
+                request_id: "unique-attempt-a".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+                wait_timeout_ms: Some(30_000),
+            },
+            base + 1,
+        );
+        assert_eq!(late.output["acquired"], false);
+        assert_eq!(late.output["queued"], false);
+        assert!(sm.lock_get("orders/42").holder.is_none());
+        assert!(sm.lock_get("orders/42").wait_queue.is_empty());
+
+        let cancelled = sm.apply_at(
+            Command::SemaphoreCancelAttempt {
+                key: "pool".to_string(),
+                holder: "worker-b".to_string(),
+                request_id: "unique-attempt-b".to_string(),
+            },
+            base + 2,
+        );
+        assert_eq!(cancelled.output["cancelled"], true);
+        let late = sm.apply_at(
+            Command::SemaphoreAcquireAttempt {
+                key: "pool".to_string(),
+                holder: "worker-b".to_string(),
+                request_id: "unique-attempt-b".to_string(),
+                limit: 1,
+                ttl_ms: 30_000,
+                wait: true,
+                wait_timeout_ms: Some(30_000),
+            },
+            base + 3,
+        );
+        assert_eq!(late.output["acquired"], false);
+        assert_eq!(late.output["queued"], false);
+        assert!(sm.semaphore_get("pool").holders.is_empty());
+        assert!(sm.semaphore_get("pool").wait_queue.is_empty());
+
+        let snapshot = sm.snapshot().unwrap();
+        let restored = StateMachine::new();
+        restored.restore(&snapshot).unwrap();
+        let replayed_late = restored.apply_at(
+            Command::LockAcquireAttempt {
+                keys: vec!["orders/42".to_string(), "inventory/7".to_string()],
+                holder: "worker-a".to_string(),
+                request_id: "unique-attempt-a".to_string(),
+                ttl_ms: 30_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            base + 4,
+        );
+        assert_eq!(replayed_late.output["acquired"], false);
+    }
+
+    #[test]
+    fn cancellation_is_scoped_to_one_request_id_not_the_stable_holder() {
+        let sm = StateMachine::new();
+        sm.apply_at(
+            Command::LockCancelAttempt {
+                keys: vec!["resource".to_string()],
+                holder: "\u{1}org-a\u{1}worker".to_string(),
+                request_id: "attempt-a".to_string(),
+            },
+            1_000,
+        );
+
+        let distinct = sm.apply_at(
+            Command::LockAcquireAttempt {
+                keys: vec!["resource".to_string()],
+                holder: "\u{1}org-a\u{1}worker".to_string(),
+                request_id: "attempt-b".to_string(),
+                ttl_ms: 1_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_001,
+        );
+        assert_eq!(distinct.output["acquired"], true);
+
+        let store = sm.store.lock().unwrap();
+        assert_eq!(store.lock_cancellations.entries.len(), 1);
+        assert!(store
+            .lock_cancellations
+            .entries
+            .keys()
+            .all(|digest| digest.len() == 64));
+        assert_eq!(store.lock_cancellations.tenant_counts.len(), 1);
+    }
+
+    #[test]
+    fn cancellation_capacity_never_hides_raced_lock_or_semaphore_authority() {
+        let sm = StateMachine::new();
+        let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+        let lock_holder = format!("{delimiter}org-lock{delimiter}waiter");
+        let permit_holder = format!("{delimiter}org-permit{delimiter}waiter");
+        {
+            let mut store = sm.store.lock().unwrap();
+            let lock_tenant = cancellation_tenant(&lock_holder);
+            fill_tenant_cancellation_capacity(&mut store.lock_cancellations, &lock_tenant, 0);
+            let permit_tenant = cancellation_tenant(&permit_holder);
+            fill_tenant_cancellation_capacity(
+                &mut store.semaphore_cancellations,
+                &permit_tenant,
+                0,
+            );
+        }
+
+        sm.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["capacity-lock".to_string()],
+                holder: "lock-owner".to_string(),
+                ttl_ms: 10,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        sm.apply_at(
+            Command::LockAcquireAttempt {
+                keys: vec!["capacity-lock".to_string()],
+                holder: lock_holder.clone(),
+                request_id: "raced-lock-attempt".to_string(),
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(1_000),
+            },
+            1_001,
+        );
+        let lock_cancel = sm.apply_at(
+            Command::LockCancelAttempt {
+                keys: vec!["capacity-lock".to_string()],
+                holder: lock_holder,
+                request_id: "raced-lock-attempt".to_string(),
+            },
+            1_010,
+        );
+        assert_eq!(lock_cancel.output["acquired"], true);
+        assert_eq!(lock_cancel.output["cancelled"], false);
+        assert!(lock_cancel.output["fencing_token"].as_u64().unwrap() > 1);
+        assert_ne!(
+            lock_cancel.output["reason"], "cancellation_capacity",
+            "a full safety ledger must not conceal authority the caller now owns"
+        );
+
+        sm.apply_at(
+            Command::SemaphoreAcquireV2 {
+                key: "capacity-pool".to_string(),
+                holder: "permit-owner".to_string(),
+                limit: 1,
+                ttl_ms: 10,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            2_000,
+        );
+        sm.apply_at(
+            Command::SemaphoreAcquireAttempt {
+                key: "capacity-pool".to_string(),
+                holder: permit_holder.clone(),
+                request_id: "raced-permit-attempt".to_string(),
+                limit: 1,
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(1_000),
+            },
+            2_001,
+        );
+        let permit_cancel = sm.apply_at(
+            Command::SemaphoreCancelAttempt {
+                key: "capacity-pool".to_string(),
+                holder: permit_holder,
+                request_id: "raced-permit-attempt".to_string(),
+            },
+            2_010,
+        );
+        assert_eq!(permit_cancel.output["acquired"], true);
+        assert_eq!(permit_cancel.output["cancelled"], false);
+        assert_ne!(permit_cancel.output["reason"], "cancellation_capacity");
+    }
+
+    #[test]
+    fn cancellation_capacity_is_fail_closed_and_preserves_the_waiter() {
+        let sm = StateMachine::new();
+        let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+        let holder = format!("{delimiter}org-full{delimiter}waiter");
+        {
+            let mut store = sm.store.lock().unwrap();
+            fill_tenant_cancellation_capacity(
+                &mut store.lock_cancellations,
+                &cancellation_tenant(&holder),
+                0,
+            );
+        }
+        sm.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["busy".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 5_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        sm.apply_at(
+            Command::LockAcquireAttempt {
+                keys: vec!["busy".to_string()],
+                holder: holder.clone(),
+                request_id: "still-queued".to_string(),
+                ttl_ms: 5_000,
+                wait: true,
+                wait_timeout_ms: Some(5_000),
+            },
+            1_001,
+        );
+        let cancel = sm.apply_at(
+            Command::LockCancelAttempt {
+                keys: vec!["busy".to_string()],
+                holder: holder.clone(),
+                request_id: "still-queued".to_string(),
+            },
+            1_002,
+        );
+        assert_eq!(cancel.output["reason"], "cancellation_capacity");
+        assert_eq!(cancel.output["cancelled"], false);
+        let store = sm.store.lock().unwrap();
+        assert!(store
+            .locks
+            .queue
+            .get(&(holder, vec!["busy".to_string()]))
+            .is_some());
+    }
+
+    #[test]
+    fn cancellation_capacity_survives_snapshot_and_recovers_after_expiry() {
+        let original = StateMachine::new();
+        let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+        let holder = format!("{delimiter}org-snapshot{delimiter}worker");
+        let tenant = cancellation_tenant(&holder);
+        {
+            let mut store = original.store.lock().unwrap();
+            fill_tenant_cancellation_capacity(&mut store.lock_cancellations, &tenant, 0);
+        }
+
+        let restored = StateMachine::new();
+        restored.restore(&original.snapshot().unwrap()).unwrap();
+        let before_expiry = restored.apply_at(
+            Command::LockCancelAttempt {
+                keys: vec!["snapshot-capacity".to_string()],
+                holder: holder.clone(),
+                request_id: "after-snapshot".to_string(),
+            },
+            CANCELLATION_TOMBSTONE_TTL_MS - 1,
+        );
+        assert_eq!(before_expiry.output["reason"], "cancellation_capacity");
+        assert_eq!(
+            restored
+                .store
+                .lock()
+                .unwrap()
+                .lock_cancellations
+                .entries
+                .len(),
+            MAX_CANCELLATION_TOMBSTONES_PER_TENANT as usize
+        );
+
+        let after_expiry = restored.apply_at(
+            Command::LockCancelAttempt {
+                keys: vec!["snapshot-capacity".to_string()],
+                holder,
+                request_id: "after-snapshot".to_string(),
+            },
+            CANCELLATION_TOMBSTONE_TTL_MS,
+        );
+        assert_eq!(after_expiry.output["cancelled"], true);
+        assert!(after_expiry.output.get("reason").is_none());
+        let store = restored.store.lock().unwrap();
+        assert_eq!(store.lock_cancellations.entries.len(), 1);
+        assert_eq!(store.lock_cancellations.tenant_counts[&tenant], 1);
+        store.lock_cancellations.validate("lock").unwrap();
+    }
+
+    #[test]
+    fn cancellation_global_reserve_protects_a_new_tenants_fair_share() {
+        let limits = CancellationLimits {
+            per_tenant: 10,
+            total: 10,
+            global_reserve: 4,
+            fair_share_per_tenant: 2,
+        };
+        let mut ledger = CancellationLedger::default();
+        for index in 0..6 {
+            assert_eq!(
+                ledger.remember_with_limits(
+                    format!("bully-{index}"),
+                    "bully".to_string(),
+                    0,
+                    limits,
+                ),
+                RememberCancellation::Remembered
+            );
+        }
+        assert_eq!(
+            ledger.remember_with_limits(
+                "bully-reserved".to_string(),
+                "bully".to_string(),
+                0,
+                limits,
+            ),
+            RememberCancellation::CapacityExceeded
+        );
+        for index in 0..2 {
+            assert_eq!(
+                ledger.remember_with_limits(
+                    format!("new-{index}"),
+                    "new-tenant".to_string(),
+                    0,
+                    limits,
+                ),
+                RememberCancellation::Remembered
+            );
+        }
+        assert_eq!(
+            ledger.remember_with_limits(
+                "new-over-share".to_string(),
+                "new-tenant".to_string(),
+                0,
+                limits,
+            ),
+            RememberCancellation::CapacityExceeded
+        );
+        for index in 0..2 {
+            assert_eq!(
+                ledger.remember_with_limits(
+                    format!("other-{index}"),
+                    "other-tenant".to_string(),
+                    0,
+                    limits,
+                ),
+                RememberCancellation::Remembered
+            );
+        }
+        assert_eq!(ledger.entries.len(), limits.total);
+        assert_eq!(
+            ledger.remember_with_limits(
+                "hard-cap".to_string(),
+                "third-tenant".to_string(),
+                0,
+                limits,
+            ),
+            RememberCancellation::CapacityExceeded
+        );
+        assert_eq!(
+            ledger.remember_with_limits("new-0".to_string(), "new-tenant".to_string(), 0, limits,),
+            RememberCancellation::Remembered,
+            "idempotent retries remain accepted even at the hard cap"
+        );
+    }
+
+    #[test]
+    fn cancellation_reports_authority_when_promotion_won_the_race() {
+        let sm = StateMachine::new();
+        sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["lock".to_string()],
+                holder: "lock-owner".to_string(),
+                ttl_ms: 10,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["lock".to_string()],
+                holder: "lock-waiter".to_string(),
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(1_000),
+            },
+            1_001,
+        );
+        // The cancel command's pre-apply sweep expires the owner and promotes
+        // the still-live waiter. Cancel must return that raced authority rather
+        // than claiming the queue entry was simply absent.
+        let lock_cancel = sm.apply_at(
+            Command::LockCancel {
+                keys: vec!["lock".to_string()],
+                holder: "lock-waiter".to_string(),
+            },
+            1_010,
+        );
+        assert_eq!(lock_cancel.output["cancelled"], false);
+        assert_eq!(lock_cancel.output["acquired"], true);
+        let promoted_lock_token = lock_cancel.output["fencing_token"].as_u64().unwrap();
+        assert!(promoted_lock_token > 1);
+        assert_eq!(
+            sm.store.lock().unwrap().locks.grants[&promoted_lock_token].holder,
+            "lock-waiter"
+        );
+
+        sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "pool".to_string(),
+                holder: "permit-owner".to_string(),
+                limit: 1,
+                ttl_ms: 10,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            2_000,
+        );
+        sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "pool".to_string(),
+                holder: "permit-waiter".to_string(),
+                limit: 1,
+                ttl_ms: 1_000,
+                wait: true,
+                wait_timeout_ms: Some(1_000),
+            },
+            2_001,
+        );
+        let semaphore_cancel = sm.apply_at(
+            Command::SemaphoreCancel {
+                key: "pool".to_string(),
+                holder: "permit-waiter".to_string(),
+            },
+            2_010,
+        );
+        assert_eq!(semaphore_cancel.output["cancelled"], false);
+        assert_eq!(semaphore_cancel.output["acquired"], true);
+        assert!(semaphore_cancel.output["fencing_token"].as_u64().unwrap() > promoted_lock_token);
+        assert_eq!(
+            sm.store.lock().unwrap().semaphores["pool"].holders[0].holder,
+            "permit-waiter"
         );
     }
 
@@ -4387,6 +6196,7 @@ mod tests {
                 limit: 1,
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             })
         };
         acquire_permit("db/pool-z", "h1"); // holds the single permit
@@ -4419,6 +6229,7 @@ mod tests {
                 limit: 1,
                 ttl_ms: 1,
                 wait: true,
+                wait_timeout_ms: None,
             },
             expired_at,
         );
@@ -4430,6 +6241,7 @@ mod tests {
                 limit: 1,
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             },
             expired_at,
         );
@@ -4586,18 +6398,21 @@ mod tests {
                 holder: "holder-1".to_string(),
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             },
             Command::LockAcquire {
                 keys: vec!["x".to_string()],
                 holder: "holder-2".to_string(),
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             },
             Command::LockAcquire {
                 keys: vec!["x".to_string()],
                 holder: "holder-3".to_string(),
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             },
         ];
 
@@ -4711,6 +6526,7 @@ mod tests {
                     holder: "holder-1".to_string(),
                     ttl_ms: 1,
                     wait: false,
+                    wait_timeout_ms: None,
                 },
                 base,
             )
@@ -4722,6 +6538,7 @@ mod tests {
                 holder: "holder-2".to_string(),
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             },
             base,
         );
@@ -4806,6 +6623,7 @@ mod tests {
                     limit: 1,
                     ttl_ms: 1,
                     wait: false,
+                    wait_timeout_ms: None,
                 },
                 base,
             )
@@ -4818,6 +6636,7 @@ mod tests {
                 limit: 1,
                 ttl_ms: 30_000,
                 wait: true,
+                wait_timeout_ms: None,
             },
             base,
         );
@@ -6275,6 +8094,7 @@ mod tests {
             holder: "worker-a".to_string(),
             ttl_ms: 5_000,
             wait: false,
+            wait_timeout_ms: None,
         };
         let original = StateMachine::new();
         let first = original.apply_at(command.clone(), 10_000);
@@ -6292,20 +8112,22 @@ mod tests {
         let original = StateMachine::new();
         let base = now_ms();
         original.apply_at(
-            Command::LockAcquire {
+            Command::LockAcquireV2 {
                 keys: vec!["snapshot-lock".to_string()],
                 holder: "owner".to_string(),
                 ttl_ms: 300_000,
                 wait: false,
+                wait_timeout_ms: None,
             },
             base,
         );
         original.apply_at(
-            Command::LockAcquire {
+            Command::LockAcquireV2 {
                 keys: vec!["snapshot-lock".to_string()],
                 holder: "waiter".to_string(),
                 ttl_ms: 300_000,
                 wait: true,
+                wait_timeout_ms: Some(120_000),
             },
             base + 1,
         );
@@ -6317,6 +8139,225 @@ mod tests {
         assert_eq!(inventory.wait_queue.len(), 1);
         assert_eq!(inventory.held[0].fencing_token, 1);
         assert_eq!(inventory.wait_queue[0].holder, "waiter");
+        assert_eq!(
+            inventory.wait_queue[0].wait_expires_ms,
+            Some(base + 120_001),
+            "the replicated queue deadline survives snapshot restart"
+        );
+    }
+
+    #[test]
+    fn legacy_snapshots_without_queue_deadlines_restore_compatibly() {
+        let original = StateMachine::new();
+        let base = now_ms();
+        original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["legacy-lock".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 300_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            base,
+        );
+        original.apply_at(
+            Command::LockAcquire {
+                keys: vec!["legacy-lock".to_string()],
+                holder: "waiter".to_string(),
+                ttl_ms: 300_000,
+                wait: true,
+                wait_timeout_ms: Some(120_000),
+            },
+            base + 1,
+        );
+        original.apply_at(
+            Command::SemaphoreAcquire {
+                key: "legacy-pool".to_string(),
+                holder: "owner".to_string(),
+                limit: 1,
+                ttl_ms: 300_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            base + 2,
+        );
+        original.apply_at(
+            Command::SemaphoreAcquire {
+                key: "legacy-pool".to_string(),
+                holder: "waiter".to_string(),
+                limit: 1,
+                ttl_ms: 300_000,
+                wait: true,
+                wait_timeout_ms: Some(120_000),
+            },
+            base + 3,
+        );
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original.snapshot().unwrap()).unwrap();
+        value["locks"]["queue"][0][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("wait_expires_ms");
+        value["semaphores"]["legacy-pool"]["queue"][0][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("wait_expires_ms");
+
+        let restored = StateMachine::new();
+        restored
+            .restore(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        assert_eq!(restored.lock_inventory().wait_queue.len(), 1);
+        assert_eq!(
+            restored.lock_inventory().wait_queue[0].wait_expires_ms,
+            None
+        );
+        assert_eq!(
+            restored.semaphore_inventory()[0].wait_queue[0].wait_expires_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn historical_acquire_log_entries_preserve_indefinite_waits() {
+        let sm = StateMachine::new();
+        sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["legacy-log".to_string()],
+                holder: "owner".to_string(),
+                ttl_ms: 10_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            5_000,
+        );
+        let historical: Command = serde_json::from_value(json!({
+            "op": "lock_acquire",
+            "keys": ["legacy-log"],
+            "holder": "waiter",
+            "ttl_ms": 10_000,
+            "wait": true
+        }))
+        .unwrap();
+        let queued = sm.apply_at(historical, 5_001);
+        assert_eq!(queued.output["wait_expires_ms"], Value::Null);
+
+        sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "legacy-pool-log".to_string(),
+                holder: "owner".to_string(),
+                limit: 1,
+                ttl_ms: 10_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            6_000,
+        );
+        let historical: Command = serde_json::from_value(json!({
+            "op": "semaphore_acquire",
+            "key": "legacy-pool-log",
+            "holder": "waiter",
+            "limit": 1,
+            "ttl_ms": 10_000,
+            "wait": true
+        }))
+        .unwrap();
+        let queued = sm.apply_at(historical, 6_001);
+        assert_eq!(queued.output["wait_expires_ms"], Value::Null);
+    }
+
+    #[test]
+    fn historical_acquire_log_entries_preserve_renew_and_limit_reconfiguration() {
+        let sm = StateMachine::new();
+        let first = sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["legacy-lock".to_string()],
+                holder: "holder".to_string(),
+                ttl_ms: 100,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_000,
+        );
+        let retry = sm.apply_at(
+            Command::LockAcquire {
+                keys: vec!["legacy-lock".to_string()],
+                holder: "holder".to_string(),
+                ttl_ms: 500,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            1_050,
+        );
+        assert_eq!(retry.output["fencing_token"], first.output["fencing_token"]);
+        assert_eq!(retry.output["renewed"], true);
+        assert_eq!(retry.output["lease_expires_ms"], 1_550);
+
+        sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "legacy-pool".to_string(),
+                holder: "holder-a".to_string(),
+                limit: 1,
+                ttl_ms: 1_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            2_000,
+        );
+        let reconfigured = sm.apply_at(
+            Command::SemaphoreAcquire {
+                key: "legacy-pool".to_string(),
+                holder: "holder-b".to_string(),
+                limit: 2,
+                ttl_ms: 1_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            2_001,
+        );
+        assert_eq!(reconfigured.output["acquired"], true);
+        let store = sm.store.lock().unwrap();
+        assert_eq!(store.semaphores["legacy-pool"].limit, 2);
+        assert_eq!(store.semaphores["legacy-pool"].holders.len(), 2);
+    }
+
+    #[test]
+    fn protocol_activation_stamps_snapshots_for_fail_closed_downgrades() {
+        let state = StateMachine::new();
+        let legacy = state.snapshot().unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&legacy).is_ok());
+        assert_eq!(state.command_protocol(), LEGACY_COMMAND_PROTOCOL);
+
+        let activated = state.apply_at(
+            Command::ActivateCommandProtocol {
+                version: CURRENT_COMMAND_PROTOCOL,
+            },
+            1_000,
+        );
+        assert_eq!(activated.output["activated"], true);
+        assert_eq!(
+            activated.revision, 0,
+            "internal activation is not a user revision"
+        );
+        let stamped = state.snapshot().unwrap();
+        assert!(stamped.starts_with(CURRENT_PROTOCOL_SNAPSHOT_MAGIC));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&stamped).is_err(),
+            "the previous release's raw-JSON snapshot parser must fail closed"
+        );
+
+        let restored = StateMachine::new();
+        restored.restore(&stamped).unwrap();
+        assert_eq!(restored.command_protocol(), CURRENT_COMMAND_PROTOCOL);
+
+        let raw_v2 = stamped
+            .strip_prefix(CURRENT_PROTOCOL_SNAPSHOT_MAGIC)
+            .unwrap();
+        assert!(
+            StateMachine::new().restore(raw_v2).is_err(),
+            "a V2 state claiming no compatibility envelope is corrupt"
+        );
     }
 
     #[test]
@@ -6329,6 +8370,7 @@ mod tests {
                 holder: "owner-a".to_string(),
                 ttl_ms: 300_000,
                 wait: false,
+                wait_timeout_ms: None,
             },
             base,
         );
@@ -6342,6 +8384,7 @@ mod tests {
                 holder: "owner-b".to_string(),
                 ttl_ms: 300_000,
                 wait: false,
+                wait_timeout_ms: None,
             },
             base.saturating_add(1),
         );
@@ -6361,6 +8404,7 @@ mod tests {
                 holder: "owner".to_string(),
                 ttl_ms: 300_000,
                 wait: false,
+                wait_timeout_ms: None,
             },
             now_ms(),
         );
@@ -6396,6 +8440,7 @@ mod tests {
                 holder: "owner".to_string(),
                 ttl_ms: 300_000,
                 wait: false,
+                wait_timeout_ms: None,
             },
             now_ms(),
         );

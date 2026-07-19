@@ -86,6 +86,22 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
     assert_eq!(first["acquired"], true);
     assert_eq!(first["keys"], json!([a, b]));
 
+    let renewed = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/locks/renew",
+        Some(json!({
+            "keys": [a, b],
+            "holder": format!("{prefix}-lock-1"),
+            "fencing_token": first["fencing_token"],
+            "ttl_ms": 10_000
+        })),
+    )
+    .await?;
+    assert_eq!(renewed["renewed"], true);
+    assert_eq!(renewed["fencing_token"], first["fencing_token"]);
+
     let no_wait = call(
         &client,
         &base,
@@ -102,6 +118,57 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
     assert_eq!(no_wait["acquired"], false);
     assert_eq!(no_wait["queued"], false);
 
+    let cancel_holder = format!("{prefix}-lock-cancel");
+    let cancel_request_id = format!("{prefix}-lock-cancel-attempt");
+    let to_cancel = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/locks/acquire",
+        Some(json!({
+            "key": a,
+            "holder": cancel_holder,
+            "request_id": cancel_request_id,
+            "ttl_ms": 10_000,
+            "wait": true,
+            "wait_timeout_ms": 5_000
+        })),
+    )
+    .await?;
+    assert_eq!(to_cancel["queued"], true);
+    assert!(to_cancel["wait_expires_ms"].is_number());
+    let cancelled = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/locks/cancel",
+        Some(json!({
+            "key": a,
+            "holder": cancel_holder,
+            "request_id": cancel_request_id
+        })),
+    )
+    .await?;
+    assert_eq!(cancelled["cancelled"], true);
+    assert_eq!(cancelled["acquired"], false);
+    let late_cancelled_attempt = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/locks/acquire",
+        Some(json!({
+            "key": a,
+            "holder": cancel_holder,
+            "request_id": cancel_request_id,
+            "ttl_ms": 10_000,
+            "wait": true,
+            "wait_timeout_ms": 5_000
+        })),
+    )
+    .await?;
+    assert_eq!(late_cancelled_attempt["acquired"], false);
+    assert_eq!(late_cancelled_attempt["queued"], false);
+
     let queued = call(
         &client,
         &base,
@@ -111,11 +178,13 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
             "keys": [b, c],
             "holder": format!("{prefix}-lock-3"),
             "ttl_ms": 10_000,
-            "wait": true
+            "wait": true,
+            "wait_timeout_ms": 5_000
         })),
     )
     .await?;
     assert_eq!(queued["queued"], true);
+    assert!(queued["wait_expires_ms"].is_number());
 
     let inspected = call(
         &client,
@@ -194,12 +263,30 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
             "key": ttl_key,
             "holder": format!("{prefix}-ttl-lock-2"),
             "ttl_ms": 10_000,
-            "wait": true
+            "wait": true,
+            "wait_timeout_ms": 5_000
         })),
     )
     .await?;
     assert_eq!(ttl_waiter["queued"], true);
     tokio::time::sleep(Duration::from_millis(350)).await;
+    // Expiry/promotion is a replicated mutation; retrying the queued identity
+    // commits the sweep before the following pure read.
+    let ttl_promoted = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/locks/acquire",
+        Some(json!({
+            "key": ttl_key,
+            "holder": format!("{prefix}-ttl-lock-2"),
+            "ttl_ms": 10_000,
+            "wait": true,
+            "wait_timeout_ms": 5_000
+        })),
+    )
+    .await?;
+    assert_eq!(ttl_promoted["acquired"], true);
     let ttl_state = call(
         &client,
         &base,
@@ -254,6 +341,22 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
     assert_eq!(sem1["acquired"], true);
     assert_eq!(sem2["acquired"], true);
 
+    let sem_renewed = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/semaphores/renew",
+        Some(json!({
+            "key": sem_key,
+            "holder": format!("{prefix}-sem-1"),
+            "fencing_token": sem1["fencing_token"],
+            "ttl_ms": 10_000
+        })),
+    )
+    .await?;
+    assert_eq!(sem_renewed["renewed"], true);
+    assert_eq!(sem_renewed["fencing_token"], sem1["fencing_token"]);
+
     let sem_no_wait = call(
         &client,
         &base,
@@ -271,6 +374,59 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
     assert_eq!(sem_no_wait["acquired"], false);
     assert_eq!(sem_no_wait["queued"], false);
 
+    let sem_cancel_holder = format!("{prefix}-sem-cancel");
+    let sem_cancel_request_id = format!("{prefix}-sem-cancel-attempt");
+    let sem_to_cancel = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/semaphores/acquire",
+        Some(json!({
+            "key": sem_key,
+            "holder": sem_cancel_holder,
+            "request_id": sem_cancel_request_id,
+            "limit": 2,
+            "ttl_ms": 10_000,
+            "wait": true,
+            "wait_timeout_ms": 5_000
+        })),
+    )
+    .await?;
+    assert_eq!(sem_to_cancel["queued"], true);
+    assert!(sem_to_cancel["wait_expires_ms"].is_number());
+    let sem_cancelled = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/semaphores/cancel",
+        Some(json!({
+            "key": sem_key,
+            "holder": sem_cancel_holder,
+            "request_id": sem_cancel_request_id
+        })),
+    )
+    .await?;
+    assert_eq!(sem_cancelled["cancelled"], true);
+    assert_eq!(sem_cancelled["acquired"], false);
+    let late_sem_cancelled_attempt = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/semaphores/acquire",
+        Some(json!({
+            "key": sem_key,
+            "holder": sem_cancel_holder,
+            "request_id": sem_cancel_request_id,
+            "limit": 2,
+            "ttl_ms": 10_000,
+            "wait": true,
+            "wait_timeout_ms": 5_000
+        })),
+    )
+    .await?;
+    assert_eq!(late_sem_cancelled_attempt["acquired"], false);
+    assert_eq!(late_sem_cancelled_attempt["queued"], false);
+
     let sem_waiter = call(
         &client,
         &base,
@@ -281,7 +437,8 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
             "holder": format!("{prefix}-sem-3"),
             "limit": 2,
             "ttl_ms": 10_000,
-            "wait": true
+            "wait": true,
+            "wait_timeout_ms": 5_000
         })),
     )
     .await?;
@@ -353,12 +510,29 @@ async fn live_lock_semaphore_and_multikey_smoke() -> TestResult {
             "holder": format!("{prefix}-sem-ttl-2"),
             "limit": 1,
             "ttl_ms": 10_000,
-            "wait": true
+            "wait": true,
+            "wait_timeout_ms": 5_000
         })),
     )
     .await?;
     assert_eq!(sem_ttl_waiter["queued"], true);
     tokio::time::sleep(Duration::from_millis(350)).await;
+    let sem_ttl_promoted = call(
+        &client,
+        &base,
+        Method::POST,
+        "/v1/semaphores/acquire",
+        Some(json!({
+            "key": sem_ttl_key,
+            "holder": format!("{prefix}-sem-ttl-2"),
+            "limit": 1,
+            "ttl_ms": 10_000,
+            "wait": true,
+            "wait_timeout_ms": 5_000
+        })),
+    )
+    .await?;
+    assert_eq!(sem_ttl_promoted["acquired"], true);
     let sem_ttl_state = call(
         &client,
         &base,

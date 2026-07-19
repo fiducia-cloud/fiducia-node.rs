@@ -284,6 +284,7 @@ mod tests {
                 holder: org.scope("worker"),
                 ttl_ms: 30_000,
                 wait: false,
+                wait_timeout_ms: None,
             })
             .await
             .expect("lock commit");
@@ -293,6 +294,7 @@ mod tests {
                 limit: 2,
                 ttl_ms: 30_000,
                 wait: false,
+                wait_timeout_ms: None,
             })
             .await
             .expect("semaphore commit");
