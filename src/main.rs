@@ -83,14 +83,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = Arc::new(Node::bootstrap_http(config));
 
     // KV values are encrypted at rest by default; surface which posture booted.
-    if node.kv_cipher().is_some() {
-        tracing::info!("KV encryption at rest: ENABLED (FIDUCIA_KV_ENCRYPTION_KEY set)");
+    if let Some(cipher) = node.kv_cipher() {
+        tracing::info!(
+            backend = %cipher.posture(),
+            "KV encryption at rest: ENABLED"
+        );
     } else {
         tracing::warn!(
-            "KV encryption at rest: DISABLED (FIDUCIA_KV_ENCRYPTION_KEY unset). KV values, \
-             including the Raft log and snapshots on disk, are stored in cleartext. Set a base64 \
-             32-byte key to encrypt by default; clients may still opt individual writes out with \
-             \"plaintext\": true."
+            "KV encryption at rest: DISABLED. KV values, including the Raft log and snapshots on \
+             disk, are stored in cleartext. Configure a local keyring or Vault Transit to encrypt \
+             by default; clients may still opt individual writes out with \"plaintext\": true."
         );
     }
 
@@ -246,9 +248,11 @@ mod interface_contract_tests {
     fn generated_interfaces_are_importable() {
         let request = LockAcquireManyRequest {
             keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
-            holder: Some("worker-a".to_string()),
+            holder: "worker-a".to_string(),
+            request_id: None,
             ttl_ms: Some(30_000),
             wait: Some(false),
+            wait_timeout_ms: None,
         };
 
         assert_eq!(request.keys.len(), 2);

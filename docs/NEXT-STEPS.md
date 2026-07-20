@@ -31,9 +31,6 @@ GC, and misconfig edges.
   heap + snapshot bloat → slow InstallSnapshot/recovery, eventual OOM. Add a deterministic
   committed retention sweep (driven by `proposed_at_ms`) for terminal records; evict idle
   rate-limit buckets.
-- **M27 (~S) — `FIDUCIA_KV_ENCRYPTION_KEY` (a secret) missing from `[env].ignore`** in
-  `.cli-flags.toml` (`kv.rs:73` reads it). Add it.
-
 ## Lower priority (confirmed)
 - `apply_task_claim` mints a fencing token before validation (`state.rs:2646`) — move `next_token()`
   below the not_found/terminal/!claimable guards (matches `apply_handoff_accept`).

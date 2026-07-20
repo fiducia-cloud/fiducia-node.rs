@@ -30,6 +30,8 @@ pub const MAX_LOCK_KEYS: usize = 256;
 pub const MAX_KEY_BYTES: usize = 1024;
 /// Max bytes for a holder / candidate / instance identifier.
 pub const MAX_HOLDER_BYTES: usize = 512;
+/// Max bytes for one client-generated logical acquisition attempt id.
+pub const MAX_REQUEST_ID_BYTES: usize = 128;
 /// Max bytes for an election or service *name*.
 pub const MAX_NAME_BYTES: usize = 1024;
 /// Max bytes for a service instance address.
@@ -37,6 +39,11 @@ pub const MAX_ADDRESS_BYTES: usize = 2048;
 /// Max lease TTL: 24h. Leases auto-expire to free abandoned holders, so an
 /// unbounded TTL is just a way to hold a resource forever; cap it.
 pub const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Default lifetime for a queued lock/semaphore request. A waiter must opt back
+/// in after this window rather than occupying replicated queue state forever.
+pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+/// Queue waits are leases too: cap them at the same 24h ceiling as held leases.
+pub const MAX_WAIT_TIMEOUT_MS: u64 = MAX_TTL_MS;
 /// Sanity ceiling on a semaphore's concurrent-holder limit.
 pub const MAX_SEMAPHORE_LIMIT: u32 = 1_000_000;
 /// Max key/value pairs in a metadata map (discovery / election candidate facts).
@@ -93,11 +100,81 @@ fn check_str(label: &str, value: &str, max: usize, allow_empty: bool) -> Result<
     Ok(())
 }
 
+fn check_holder(value: &str) -> Result<(), Rejection> {
+    check_str("holder", value, MAX_HOLDER_BYTES, false)?;
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(Rejection::new(
+            "invalid_holder",
+            "holder must contain a non-whitespace character and no control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the optional identity that binds acquire retries to cancellation.
+/// Legacy callers may omit it; when present it must be compact and unambiguous.
+pub fn acquisition_request_id(request_id: &Option<String>) -> Result<(), Rejection> {
+    let Some(request_id) = request_id else {
+        return Ok(());
+    };
+    check_str("request_id", request_id, MAX_REQUEST_ID_BYTES, false)?;
+    if request_id.trim().is_empty() || request_id.chars().any(char::is_control) {
+        return Err(Rejection::new(
+            "invalid_request_id",
+            "request_id must contain a non-whitespace character and no control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn check_ttl(ttl_ms: u64) -> Result<(), Rejection> {
+    if ttl_ms == 0 {
+        return Err(Rejection::new(
+            "invalid_ttl",
+            "ttl_ms must be greater than zero",
+        ));
+    }
     if ttl_ms > MAX_TTL_MS {
         return Err(Rejection::new(
             "ttl_too_large",
             format!("ttl_ms exceeds the {MAX_TTL_MS} ms (24h) ceiling"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_wait_timeout(wait_timeout_ms: u64) -> Result<(), Rejection> {
+    if wait_timeout_ms == 0 {
+        return Err(Rejection::new(
+            "invalid_wait_timeout",
+            "wait_timeout_ms must be greater than zero",
+        ));
+    }
+    if wait_timeout_ms > MAX_WAIT_TIMEOUT_MS {
+        return Err(Rejection::new(
+            "wait_timeout_too_large",
+            format!("wait_timeout_ms exceeds the {MAX_WAIT_TIMEOUT_MS} ms (24h) ceiling"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_required_holder(holder: &Option<String>) -> Result<(), Rejection> {
+    let Some(holder) = holder else {
+        return Err(Rejection::new(
+            "missing_holder",
+            "holder is required and must not be empty",
+        ));
+    };
+    check_holder(holder)
+}
+
+/// Validate client-supplied fencing authority before proposing a mutation.
+pub fn validate_fencing_token(fencing_token: u64) -> Result<(), Rejection> {
+    if fencing_token == 0 {
+        return Err(Rejection::new(
+            "invalid_fencing_token",
+            "fencing_token must be greater than zero",
         ));
     }
     Ok(())
@@ -121,11 +198,12 @@ fn check_metadata(metadata: &HashMap<String, String>) -> Result<(), Rejection> {
 }
 
 /// Validate a (possibly multi-key) lock acquire: key count, each key's length,
-/// the optional holder, and the optional TTL.
+/// the required holder, held-lease TTL, and optional queue-wait timeout.
 pub fn lock_acquire(
     keys: &[String],
     holder: &Option<String>,
     ttl_ms: Option<u64>,
+    wait_timeout_ms: Option<u64>,
 ) -> Result<(), Rejection> {
     if keys.len() > MAX_LOCK_KEYS {
         return Err(Rejection::new(
@@ -136,11 +214,12 @@ pub fn lock_acquire(
     for key in keys {
         check_str("lock key", key, MAX_KEY_BYTES, false)?;
     }
-    if let Some(holder) = holder {
-        check_str("holder", holder, MAX_HOLDER_BYTES, true)?;
-    }
+    check_required_holder(holder)?;
     if let Some(ttl) = ttl_ms {
         check_ttl(ttl)?;
+    }
+    if let Some(timeout) = wait_timeout_ms {
+        check_wait_timeout(timeout)?;
     }
     Ok(())
 }
@@ -150,19 +229,69 @@ pub fn lock_acquire(
 /// Release itself persists nothing, but validating here keeps every mutating lock
 /// path consistently bounded and rejects obvious abuse before `propose`.
 pub fn lock_release(holder: &str) -> Result<(), Rejection> {
-    check_str("holder", holder, MAX_HOLDER_BYTES, false)
+    check_holder(holder)
 }
 
-/// Validate a semaphore acquire: key, optional holder, holder limit, optional TTL.
+/// Validate an explicit token-bound union-lock renewal.
+pub fn lock_renew(
+    keys: &[String],
+    holder: &str,
+    fencing_token: u64,
+    ttl_ms: Option<u64>,
+) -> Result<(), Rejection> {
+    if keys.is_empty() {
+        return Err(Rejection::new("no_keys", "provide `keys` or `key`"));
+    }
+    if keys.len() > MAX_LOCK_KEYS {
+        return Err(Rejection::new(
+            "too_many_keys",
+            format!("union lock has {} keys; max is {MAX_LOCK_KEYS}", keys.len()),
+        ));
+    }
+    for key in keys {
+        check_str("lock key", key, MAX_KEY_BYTES, false)?;
+    }
+    check_holder(holder)?;
+    validate_fencing_token(fencing_token)?;
+    if let Some(ttl) = ttl_ms {
+        check_ttl(ttl)?;
+    }
+    Ok(())
+}
+
+/// Validate an idempotent removal of one queued union-lock identity.
+pub fn lock_cancel(keys: &[String], holder: &str) -> Result<(), Rejection> {
+    if keys.is_empty() {
+        return Err(Rejection::new("no_keys", "provide `keys` or `key`"));
+    }
+    if keys.len() > MAX_LOCK_KEYS {
+        return Err(Rejection::new(
+            "too_many_keys",
+            format!("union lock has {} keys; max is {MAX_LOCK_KEYS}", keys.len()),
+        ));
+    }
+    for key in keys {
+        check_str("lock key", key, MAX_KEY_BYTES, false)?;
+    }
+    check_holder(holder)
+}
+
+/// Validate a semaphore acquire: key, required holder, holder limit, lease TTL,
+/// and the independent optional queue-wait timeout.
 pub fn semaphore_acquire(
     key: &str,
     holder: &Option<String>,
     limit: u32,
     ttl_ms: Option<u64>,
+    wait_timeout_ms: Option<u64>,
 ) -> Result<(), Rejection> {
     check_str("semaphore key", key, MAX_KEY_BYTES, false)?;
-    if let Some(holder) = holder {
-        check_str("holder", holder, MAX_HOLDER_BYTES, true)?;
+    check_required_holder(holder)?;
+    if limit == 0 {
+        return Err(Rejection::new(
+            "invalid_limit",
+            "semaphore limit must be greater than zero",
+        ));
     }
     if limit > MAX_SEMAPHORE_LIMIT {
         return Err(Rejection::new(
@@ -170,6 +299,30 @@ pub fn semaphore_acquire(
             format!("semaphore limit {limit} exceeds {MAX_SEMAPHORE_LIMIT}"),
         ));
     }
+    if let Some(ttl) = ttl_ms {
+        check_ttl(ttl)?;
+    }
+    if let Some(timeout) = wait_timeout_ms {
+        check_wait_timeout(timeout)?;
+    }
+    Ok(())
+}
+
+/// Validate semaphore release/cancel paths, which identify one holder at a key.
+pub fn semaphore_holder(key: &str, holder: &str) -> Result<(), Rejection> {
+    check_str("semaphore key", key, MAX_KEY_BYTES, false)?;
+    check_holder(holder)
+}
+
+/// Validate an explicit token-bound semaphore renewal.
+pub fn semaphore_renew(
+    key: &str,
+    holder: &str,
+    fencing_token: u64,
+    ttl_ms: Option<u64>,
+) -> Result<(), Rejection> {
+    semaphore_holder(key, holder)?;
+    validate_fencing_token(fencing_token)?;
     if let Some(ttl) = ttl_ms {
         check_ttl(ttl)?;
     }
@@ -316,13 +469,19 @@ mod tests {
     #[test]
     fn lock_acquire_accepts_a_normal_union() {
         let keys = vec!["orders/42".to_string(), "inv/7".to_string()];
-        assert!(lock_acquire(&keys, &Some("worker-a".to_string()), Some(30_000)).is_ok());
+        assert!(lock_acquire(
+            &keys,
+            &Some("worker-a".to_string()),
+            Some(30_000),
+            Some(15_000)
+        )
+        .is_ok());
     }
 
     #[test]
     fn lock_acquire_rejects_too_many_keys() {
         let keys: Vec<String> = (0..MAX_LOCK_KEYS + 1).map(|i| format!("k{i}")).collect();
-        let err = lock_acquire(&keys, &None, None).unwrap_err();
+        let err = lock_acquire(&keys, &Some("worker".into()), None, None).unwrap_err();
         assert_eq!(err.code, "too_many_keys");
     }
 
@@ -330,7 +489,9 @@ mod tests {
     fn lock_acquire_rejects_an_oversized_key() {
         let keys = vec![big(MAX_KEY_BYTES + 1)];
         assert_eq!(
-            lock_acquire(&keys, &None, None).unwrap_err().code,
+            lock_acquire(&keys, &Some("worker".into()), None, None)
+                .unwrap_err()
+                .code,
             "field_too_long"
         );
     }
@@ -339,7 +500,9 @@ mod tests {
     fn lock_acquire_rejects_an_empty_key() {
         let keys = vec![String::new()];
         assert_eq!(
-            lock_acquire(&keys, &None, None).unwrap_err().code,
+            lock_acquire(&keys, &Some("worker".into()), None, None)
+                .unwrap_err()
+                .code,
             "empty_field"
         );
     }
@@ -348,12 +511,77 @@ mod tests {
     fn ttl_ceiling_is_enforced() {
         let keys = vec!["k".to_string()];
         assert_eq!(
-            lock_acquire(&keys, &None, Some(MAX_TTL_MS + 1))
+            lock_acquire(&keys, &Some("worker".into()), Some(MAX_TTL_MS + 1), None,)
                 .unwrap_err()
                 .code,
             "ttl_too_large"
         );
-        assert!(lock_acquire(&keys, &None, Some(MAX_TTL_MS)).is_ok());
+        assert!(lock_acquire(&keys, &Some("worker".into()), Some(MAX_TTL_MS), None).is_ok());
+    }
+
+    #[test]
+    fn lock_acquire_requires_a_nonempty_holder_and_positive_ttl() {
+        let keys = vec!["k".to_string()];
+        assert_eq!(
+            lock_acquire(&keys, &None, Some(30_000), None)
+                .unwrap_err()
+                .code,
+            "missing_holder"
+        );
+        assert_eq!(
+            lock_acquire(&keys, &Some(String::new()), Some(30_000), None)
+                .unwrap_err()
+                .code,
+            "empty_field"
+        );
+        assert_eq!(
+            lock_acquire(&keys, &Some("worker".into()), Some(0), None)
+                .unwrap_err()
+                .code,
+            "invalid_ttl"
+        );
+    }
+
+    #[test]
+    fn wait_timeout_is_positive_and_bounded() {
+        let keys = vec!["k".to_string()];
+        let holder = Some("worker".to_string());
+        assert_eq!(
+            lock_acquire(&keys, &holder, Some(30_000), Some(0))
+                .unwrap_err()
+                .code,
+            "invalid_wait_timeout"
+        );
+        assert_eq!(
+            lock_acquire(&keys, &holder, Some(30_000), Some(MAX_WAIT_TIMEOUT_MS + 1),)
+                .unwrap_err()
+                .code,
+            "wait_timeout_too_large"
+        );
+    }
+
+    #[test]
+    fn request_id_is_optional_but_bounded_and_printable() {
+        assert!(acquisition_request_id(&None).is_ok());
+        assert!(acquisition_request_id(&Some("attempt-01".to_string())).is_ok());
+        assert_eq!(
+            acquisition_request_id(&Some(String::new()))
+                .unwrap_err()
+                .code,
+            "empty_field"
+        );
+        assert_eq!(
+            acquisition_request_id(&Some(" \t".to_string()))
+                .unwrap_err()
+                .code,
+            "invalid_request_id"
+        );
+        assert_eq!(
+            acquisition_request_id(&Some(big(MAX_REQUEST_ID_BYTES + 1)))
+                .unwrap_err()
+                .code,
+            "field_too_long"
+        );
     }
 
     #[test]
@@ -365,11 +593,29 @@ mod tests {
             "field_too_long"
         );
         assert!(lock_release(&big(MAX_HOLDER_BYTES)).is_ok());
+        assert!(validate_fencing_token(1).is_ok());
+        assert_eq!(
+            validate_fencing_token(0).unwrap_err().code,
+            "invalid_fencing_token"
+        );
     }
 
     #[test]
     fn semaphore_limit_ceiling_is_enforced() {
-        let err = semaphore_acquire("k", &None, MAX_SEMAPHORE_LIMIT + 1, None).unwrap_err();
+        assert_eq!(
+            semaphore_acquire("k", &Some("worker".into()), 0, None, None)
+                .unwrap_err()
+                .code,
+            "invalid_limit"
+        );
+        let err = semaphore_acquire(
+            "k",
+            &Some("worker".into()),
+            MAX_SEMAPHORE_LIMIT + 1,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "limit_too_large");
     }
 
@@ -419,7 +665,13 @@ mod tests {
         const { assert!(NINETY_MIN_MS < MAX_TTL_MS) };
         let keys = vec!["athleto:seat:A".to_string(), "athleto:seat:B".to_string()];
         assert!(
-            lock_acquire(&keys, &Some("cart:7f3a".to_string()), Some(NINETY_MIN_MS)).is_ok(),
+            lock_acquire(
+                &keys,
+                &Some("cart:7f3a".to_string()),
+                Some(NINETY_MIN_MS),
+                None,
+            )
+            .is_ok(),
             "a 90-minute union-lock hold should validate"
         );
     }
@@ -429,11 +681,16 @@ mod tests {
         // Guards the boundary: MAX_KEY_BYTES must be inclusive, so a namespaced
         // key sized right at the limit is not spuriously rejected.
         let keys = vec![big(MAX_KEY_BYTES)];
-        assert!(lock_acquire(&keys, &None, Some(30_000)).is_ok());
+        assert!(lock_acquire(&keys, &Some("worker".into()), Some(30_000), None).is_ok());
         assert_eq!(
-            lock_acquire(&[big(MAX_KEY_BYTES + 1)], &None, None)
-                .unwrap_err()
-                .code,
+            lock_acquire(
+                &[big(MAX_KEY_BYTES + 1)],
+                &Some("worker".into()),
+                None,
+                None,
+            )
+            .unwrap_err()
+            .code,
             "field_too_long"
         );
     }

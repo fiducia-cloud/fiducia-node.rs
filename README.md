@@ -22,7 +22,7 @@ All over HTTP (`/v1`):
 | **Locks (multi-key)** | `/v1/locks/*`      | Mutual exclusion over a **union** of keys — the flagship. Atomic all-or-nothing, FIFO, deadlock-free, fencing tokens, TTL leases. |
 | **Semaphores**        | `/v1/semaphores/*` | Counting locks: up to `limit` concurrent holders, FIFO queue beyond the cap. |
 | **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
-| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted at rest by default** (AES-256-GCM) when `FIDUCIA_KV_ENCRYPTION_KEY` is set; per-write `{"plaintext": true}` opt-out. |
+| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted before Raft** through external Vault Transit or a versioned local AES-256-GCM keyring; per-write `{"plaintext": true}` opt-out. |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
 | **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
@@ -155,10 +155,15 @@ at a time. You can lock the **union** of a key *set*:
 ```bash
 # Acquire {orders/42, inventory/sku-9} atomically — all or nothing.
 fiducia -XPOST localhost:8090/v1/locks/acquire \
-  -d '{"keys":["orders/42","inventory/sku-9"],"holder":"worker-a","ttl_ms":30000,"wait":true}'
+  -d '{"keys":["orders/42","inventory/sku-9"],"holder":"worker-a","request_id":"orders-42-attempt-01","ttl_ms":30000,"wait":true,"wait_timeout_ms":15000}'
 # → { "committed": true, "result": { "output": {
 #       "acquired": true, "keys": ["inventory/sku-9","orders/42"],
 #       "fencing_token": 7, "lease_expires_ms": ... } } }
+
+# Renew only with the exact key set, holder, and fencing token. Renewal keeps
+# the token and extends the lease.
+fiducia -XPOST localhost:8090/v1/locks/renew \
+  -d '{"keys":["orders/42","inventory/sku-9"],"holder":"worker-a","fencing_token":7,"ttl_ms":30000}'
 
 # Release the whole set by its fencing token.
 fiducia -XPOST localhost:8090/v1/locks/release -d '{"holder":"worker-a","fencing_token":7}'
@@ -178,13 +183,32 @@ model, made linearizable by Raft):
   the resource you're protecting to fence off a slow previous holder.
 - **TTL leases.** A holder that dies has its grant auto-expire; the freed keys
   promote the next grantable waiter.
+- **Bounded waiting.** `wait_timeout_ms` is independent of the granted lease
+  TTL and defaults to 30 seconds. Queued responses and reads expose the absolute
+  `wait_expires_ms` deadline. Reposting the same queued identity does not move it
+  back in line or extend that deadline.
+- **Durable cancellation.** `POST /v1/locks/cancel` with the original `keys`,
+  `holder`, and client-generated `request_id` removes a queued request and
+  records a fixed-size, quota-bounded replicated tombstone,
+  so a late ambiguous acquire with that identity cannot create a zombie. If
+  promotion won the race, cancel reports `acquired:true` plus the live token so
+  the caller can release it safely. Generate one cryptographically unique
+  `request_id` per logical acquisition attempt and reuse that exact id for its
+  retries and cancellation; stable holder names remain safe across attempts.
 
 **Semaphores** generalize a lock to *N* holders (a mutex is `limit = 1`):
 
 ```bash
 fiducia -XPOST localhost:8090/v1/semaphores/acquire \
-  -d '{"key":"db-pool","holder":"conn-1","limit":10,"ttl_ms":30000,"wait":true}'
+  -d '{"key":"db-pool","holder":"conn-1","request_id":"db-pool-attempt-01","limit":10,"ttl_ms":30000,"wait":true,"wait_timeout_ms":15000}'
+fiducia -XPOST localhost:8090/v1/semaphores/renew \
+  -d '{"key":"db-pool","holder":"conn-1","fencing_token":8,"ttl_ms":30000}'
+fiducia -XPOST localhost:8090/v1/semaphores/cancel \
+  -d '{"key":"db-pool","holder":"conn-1","request_id":"db-pool-attempt-01"}'
 ```
+
+Lock and semaphore mutations require a non-empty `holder`; lease and wait TTLs
+must be positive and are capped at 24 hours.
 
 **Idempotency keys** dedupe retry-prone work such as webhook handling, order
 fulfillment, and "run this job once" APIs:
@@ -202,10 +226,10 @@ until the TTL expires. Duplicates return the retained record. Completion require
 the original owner and fencing token, and duplicate completions replay the stored
 result.
 
-**Keys are never in the URL path** — they go in `?key=` (or, for the multi-key
-lock acquire/release, the JSON body). So they're free of any path grammar and may
-contain slashes, dots, or be empty (`flags/checkout`, `orders/42`,
-`pools/db/primary`, even a key named `acquire`):
+**Keys are never in the URL path** — they go in `?key=` (or, for multi-key lock
+mutations, the JSON body). So they're free of any path grammar and may
+contain slashes or dots (`flags/checkout`, `orders/42`, `pools/db/primary`, even
+a key named `acquire`):
 
 ```bash
 fiducia       'localhost:8090/v1/kv?key=flags/checkout'              # read
@@ -429,7 +453,15 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_RAFT_RPC_TIMEOUT_MS` | integer | `10000` | no | Total timeout for vote and bounded AppendEntries HTTP requests. |
 | `FIDUCIA_RAFT_SNAPSHOT_TIMEOUT_MS` | integer | `120000` | no | Longer total timeout for InstallSnapshot HTTP requests. |
 | `FIDUCIA_INTERNAL_SECRET` | string | *(unset ⇒ fail closed)* | **yes** | Shared cluster secret enforced on `/v1` and `/raft`. Share with the LB and peer nodes. |
-| `FIDUCIA_KV_ENCRYPTION_KEY` | base64 32 bytes | *(unset ⇒ KV plaintext at rest)* | recommended | Cluster-wide AES-256 key for **KV encryption at rest**. When set, `/v1/kv` values are sealed (AES-256-GCM) before entering the Raft log, so the on-disk log, snapshots, and in-memory state all hold ciphertext. Must be **identical on every replica**. A client may opt a single write out with `{"plaintext": true}`. |
+| `FIDUCIA_KV_ENCRYPTION_KEYS` | JSON object | *(unset)* | **yes** | Versioned local keyring mapping key IDs to base64 32-byte AES-256 keys. Retain old IDs while any live value or backup uses them. |
+| `FIDUCIA_KV_ENCRYPTION_ACTIVE_KEY_ID` | string | *(unset)* | no | Local key ID used for new writes. Required with the versioned keyring. Changing it rotates writes without breaking reads under retained old IDs. |
+| `FIDUCIA_KV_ENCRYPTION_KEY` | base64 32 bytes | *(unset)* | **yes** | Legacy single local key accepted for migration. Prefer the versioned keyring so rotation can overlap old and new keys. |
+| `FIDUCIA_KV_ENCRYPTION_KEY_ID` | string | `legacy` | no | Optional envelope key ID for the legacy single-key setting. It is invalid without `FIDUCIA_KV_ENCRYPTION_KEY`. |
+| `FIDUCIA_KV_VAULT_ADDR` | URL | *(unset)* | no | External Vault Transit-compatible base URL. Public hosts require HTTPS; cleartext is accepted only for loopback/private/internal hosts. |
+| `FIDUCIA_KV_VAULT_TOKEN` | string | *(unset)* | **yes** | Short-lived, least-privilege token allowed to encrypt/decrypt the configured Transit key. Redirects are disabled. |
+| `FIDUCIA_KV_VAULT_KEY` | string | *(unset)* | no | Transit key name used for KV envelopes. |
+| `FIDUCIA_KV_VAULT_MOUNT` | string | `transit` | no | Transit secrets-engine mount name. |
+| `FIDUCIA_KV_VAULT_NAMESPACE` | string | *(unset)* | no | Optional Vault Enterprise namespace. |
 | `FIDUCIA_ALLOW_INSECURE_INTERNAL` | bool | `false` | no | Debug-build-only local-dev opt-out. Release binaries compile the bypass out. |
 | `FIDUCIA_RAFT_PREVOTE` | bool | `true` | no | Raft PreVote (avoids term inflation from a partitioned node). Disable with `0`/`false`/`off`. |
 | `FIDUCIA_RAFT_CHECK_QUORUM` | bool | `true` | no | Leader steps down without a quorum of live followers. Disable with `0`/`false`/`off`. |
@@ -439,6 +471,17 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_RAFT_ELECTION_JITTER_MS` | integer | `150` | no | Random jitter added to the election timeout. |
 
 Bool vars accept `1`/`true` (and, for the Raft toggles, `0`/`false`/`off`).
+
+Choose exactly one KV protection backend. Partial or conflicting configuration
+fails startup. Both backends seal values before a proposal enters Raft and bind
+the ciphertext to its organization-scoped storage key. Reads fail closed when a
+provider/key is unavailable or an envelope is malformed; they never return raw
+ciphertext or silently fall back to plaintext. KV get/list responses expose
+`protection.at_rest` plus provider, key ID, or provider key version metadata.
+Vault rotation is performed by a separate operator identity; Fiducia writes with
+the provider's new version and keeps reading supported old versions. Local
+rotation adds a new key ID and changes the active ID, then rewrites long-lived
+values before retiring an old key.
 
 ### Secure-by-default trust boundary
 
@@ -498,14 +541,15 @@ configuration so neither can be enabled or exposed casually through argv.
 
 The source build is intentionally closed over immutable inputs:
 
-- Rust is pinned to 1.95.0 in `rust-toolchain.toml`, CI, and the container
-  builder; Cargo build, clippy, and test commands use the committed lockfile.
+- Rust is pinned to 1.95.0 in `rust-toolchain.toml` and CI; the container builder
+  is separately pinned to Rust 1.97.0 by tag and immutable image digest. Cargo
+  build, clippy, and test commands use the committed lockfile.
 - CI and Docker resolve `fiducia-interfaces` at
-  `487e470c45ab5851e8f6f3b1dc048fe067fbf408` and `fiducia-routing.rs` at
+  `6e20a3f4df2e52b99a0ad6add83d4528262b5dbc` and `fiducia-routing.rs` at
   `543b4ea3b3bba28b66c15a97a27514488d2ccce3`. The image build verifies each
   fetched checkout before compiling instead of following either repository's
   moving `main` branch.
-- GitHub Actions use full commit SHAs. CI installs cargo-audit 0.21.2 from its
+- GitHub Actions use full commit SHAs. CI installs cargo-audit 0.22.2 from its
   locked dependency graph, while Dependabot covers Cargo, Actions, and Docker
   inputs so upgrades arrive as reviewable changes.
 - The final image contains only the release binary and runs as distroless uid
@@ -514,6 +558,25 @@ The source build is intentionally closed over immutable inputs:
 
 For a local release-equivalent check, use `cargo build --release --locked`.
 `docker build .` additionally fetches the two pinned public sibling commits.
+
+### Rolling command-protocol upgrades
+
+Lock/semaphore attempt IDs, cancellation, and explicit renewals use command
+protocol V2. The Raft rollout is automatic but deliberately two-phase:
+
+1. Upgrade every configured replica. Leaders continue writing legacy-compatible
+   acquire entries while `active_command_protocol` is 1; V2-only operations
+   return unavailable rather than placing an entry an older peer cannot parse.
+2. Each follower advertises `parser_command_protocol: 2` in AppendEntries. Only
+   after **every** configured peer has done so does the leader append and commit
+   the per-shard activation barrier. `/v1/status` then reports
+   `active_command_protocol: 2`.
+
+Do not intentionally downgrade a shard after activation. The activation entry
+causes the previous binary to reject the retained log; after compaction, a
+non-JSON snapshot compatibility stamp preserves that fail-closed refusal. A
+recovered V2 entry left by a pre-gate build is likewise withheld from unadvertised
+peers and cannot commit until every peer has advertised the V2 parser.
 
 ## Security
 
@@ -546,9 +609,14 @@ Trust-boundary and hardening posture applied to this crate:
   application, and client success all depend on successful durable writes. A
   faulted shard remains unavailable and visible through `/readyz`, `/v1/status`,
   and `/v1/observe/shards` until it restarts and validates its on-disk state.
+- **Bounded, fair cancellation safety.** Attempt-cancellation tombstones are
+  fixed-size digests with a 24-hour rolling expiry, hard global/per-tenant caps,
+  and reserved global headroom for tenants below their fair share. Capacity
+  failure leaves a waiter intact; if expiry promoted that exact waiter first,
+  cancellation returns its fencing authority even when the ledger is full.
 
 **Dependency advisories:** `cargo audit` is clean — 0 advisories across the
-dependency tree (171 crates), reconfirmed at the latest scan. No known or
+dependency tree (219 crate dependencies), reconfirmed at the latest scan. No known or
 accepted (ignored) advisories.
 
 ## Related

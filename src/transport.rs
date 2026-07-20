@@ -24,6 +24,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::consensus::{LogEntry, ShardMsg};
 use fiducia_routing::ShardId;
 
+fn legacy_command_protocol() -> u16 {
+    crate::state::LEGACY_COMMAND_PROTOCOL
+}
+
 // ---------------------------------------------------------------------------
 // Raft RPC wire types. These cross the network (HTTP) and the in-process
 // loopback identically, so they are plain serializable structs.
@@ -45,6 +49,10 @@ pub struct AppendEntriesReq {
     pub entries: Vec<LogEntry>,
     /// Leader's `commit_index`, so the follower can advance its own.
     pub leader_commit: u64,
+    /// Highest command protocol the leader binary can parse. Older peers ignore
+    /// this unknown field; when absent, current peers conservatively read V1.
+    #[serde(default = "legacy_command_protocol")]
+    pub command_protocol: u16,
 }
 
 /// Reply to [`AppendEntriesReq`].
@@ -57,6 +65,11 @@ pub struct AppendEntriesResp {
     /// Follower's last log index afterward — lets the leader set `match_index`
     /// on success and fast-rewind `next_index` on failure.
     pub match_index: u64,
+    /// Highest command protocol this follower binary can parse. Leaders must
+    /// observe V2 from every configured peer before appending the activation
+    /// barrier that permits V2 command emission.
+    #[serde(default = "legacy_command_protocol")]
+    pub command_protocol: u16,
 }
 
 /// InstallSnapshot transfers compacted state to a follower whose next required
