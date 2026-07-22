@@ -106,6 +106,12 @@ async fn renew(
     Path(name): Path<String>,
     Json(body): Json<RenewBody>,
 ) -> Response {
+    // Renew sets a fresh expiry, so it is bounded exactly like campaign is.
+    if let Some(ttl_ms) = body.ttl_ms {
+        if let Err(rejection) = crate::validate::ttl(ttl_ms) {
+            return rejection.into_response();
+        }
+    }
     let result = node
         .propose(Command::ElectionRenew {
             name: org.scope(&name),

@@ -46,6 +46,12 @@ async fn check(
     if let Err(rejection) = crate::validate::rate_limit(&tenant, &key) {
         return rejection.into_response();
     }
+    let cost = body.cost.unwrap_or(1);
+    if let Err(rejection) =
+        crate::validate::rate_limit_params(body.limit, body.window_ms, cost, body.refill_per_second)
+    {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::RateLimitCheck {
             key: org.scope(&key),
@@ -54,7 +60,7 @@ async fn check(
             limit: body.limit,
             window_ms: body.window_ms,
             refill_per_second: body.refill_per_second,
-            cost: body.cost.unwrap_or(1),
+            cost,
         })
         .await;
     org.propose_response(result, &uri)

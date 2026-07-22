@@ -123,7 +123,9 @@ async fn arrive(
     uri: Uri,
     Json(body): Json<ArriveBody>,
 ) -> Response {
-    if let Err(rejection) = crate::validate::barrier_arrive(&body.name, &body.participant) {
+    if let Err(rejection) =
+        crate::validate::barrier_arrive(&body.name, &body.participant, body.weight)
+    {
         return rejection.into_response();
     }
     let result = node

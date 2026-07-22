@@ -1764,10 +1764,12 @@ impl ShardActor {
             };
         }
         if req.term > self.current_term {
-            self.current_term = req.term;
-            self.voted_for = None;
-            if let Err(error) = self.persist_hard_state() {
-                self.fail_storage("persisting higher term from snapshot leader", error);
+            // Step down, don't just adopt the term: the metadata check below can
+            // return early, and a leader that kept `Role::Leader` at the newer
+            // term would go on broadcasting AppendEntries in a term it never won
+            // — two leaders in one term, both committing.
+            self.step_down(req.term, None);
+            if self.storage_fault.is_some() {
                 return InstallSnapshotResp {
                     term: self.current_term,
                     success: false,
@@ -1885,13 +1887,16 @@ impl ShardActor {
                 command_protocol: CURRENT_COMMAND_PROTOCOL,
             };
         }
-        // Recognize this leader for our term (or a newer one).
+        // Recognize this leader for our term (or a newer one). Stepping down is
+        // part of adopting the term, not a later step: every validation check
+        // below can return early, and a leader that kept `Role::Leader` while
+        // holding the newer term would keep broadcasting AppendEntries in a term
+        // it never won — two leaders in one term, both committing. `step_down`
+        // persists the hard state, durable before we answer this RPC (even on
+        // the reject paths below).
         if req.term > self.current_term {
-            self.current_term = req.term;
-            self.voted_for = None;
-            // Durable before we answer this RPC (even the reject path below).
-            if let Err(error) = self.persist_hard_state() {
-                self.fail_storage("persisting higher term from append leader", error);
+            self.step_down(req.term, None);
+            if self.storage_fault.is_some() {
                 return AppendEntriesResp {
                     term: self.current_term,
                     success: false,

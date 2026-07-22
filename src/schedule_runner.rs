@@ -208,14 +208,19 @@ async fn deliver(
     fire_id_ms: u64,
 ) -> (bool, u32, Option<String>) {
     let url = target_url(&schedule.target);
+    // Stored names are org-scoped (`\x01<org>\x01<name>`). The SOH delimiter is
+    // not a legal header byte, so a scoped name makes `HeaderValue` — and with it
+    // every delivery — fail before a socket opens; it is also not the name the
+    // caller created. Deliver the caller-facing name.
+    let name = unscoped_name(&schedule.name);
     let body = json!({
-        "schedule": schedule.name,
+        "schedule": name,
         "fire_id": fire_id_ms.to_string(),
         "fired_at_ms": fire_id_ms,
         "target": schedule.target,
     });
     let max_attempts = schedule.max_retries.saturating_add(1);
-    let idempotency_key = delivery_idempotency_key(&schedule.name, fire_id_ms);
+    let idempotency_key = delivery_idempotency_key(name, fire_id_ms);
     let mut attempts = 0u32;
     let mut last_error = None;
     while attempts < max_attempts {
@@ -223,7 +228,7 @@ async fn deliver(
         match http
             .post(&url)
             .header("Idempotency-Key", &idempotency_key)
-            .header("X-Fiducia-Schedule", &schedule.name)
+            .header("X-Fiducia-Schedule", name)
             .json(&body)
             .send()
             .await
@@ -257,6 +262,16 @@ async fn deliver(
         }
     }
     (false, attempts, last_error)
+}
+
+/// Strip the `\x01<org>\x01` namespace prefix a stored schedule name carries
+/// (see [`crate::org_scope`]), leaving the name the caller created. Returns the
+/// input unchanged when it is not scoped (legacy records).
+fn unscoped_name(name: &str) -> &str {
+    name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
+        .and_then(|rest| rest.split_once(fiducia_routing::ORG_SCOPE_DELIM))
+        .map(|(_, name)| name)
+        .unwrap_or(name)
 }
 
 fn delivery_idempotency_key(schedule_name: &str, fire_id_ms: u64) -> String {

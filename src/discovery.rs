@@ -166,6 +166,13 @@ async fn heartbeat(
     Path((service, id)): Path<(String, String)>,
     Json(body): Json<HeartbeatBody>,
 ) -> Response {
+    // A heartbeat re-stamps the registration's expiry, so it is bounded exactly
+    // like the register path is.
+    if let Some(ttl_ms) = body.ttl_ms {
+        if let Err(rejection) = crate::validate::ttl(ttl_ms) {
+            return rejection.into_response();
+        }
+    }
     let result = node
         .propose(Command::ServiceHeartbeat {
             service: org.scope(&service),

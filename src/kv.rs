@@ -631,7 +631,10 @@ fn validate_vault_address(raw: &str) -> Result<Url, KvCryptoError> {
     Ok(url)
 }
 
-fn cleartext_internal_host_allowed(host: &str) -> bool {
+/// Whether `host` names something inside the cluster's trust boundary. Vault
+/// uses it to permit cleartext HTTP to such a host; [`crate::schedule`] uses the
+/// same predicate with the opposite polarity, to refuse *delivering* to one.
+pub(crate) fn cleartext_internal_host_allowed(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if host == "localhost" || host.ends_with(".localhost") {
         return true;

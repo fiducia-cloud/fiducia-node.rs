@@ -173,7 +173,13 @@ fn parse_field(
         let mut v = lo;
         while v <= hi {
             values.push(v);
-            v += step;
+            // A caller-supplied step can be up to `u32::MAX`, which overflows the
+            // cursor on the first advance (panic in debug, wrap in release —
+            // an infinite loop). An overflow just means the range is exhausted.
+            let Some(next) = v.checked_add(step) else {
+                break;
+            };
+            v = next;
         }
     }
     Ok((values, restricted))
