@@ -107,6 +107,9 @@ async fn set(
     if let Err(rejection) = crate::validate::budget(&body.name, None, None) {
         return rejection.into_response();
     }
+    if let Err(rejection) = crate::validate::budget_amount(&body.limit) {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::BudgetSet {
             name: org.scope(&body.name),
@@ -127,6 +130,9 @@ async fn reserve(
     {
         return rejection.into_response();
     }
+    if let Err(rejection) = crate::validate::budget_amount(&body.amount) {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::BudgetReserve {
             name: org.scope(&body.name),
@@ -145,6 +151,9 @@ async fn commit(
     Json(body): Json<CommitBody>,
 ) -> Response {
     if let Err(rejection) = crate::validate::budget(&body.name, Some(&body.reservation_id), None) {
+        return rejection.into_response();
+    }
+    if let Err(rejection) = crate::validate::budget_amount(&body.actual) {
         return rejection.into_response();
     }
     let result = node

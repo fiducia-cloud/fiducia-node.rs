@@ -881,12 +881,14 @@ impl BarrierRecord {
             return BarrierStatus::Vetoed;
         }
         let count = self.arrivals.values().filter(|a| !a.veto).count() as u64;
+        // Weights are caller-supplied, so the tally saturates rather than
+        // wrapping: in release a wrap would silently *unsatisfy* a met barrier
+        // (and in debug it would panic inside `apply`, on every replica).
         let weight: u64 = self
             .arrivals
             .values()
             .filter(|a| !a.veto)
-            .map(|a| a.weight)
-            .sum();
+            .fold(0u64, |acc, a| acc.saturating_add(a.weight));
         let deadline_passed = self.deadline_ms.is_some_and(|deadline| now >= deadline);
 
         let met = match &self.policy {
@@ -1503,7 +1505,10 @@ impl DecisionRecord {
                 continue;
             }
             if let Some(option) = &vote.option {
-                *sums.entry(option.clone()).or_default() += vote.weight;
+                // Saturating: vote weights are caller-supplied, and a wrapped
+                // tally would hand the decision to the wrong option.
+                let sum = sums.entry(option.clone()).or_default();
+                *sum = sum.saturating_add(vote.weight);
             }
         }
         sums.into_iter().collect()
@@ -1685,11 +1690,12 @@ impl BudgetRecord {
     /// Budget consumed right now: held reservations block their full amount;
     /// committed ones consume only what was actually spent; released free it.
     fn consumed(&self) -> BudgetAmount {
+        // Saturating: reservation amounts are caller-supplied, and a wrapped sum
+        // would report a full budget as empty (or vice versa).
         let sum = |axis: fn(&BudgetAmount) -> Option<u64>| -> u64 {
             self.reservations
                 .values()
-                .map(|r| r.consumed_on(axis))
-                .sum()
+                .fold(0u64, |acc, r| acc.saturating_add(r.consumed_on(axis)))
         };
         BudgetAmount {
             usd_micros: Some(sum(|b| b.usd_micros)),
@@ -1704,8 +1710,9 @@ impl BudgetRecord {
             self.reservations
                 .values()
                 .filter(|r| r.status == ReservationStatus::Committed)
-                .map(|r| axis(&r.spent).unwrap_or(0))
-                .sum()
+                .fold(0u64, |acc, r| {
+                    acc.saturating_add(axis(&r.spent).unwrap_or(0))
+                })
         };
         BudgetAmount {
             usd_micros: Some(sum(|b| b.usd_micros)),
@@ -1941,6 +1948,15 @@ struct SemaphoreAcquireInput {
     legacy_semantics: bool,
 }
 
+/// How far above this shard's fencing counter a handoff's caller-supplied
+/// `from_token` may sit. Tokens are per-shard and a handoff may transfer a
+/// resource fenced on another shard, so a `from_token` ahead of this counter is
+/// legitimate — but it is also unauthenticated input that becomes the floor for
+/// the next mint, so an unbounded one (`u64::MAX`) would burn the whole token
+/// space in a single request and collapse every later token on the shard onto
+/// the same value. A billion is far beyond any real cross-shard skew.
+const MAX_HANDOFF_TOKEN_ADVANCE: u64 = 1_000_000_000;
+
 const CANCELLATION_TOMBSTONE_TTL_MS: u64 = crate::validate::MAX_TTL_MS;
 const MAX_CANCELLATION_TOMBSTONES_PER_TENANT: u32 = 10_000;
 const MAX_CANCELLATION_TOMBSTONES_TOTAL: usize = 250_000;
@@ -2145,9 +2161,23 @@ impl StateMachine {
         }
     }
 
+    /// Lock the store, recovering the guard from a poisoned mutex.
+    ///
+    /// One panic under the guard would otherwise poison the lock *forever*: every
+    /// later apply and every read on this shard would panic too, while
+    /// `CatchPanicLayer` keeps the process cheerfully answering 500s. Poisoning
+    /// says "state may be half-updated", which is exactly the state the shard is
+    /// in either way — refusing to look at it only converts one bad command into
+    /// a permanently dead shard. Take the inner guard and keep serving.
+    fn locked(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Serialize the complete applied state for Raft log compaction.
     pub fn snapshot(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         let payload = serde_json::to_vec(&*store)?;
         if store.command_protocol < CURRENT_COMMAND_PROTOCOL {
             return Ok(payload);
@@ -2180,12 +2210,12 @@ impl StateMachine {
         restored
             .validate_restored()
             .map_err(<serde_json::Error as serde::de::Error>::custom)?;
-        *self.store.lock().unwrap() = restored;
+        *self.locked() = restored;
         Ok(())
     }
 
     pub fn command_protocol(&self) -> u16 {
-        self.store.lock().unwrap().command_protocol
+        self.locked().command_protocol
     }
 
     #[allow(dead_code)]
@@ -2197,7 +2227,7 @@ impl StateMachine {
     /// entry. Replicas and restart recovery must pass the same value so leases,
     /// TTLs, refill windows, and deadlines cannot move when an entry is replayed.
     pub fn apply_at(&self, command: Command, proposed_at_ms: u64) -> ApplyResult {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.locked();
         let now = proposed_at_ms;
         let protocol_activation = matches!(command, Command::ActivateCommandProtocol { .. });
         // Recovery defense: builds that predate the explicit activation barrier
@@ -2676,14 +2706,12 @@ impl StateMachine {
 
     #[allow(dead_code)]
     pub fn revision(&self) -> u64 {
-        self.store.lock().unwrap().revision
+        self.locked().revision
     }
 
     pub fn kv_get(&self, key: &str) -> Option<KvEntry> {
         let now = now_ms();
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .kv
             .get(key)
             .filter(|entry| entry.expires_at_ms.is_none_or(|expires| expires > now))
@@ -2692,12 +2720,12 @@ impl StateMachine {
 
     /// Read a counter's current value and revision. Counters do not expire.
     pub fn counter_get(&self, key: &str) -> Option<CounterEntry> {
-        self.store.lock().unwrap().counters.get(key).cloned()
+        self.locked().counters.get(key).cloned()
     }
 
     /// Read a barrier's current state, with its status derived at `now`.
     pub fn barrier_get(&self, name: &str) -> Option<BarrierState> {
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         store
             .barriers
             .get(name)
@@ -2706,9 +2734,7 @@ impl StateMachine {
 
     /// Read a durable task's current state.
     pub fn task_get(&self, name: &str) -> Option<TaskState> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .tasks
             .get(name)
             .map(|record| record.view(name))
@@ -2716,9 +2742,7 @@ impl StateMachine {
 
     /// Read an approval-escrow effect's current state.
     pub fn effect_get(&self, name: &str) -> Option<EffectState> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .effects
             .get(name)
             .map(|record| record.view(name))
@@ -2726,7 +2750,7 @@ impl StateMachine {
 
     /// Read an ownership handoff's current state.
     pub fn handoff_get(&self, name: &str) -> Option<HandoffState> {
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         store
             .handoffs
             .get(name)
@@ -2735,7 +2759,7 @@ impl StateMachine {
 
     /// Read a decision's current state, with its outcome derived at `now`.
     pub fn decision_get(&self, name: &str) -> Option<DecisionState> {
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         store
             .decisions
             .get(name)
@@ -2744,9 +2768,7 @@ impl StateMachine {
 
     /// Read a budget's ceiling, consumption, and reservations.
     pub fn budget_get(&self, name: &str) -> Option<BudgetState> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .budgets
             .get(name)
             .map(|record| record.view(name))
@@ -2754,9 +2776,7 @@ impl StateMachine {
 
     /// Read a claim's current state.
     pub fn claim_get(&self, name: &str) -> Option<ClaimState> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .claims
             .get(name)
             .map(|record| record.view(name))
@@ -2764,7 +2784,7 @@ impl StateMachine {
 
     pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, KvEntry)> {
         let now = now_ms();
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         let mut entries: Vec<_> = store
             .kv
             .iter()
@@ -2778,28 +2798,20 @@ impl StateMachine {
     }
 
     pub fn lock_get(&self, key: &str) -> LockState {
-        self.store
-            .lock()
-            .unwrap()
-            .lock_snapshot_live_at(key, now_ms())
+        self.locked().lock_snapshot_live_at(key, now_ms())
     }
 
     pub fn semaphore_get(&self, key: &str) -> SemaphoreState {
-        self.store
-            .lock()
-            .unwrap()
-            .semaphore_snapshot_live_at(key, now_ms())
+        self.locked().semaphore_snapshot_live_at(key, now_ms())
     }
 
     pub fn rate_limit_get(&self, tenant: &str, key: &str) -> Option<RateLimitSnapshot> {
-        self.store.lock().unwrap().rate_limit_snapshot(tenant, key)
+        self.locked().rate_limit_snapshot(tenant, key)
     }
 
     pub fn idempotency_get(&self, key: &str) -> Option<IdempotencyRecord> {
         let now = now_ms();
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .idempotency
             .get(key)
             .filter(|record| record.lease_expires_ms > now)
@@ -2808,9 +2820,7 @@ impl StateMachine {
 
     pub fn election_get(&self, name: &str) -> Option<Leadership> {
         let now = now_ms();
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .elections
             .get(name)
             .filter(|leadership| leadership.lease_expires_ms > now)
@@ -2818,18 +2828,14 @@ impl StateMachine {
     }
 
     pub fn schedule_get(&self, name: &str) -> Option<Schedule> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .schedules
             .get(name)
             .map(|record| record.definition.clone())
     }
 
     pub fn schedule_history(&self, name: &str) -> Vec<ScheduleRun> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .schedules
             .get(name)
             .map(|record| record.history.clone())
@@ -2838,9 +2844,7 @@ impl StateMachine {
 
     /// Every schedule definition on this shard (for the firing loop to scan).
     pub fn schedule_list(&self) -> Vec<Schedule> {
-        self.store
-            .lock()
-            .unwrap()
+        self.locked()
             .schedules
             .values()
             .map(|record| record.definition.clone())
@@ -2849,7 +2853,7 @@ impl StateMachine {
 
     pub fn service_list(&self, service: &str) -> Vec<ServiceInstance> {
         let now = now_ms();
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         store
             .services
             .get(service)
@@ -2868,7 +2872,7 @@ impl StateMachine {
     /// across shards and merge.
     pub fn kv_list(&self, prefix: &str) -> Vec<KvListItem> {
         let now = now_ms();
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         store
             .kv
             .iter()
@@ -2886,7 +2890,7 @@ impl StateMachine {
     /// live-instance count. Callers fan this out across shards and sum.
     pub fn service_names(&self) -> Vec<ServiceSummary> {
         let now = now_ms();
-        let store = self.store.lock().unwrap();
+        let store = self.locked();
         store
             .services
             .iter()
@@ -2910,41 +2914,42 @@ impl StateMachine {
     /// token and the queue by request time, so output is deterministic for
     /// tests/diffs.
     pub fn lock_inventory(&self) -> LockInventory {
-        self.store.lock().unwrap().lock_inventory_live_at(now_ms())
+        self.locked().lock_inventory_live_at(now_ms())
     }
 
     /// A snapshot of every counting semaphore on this shard (holders, free
     /// permits, wait queue). Sorted by key for deterministic output.
     pub fn semaphore_inventory(&self) -> Vec<SemaphoreState> {
-        self.store
-            .lock()
-            .unwrap()
-            .semaphore_inventory_live_at(now_ms())
+        self.locked().semaphore_inventory_live_at(now_ms())
     }
 
     /// Every named election with live leadership on this shard, sorted by name.
     /// Callers fan this out across shards (elections route by name) and merge.
     pub fn election_inventory(&self) -> Vec<ElectionEntry> {
-        self.store
-            .lock()
-            .unwrap()
-            .election_inventory_live_at(now_ms())
+        self.locked().election_inventory_live_at(now_ms())
     }
 }
 
 impl Store {
-    fn next_token(&mut self) -> u64 {
-        self.next_fencing_token = self.next_fencing_token.saturating_add(1);
-        self.next_fencing_token
+    /// Mint the next fencing token, or `None` once the counter is exhausted.
+    ///
+    /// Fail-closed on purpose: a saturating counter would hand every subsequent
+    /// caller the *same* `u64::MAX`, and two holders with equal tokens is exactly
+    /// the split-brain fencing exists to prevent. Refusing the acquisition keeps
+    /// tokens strictly increasing; callers surface it as a failed operation.
+    fn next_token(&mut self) -> Option<u64> {
+        self.next_fencing_token = self.next_fencing_token.checked_add(1)?;
+        Some(self.next_fencing_token)
     }
 
     /// Mint a fencing token strictly greater than `floor`, advancing this shard's
     /// counter so every later token also exceeds it. Used by handoffs, whose new
     /// owner's token must beat the `from_token` the previous owner presented even
-    /// when that token was minted on a different shard's counter.
-    fn mint_token_above(&mut self, floor: u64) -> u64 {
-        self.next_fencing_token = self.next_fencing_token.max(floor).saturating_add(1);
-        self.next_fencing_token
+    /// when that token was minted on a different shard's counter. `None` when the
+    /// counter is exhausted (see [`Store::next_token`]).
+    fn mint_token_above(&mut self, floor: u64) -> Option<u64> {
+        self.next_fencing_token = self.next_fencing_token.max(floor).checked_add(1)?;
+        Some(self.next_fencing_token)
     }
 
     /// The highest fencing token referenced anywhere in this state — the floor
@@ -3297,7 +3302,9 @@ impl Store {
     }
 
     fn apply_task_claim(&mut self, now: u64, name: String, worker: String, ttl_ms: u64) -> Value {
-        let token = self.next_token();
+        let Some(token) = self.next_token() else {
+            return json!({ "ok": false, "reason": "fencing_tokens_exhausted" });
+        };
         let Some(record) = self.tasks.get_mut(&name) else {
             return json!({ "ok": false, "reason": "not_found" });
         };
@@ -3506,6 +3513,19 @@ impl Store {
         context: Value,
         ttl_ms: u64,
     ) -> Value {
+        // `from_token` is caller-supplied and becomes the floor for the token the
+        // acceptor is minted, so an unbounded one drags `next_fencing_token`
+        // arbitrarily far forward — at `u64::MAX` every later mint on the shard
+        // collides on one value and fencing stops fencing. A cross-shard token
+        // may legitimately lead this shard's counter, so bound the lead rather
+        // than requiring one this shard issued.
+        if from_token
+            > self
+                .next_fencing_token
+                .saturating_add(MAX_HANDOFF_TOKEN_ADVANCE)
+        {
+            return json!({ "ok": false, "reason": "implausible_from_token" });
+        }
         // A pending offer for this name cannot be replaced; resolve it first.
         if let Some(existing) = self.handoffs.get(&name) {
             if existing.effective_status(now) == HandoffStatus::Offered {
@@ -3544,7 +3564,9 @@ impl Store {
         // Mint a token strictly above `from_token`. Fencing tokens are per-shard,
         // and the handoff may live on a different shard than the resource, so we
         // cannot rely on this shard's counter already exceeding `from_token`.
-        let token = self.mint_token_above(from_token);
+        let Some(token) = self.mint_token_above(from_token) else {
+            return json!({ "ok": false, "reason": "fencing_tokens_exhausted" });
+        };
         let record = self.handoffs.get_mut(&name).expect("handoff present");
         record.status = HandoffStatus::Accepted;
         record.to_token = Some(token);
@@ -3908,7 +3930,16 @@ impl Store {
         let blocked_by_queue = keys.iter().any(|k| reserved.contains(k.as_str()));
 
         if !blocked_by_held && !blocked_by_queue {
-            let token = self.next_token();
+            let Some(token) = self.next_token() else {
+                return json!({
+                    "acquired": false,
+                    "queued": false,
+                    "reason": "fencing_tokens_exhausted",
+                    "keys": keys,
+                    "holder": holder,
+                    "revision": revision,
+                });
+            };
             let lease_expires_ms = now.saturating_add(ttl_ms);
             self.install_grant(LockGrant {
                 holder: holder.clone(),
@@ -4196,8 +4227,12 @@ impl Store {
     fn lock_promote(&mut self, now: u64) -> Vec<Value> {
         let mut promoted = Vec::new();
         while let Some(id) = self.lock_first_grantable() {
+            // Mint before dequeuing: an exhausted counter must leave the waiter
+            // in line rather than dropping it.
+            let Some(token) = self.next_token() else {
+                break;
+            };
             let waiter = self.locks.queue.remove(&id).expect("key from scan");
-            let token = self.next_token();
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
             promoted.push(json!({
                 "holder": waiter.holder,
@@ -4319,7 +4354,16 @@ impl Store {
         let has_capacity = (sem.holders.len() as u32) < sem.limit;
         let queue_empty = sem.queue.is_empty();
         if has_capacity && queue_empty {
-            let token = self.next_token();
+            let Some(token) = self.next_token() else {
+                return json!({
+                    "acquired": false,
+                    "queued": false,
+                    "reason": "fencing_tokens_exhausted",
+                    "key": key,
+                    "holder": holder,
+                    "revision": revision,
+                });
+            };
             let lease_expires_ms = now.saturating_add(ttl_ms);
             let sem = self.semaphores.get_mut(&key).expect("just inserted");
             sem.holders.push(SemaphoreSlot {
@@ -4554,7 +4598,10 @@ impl Store {
             if (sem.holders.len() as u32) >= sem.limit || sem.queue.is_empty() {
                 break;
             }
-            let token = self.next_token();
+            // Mint before popping, so an exhausted counter leaves the waiter queued.
+            let Some(token) = self.next_token() else {
+                break;
+            };
             let sem = self.semaphores.get_mut(key).expect("checked above");
             let (_, waiter) = sem.queue.pop_front().expect("non-empty checked");
             let lease_expires_ms = now.saturating_add(waiter.ttl_ms);
@@ -4613,7 +4660,12 @@ impl Store {
                 let refill =
                     refill_per_second.unwrap_or(limit as f64 / (window_ms.max(1) as f64 / 1000.0));
                 let elapsed = now.saturating_sub(record.updated_ms) as f64 / 1000.0;
-                record.tokens = (record.tokens + elapsed * refill).min(limit as f64);
+                // Clamp, never just `min`: a non-finite accumulator (from a
+                // legacy log entry whose `refill_per_second` predates
+                // `validate::rate_limit_params`) serializes as JSON `null`, and
+                // the shard's next snapshot would then fail to restore — breaking
+                // compaction, InstallSnapshot, and boot recovery.
+                record.tokens = clamp_tokens(record.tokens + elapsed * refill, limit);
                 record.updated_ms = now;
                 if record.tokens >= cost as f64 {
                     record.tokens -= cost as f64;
@@ -4690,7 +4742,9 @@ impl Store {
             });
         }
 
-        let token = self.next_token();
+        let Some(token) = self.next_token() else {
+            return json!({ "claimed": false, "duplicate": false, "reason": "fencing_tokens_exhausted", "revision": revision });
+        };
         // Held only for the short in-flight window while `Claimed`; `complete`
         // extends it to `retention_ms`. A retention shorter than the in-flight
         // lease would let a completed record expire early, so floor it at `ttl_ms`.
@@ -4972,7 +5026,9 @@ impl Store {
             }
             return json!({ "won": false, "name": name, "leader": existing });
         }
-        let token = self.next_token();
+        let Some(token) = self.next_token() else {
+            return json!({ "won": false, "name": name, "reason": "fencing_tokens_exhausted", "revision": revision });
+        };
         let leadership = Leadership {
             leader: candidate.clone(),
             fencing_token: token,
@@ -5228,6 +5284,16 @@ impl Store {
             reset_ms: record.updated_ms.saturating_add(record.window_ms),
         })
     }
+}
+
+/// Force a token-bucket level into `0.0..=limit`, mapping NaN/±inf to a finite
+/// value. Only finite floats survive a JSON round trip, and the limiter record
+/// is snapshot state.
+fn clamp_tokens(tokens: f64, limit: u32) -> f64 {
+    if tokens.is_nan() {
+        return 0.0;
+    }
+    tokens.clamp(0.0, limit as f64)
 }
 
 fn rate_limit_store_key(tenant: &str, key: &str) -> String {

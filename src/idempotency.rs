@@ -119,6 +119,17 @@ async fn claim(
         Ok(ttl_ms) => ttl_ms,
         Err(reason) => return bad_request(reason),
     };
+    // Both windows set a record expiry (`retention_ms` is the one a *completed*
+    // record lives for), so both need a ceiling — an unbounded one saturates
+    // into a replicated record that never expires.
+    if let Err(rejection) = crate::validate::idempotency_ttl("ttl_ms", ttl_ms) {
+        return rejection.into_response();
+    }
+    if let Some(retention_ms) = body.retention_ms {
+        if let Err(rejection) = crate::validate::idempotency_ttl("retention_ms", retention_ms) {
+            return rejection.into_response();
+        }
+    }
     let result = node
         .propose(Command::IdempotencyClaim {
             key: org.scope(&body.key),
@@ -143,6 +154,9 @@ async fn renew(
         Ok(ttl_ms) => ttl_ms,
         Err(reason) => return bad_request(reason),
     };
+    if let Err(rejection) = crate::validate::idempotency_ttl("ttl_ms", ttl_ms) {
+        return rejection.into_response();
+    }
     let result = node
         .propose(Command::IdempotencyRenew {
             key: org.scope(&body.key),

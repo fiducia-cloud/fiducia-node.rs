@@ -122,7 +122,7 @@ async fn vote(
     uri: Uri,
     Json(body): Json<VoteBody>,
 ) -> Response {
-    if let Err(rejection) = crate::validate::decision(&body.name, Some(&body.voter)) {
+    if let Err(rejection) = crate::validate::decision_vote(&body.name, &body.voter, body.weight) {
         return rejection.into_response();
     }
     let result = node

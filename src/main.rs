@@ -41,7 +41,8 @@ mod validate;
 
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -198,7 +199,23 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }
 
+/// How long one `/readyz` evaluation is reused.
+///
+/// `/readyz` is mounted outside the internal-auth guard — probes must reach it
+/// unauthenticated — and every evaluation fans a `Status` message out to *every*
+/// shard actor, whose inboxes are the same ones client writes queue on. Without
+/// a cache an unauthenticated flood is a write-latency lever. Probe intervals
+/// are seconds, so a one-second cache is free readiness accuracy-wise and makes
+/// the endpoint O(1) in request rate.
+const READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Last computed readiness answer: (when it was computed, status, body).
+static READINESS_CACHE: Mutex<Option<(Instant, StatusCode, Value)>> = Mutex::new(None);
+
 async fn readiness(State(node): State<Arc<Node>>) -> Response {
+    if let Some((status_code, body)) = cached_readiness(Instant::now()) {
+        return (status_code, Json(body)).into_response();
+    }
     let status = node.status().await;
     let (ready, all_shards_running, storage_faulted_shards) = readiness_state(&status);
     let status_code = if ready {
@@ -206,17 +223,32 @@ async fn readiness(State(node): State<Arc<Node>>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (
-        status_code,
-        Json(json!({
-            "status": if ready { "ok" } else { "unavailable" },
-            "service": SERVICE,
-            "all_shards_running": all_shards_running,
-            "unresponsive_shards": status.unresponsive_shards,
-            "storage_faulted_shards": storage_faulted_shards,
-        })),
-    )
-        .into_response()
+    let body = json!({
+        "status": if ready { "ok" } else { "unavailable" },
+        "service": SERVICE,
+        "all_shards_running": all_shards_running,
+        "unresponsive_shards": status.unresponsive_shards,
+        "storage_faulted_shards": storage_faulted_shards,
+    });
+    store_readiness(Instant::now(), status_code, body.clone());
+    (status_code, Json(body)).into_response()
+}
+
+/// The cached answer, if one was computed within [`READINESS_CACHE_TTL`] of `now`.
+fn cached_readiness(now: Instant) -> Option<(StatusCode, Value)> {
+    let cache = READINESS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .as_ref()
+        .filter(|(computed_at, _, _)| now.duration_since(*computed_at) < READINESS_CACHE_TTL)
+        .map(|(_, status_code, body)| (*status_code, body.clone()))
+}
+
+fn store_readiness(now: Instant, status_code: StatusCode, body: Value) {
+    *READINESS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((now, status_code, body));
 }
 
 fn readiness_state(status: &consensus::NodeStatus) -> (bool, bool, Vec<consensus::ShardId>) {

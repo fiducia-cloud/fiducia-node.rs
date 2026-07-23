@@ -46,6 +46,15 @@ pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = MAX_TTL_MS;
 /// Sanity ceiling on a semaphore's concurrent-holder limit.
 pub const MAX_SEMAPHORE_LIMIT: u32 = 1_000_000;
+/// Sanity ceiling on one barrier arrival's / one vote's weight. Weights are
+/// summed across participants, so an unbounded one overflows the tally — which
+/// in release wraps (no `overflow-checks`) and resolves the barrier/decision the
+/// wrong way. A trillion is far past any real weighting scheme, and 2^64 / this
+/// leaves room for millions of participants before saturation can bite.
+pub const MAX_WEIGHT: u64 = 1_000_000_000_000;
+/// Sanity ceiling on one budget axis (usd_micros / tokens / tool_calls) in a
+/// single limit, reservation, or commit. Summed like weights, same reasoning.
+pub const MAX_BUDGET_AMOUNT: u64 = 1_000_000_000_000_000;
 /// Max key/value pairs in a metadata map (discovery / election candidate facts).
 pub const MAX_METADATA_ENTRIES: usize = 64;
 /// Max bytes for a single metadata key.
@@ -56,6 +65,13 @@ pub const MAX_METADATA_VALUE_BYTES: usize = 4096;
 /// tenant+key becomes a long-lived limiter bucket (a map entry), so an unbounded
 /// value is both a memory-growth vector and a way to mint arbitrary bucket names.
 pub const MAX_RATE_LIMIT_SEGMENT_BYTES: usize = 256;
+/// Sanity ceiling on a limiter's `limit` and a request's `cost`. A sliding
+/// window stores one timestamp per unit of cost, so `cost: u32::MAX` is a ~34 GB
+/// replicated allocation — made *after* commit, on every replica, and again on
+/// every log replay at restart. Mirrors [`MAX_SEMAPHORE_LIMIT`].
+pub const MAX_RATE_LIMIT_LIMIT: u32 = 1_000_000;
+/// Sanity ceiling on one request's quota cost (see [`MAX_RATE_LIMIT_LIMIT`]).
+pub const MAX_RATE_LIMIT_COST: u32 = 1_000_000;
 
 /// A rejected write. Renders as `400 Bad Request` with a stable machine code and
 /// a human-readable detail, matching the node's other error bodies.
@@ -141,6 +157,38 @@ fn check_ttl(ttl_ms: u64) -> Result<(), Rejection> {
         ));
     }
     Ok(())
+}
+
+/// Max idempotency-key lifetime: 30d. Deliberately looser than [`MAX_TTL_MS`] —
+/// a dedupe window of days is the normal case for webhook/API replay protection
+/// (`ttl: "7d"` is a documented value) — but still a ceiling, so a claim cannot
+/// pin a replicated record forever.
+pub const MAX_IDEMPOTENCY_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Validate an idempotency in-flight lease or retention window.
+pub fn idempotency_ttl(label: &str, ttl_ms: u64) -> Result<(), Rejection> {
+    if ttl_ms == 0 {
+        return Err(Rejection::new(
+            "invalid_ttl",
+            format!("{label} must be greater than zero"),
+        ));
+    }
+    if ttl_ms > MAX_IDEMPOTENCY_TTL_MS {
+        return Err(Rejection::new(
+            "ttl_too_large",
+            format!("{label} exceeds the {MAX_IDEMPOTENCY_TTL_MS} ms (30d) ceiling"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a lease TTL on its own, for the renew/heartbeat/claim paths that
+/// extend an existing lease rather than create one. The ceiling is only a
+/// ceiling if *every* path that sets an expiry enforces it — otherwise a create
+/// at 24h followed by a renew at `u64::MAX` saturates to a lease that never
+/// expires, which is exactly what [`MAX_TTL_MS`] exists to prevent.
+pub fn ttl(ttl_ms: u64) -> Result<(), Rejection> {
+    check_ttl(ttl_ms)
 }
 
 fn check_wait_timeout(wait_timeout_ms: u64) -> Result<(), Rejection> {
@@ -339,10 +387,22 @@ pub fn barrier(name: &str) -> Result<(), Rejection> {
     check_str("barrier name", name, MAX_NAME_BYTES, false)
 }
 
-/// Validate a barrier arrival: name plus the arriving participant id.
-pub fn barrier_arrive(name: &str, participant: &str) -> Result<(), Rejection> {
+/// Validate a barrier arrival: name, the arriving participant id, and the weight
+/// that is summed into the barrier's quorum tally.
+pub fn barrier_arrive(name: &str, participant: &str, weight: u64) -> Result<(), Rejection> {
     check_str("barrier name", name, MAX_NAME_BYTES, false)?;
-    check_str("participant", participant, MAX_HOLDER_BYTES, false)
+    check_str("participant", participant, MAX_HOLDER_BYTES, false)?;
+    check_weight(weight)
+}
+
+fn check_weight(weight: u64) -> Result<(), Rejection> {
+    if weight > MAX_WEIGHT {
+        return Err(Rejection::new(
+            "weight_too_large",
+            format!("weight {weight} exceeds {MAX_WEIGHT}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a task name, and a worker id when the operation names one.
@@ -382,6 +442,24 @@ pub fn budget(
     Ok(())
 }
 
+/// Validate one budget amount (a limit, a reservation, or a commit). Each axis
+/// is summed across reservations, so each axis needs its own ceiling.
+pub fn budget_amount(amount: &crate::state::BudgetAmount) -> Result<(), Rejection> {
+    for (label, value) in [
+        ("usd_micros", amount.usd_micros),
+        ("tokens", amount.tokens),
+        ("tool_calls", amount.tool_calls),
+    ] {
+        if value.is_some_and(|value| value > MAX_BUDGET_AMOUNT) {
+            return Err(Rejection::new(
+                "amount_too_large",
+                format!("{label} exceeds {MAX_BUDGET_AMOUNT}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a claim name plus an actor id (author/agent) when named.
 pub fn claim(name: &str, actor: Option<&str>) -> Result<(), Rejection> {
     check_str("claim name", name, MAX_NAME_BYTES, false)?;
@@ -400,6 +478,13 @@ pub fn decision(name: &str, voter: Option<&str>) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// Validate a cast vote: the decision, the voter, and the weight that is summed
+/// into the per-option tally.
+pub fn decision_vote(name: &str, voter: &str, weight: u64) -> Result<(), Rejection> {
+    decision(name, Some(voter))?;
+    check_weight(weight)
+}
+
 /// Validate an effect name, and a principal id when the operation names one.
 pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
     check_str("effect name", name, MAX_NAME_BYTES, false)?;
@@ -416,6 +501,58 @@ pub fn effect(name: &str, principal: Option<&str>) -> Result<(), Rejection> {
 pub fn rate_limit(tenant: &str, key: &str) -> Result<(), Rejection> {
     check_path_segment("tenant", tenant)?;
     check_path_segment("key", key)?;
+    Ok(())
+}
+
+/// Validate the numeric body of a rate-limit check. Every one of these lands in
+/// the replicated limiter record: `limit`/`cost` size a `VecDeque` allocation,
+/// `window_ms` is a divisor, and `refill_per_second` feeds a float accumulator
+/// whose non-finite result would serialize as JSON `null` and break every later
+/// snapshot/restore for the shard.
+pub fn rate_limit_params(
+    limit: u32,
+    window_ms: u64,
+    cost: u32,
+    refill_per_second: Option<f64>,
+) -> Result<(), Rejection> {
+    if limit == 0 {
+        return Err(Rejection::new(
+            "invalid_limit",
+            "rate limit must be greater than zero",
+        ));
+    }
+    if limit > MAX_RATE_LIMIT_LIMIT {
+        return Err(Rejection::new(
+            "limit_too_large",
+            format!("rate limit {limit} exceeds {MAX_RATE_LIMIT_LIMIT}"),
+        ));
+    }
+    if window_ms == 0 {
+        return Err(Rejection::new(
+            "invalid_window",
+            "window_ms must be greater than zero",
+        ));
+    }
+    if cost == 0 {
+        return Err(Rejection::new(
+            "invalid_cost",
+            "cost must be greater than zero",
+        ));
+    }
+    if cost > MAX_RATE_LIMIT_COST {
+        return Err(Rejection::new(
+            "cost_too_large",
+            format!("cost {cost} exceeds {MAX_RATE_LIMIT_COST}"),
+        ));
+    }
+    if let Some(refill) = refill_per_second {
+        if !refill.is_finite() || refill <= 0.0 {
+            return Err(Rejection::new(
+                "invalid_refill",
+                "refill_per_second must be a finite number greater than zero",
+            ));
+        }
+    }
     Ok(())
 }
 

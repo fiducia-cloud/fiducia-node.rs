@@ -69,6 +69,9 @@ async fn upsert(
                 .into_response();
         }
     }
+    if let Err(error) = validate_target(&body.target) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
+    }
 
     let result = node
         .propose(Command::ScheduleUpsert {
@@ -147,6 +150,43 @@ async fn history(
         Err(err) => read_error_response(err, &uri),
         _ => Json(json!({ "error": "unavailable" })).into_response(),
     }
+}
+
+/// Max bytes for a delivery target URL — it is replicated and kept forever.
+const MAX_TARGET_BYTES: usize = 2048;
+
+/// Bound where a fire may be delivered.
+///
+/// The firing loop POSTs to this URL *from inside the cluster*, so an unchecked
+/// caller-supplied target turns the node into an SSRF proxy: cloud metadata
+/// (`169.254.169.254`), a peer's admin port, or any in-namespace service. All
+/// three target kinds are delivered over HTTP (see
+/// [`crate::schedule_runner::target_url`]), so all three are checked the same
+/// way: a parseable, credential-free `http`/`https` URL whose host is *outside*
+/// the trust boundary — the same scheme/host allow-list Vault addresses use
+/// ([`crate::kv::cleartext_internal_host_allowed`]), inverted, because here an
+/// internal host is the attack rather than the permitted case.
+fn validate_target(target: &ScheduleTarget) -> Result<(), &'static str> {
+    let raw = match target {
+        ScheduleTarget::Webhook { url } => url,
+        ScheduleTarget::Queue { name } => name,
+        ScheduleTarget::Grpc { endpoint } => endpoint,
+    };
+    if raw.len() > MAX_TARGET_BYTES {
+        return Err("target_too_long");
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| "invalid_target_url")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("target_scheme_not_allowed");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("target_must_not_carry_credentials");
+    }
+    let host = url.host_str().ok_or("target_must_include_a_host")?;
+    if crate::kv::cleartext_internal_host_allowed(host) {
+        return Err("target_host_not_allowed");
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
