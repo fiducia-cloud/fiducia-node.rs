@@ -4,7 +4,7 @@
 # The crate has path dependencies on sibling Fiducia crates, so the build stage
 # clones those siblings before compiling. This keeps the local path-dependency
 # workflow intact while producing a self-contained image.
-FROM rust:1.97.0-slim-bookworm@sha256:6d220bf85c74e842a79da63997af8d2e74455c0b8847d8bb3a5888572334991d AS build
+FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
