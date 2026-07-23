@@ -70,7 +70,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 // authenticated by the internal-secret guard before JSON extraction.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    fiducia_telemetry::init(SERVICE);
+    let _telemetry = fiducia_telemetry::init(SERVICE);
 
     // Bootstrap this node. Single-node by default; FIDUCIA_PEERS / shard count
     // come from the environment (see consensus::NodeConfig).
