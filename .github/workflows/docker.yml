@@ -20,11 +20,11 @@ jobs:
       contents: read
       packages: write # Required only to publish this commit-SHA image to GHCR.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+      - uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -35,8 +35,8 @@ jobs:
           push: true
           pull: true
           build-args: |
-            INTERFACES_REF=6e20a3f4df2e52b99a0ad6add83d4528262b5dbc
-            ROUTING_REF=543b4ea3b3bba28b66c15a97a27514488d2ccce3
+            INTERFACES_REF=2c5c806174e067fbe83ad48b724366323ba390a2
+            ROUTING_REF=c694bc5c58587bec12989a347e926c0040aacada
           provenance: mode=max
           sbom: true
           tags: |

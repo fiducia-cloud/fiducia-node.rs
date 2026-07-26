@@ -4,12 +4,12 @@
 # The crate has path dependencies on sibling Fiducia crates, so the build stage
 # clones those siblings before compiling. This keeps the local path-dependency
 # workflow intact while producing a self-contained image.
-FROM rust:1.97.0-slim-bookworm@sha256:6d220bf85c74e842a79da63997af8d2e74455c0b8847d8bb3a5888572334991d AS build
+FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
-ARG ROUTING_REF=543b4ea3b3bba28b66c15a97a27514488d2ccce3
-ARG INTERFACES_REF=6e20a3f4df2e52b99a0ad6add83d4528262b5dbc
+ARG ROUTING_REF=c694bc5c58587bec12989a347e926c0040aacada
+ARG INTERFACES_REF=2c5c806174e067fbe83ad48b724366323ba390a2
 RUN git init fiducia-routing.rs \
     && cd fiducia-routing.rs \
     && git remote add origin https://github.com/fiducia-cloud/fiducia-routing.rs.git \
@@ -26,7 +26,7 @@ COPY . fiducia-node.rs
 WORKDIR /build/fiducia-node.rs
 RUN cargo build --release --locked && strip target/release/fiducia-node
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 COPY --from=build --chown=65532:65532 /build/fiducia-node.rs/target/release/fiducia-node /usr/local/bin/fiducia-node
 EXPOSE 8090 9090
 USER 65532:65532
