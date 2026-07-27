@@ -49,8 +49,21 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Evaluate and build flake checks
-        run: nix flake check --show-trace
+      - name: Check Nix formatting
+        run: nix develop -c nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
+
+      - name: Check agent shell
+        run: |
+          nix develop -c shellcheck .nix/agent-check.sh
+          nix develop -c shfmt -d .nix/agent-check.sh
+
+      - name: Check GitHub Actions
+        run: nix develop -c actionlint .github/workflows/ci.yml .github/workflows/cli-flags.yml .github/workflows/docker.yml .github/workflows/nix.yml
+
+      - name: Evaluate root and compatibility flakes
+        run: |
+          nix flake check --show-trace
+          nix flake check ./.nix --show-trace
 
       - name: Run the standalone-clone agent contract
         run: nix develop -c agent-check
