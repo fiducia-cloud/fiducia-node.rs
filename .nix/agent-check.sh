@@ -15,6 +15,11 @@ export CARGO_HOME="${CARGO_HOME:-$cache_root/cargo}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$cache_root/cargo-target}"
 mkdir -p "$XDG_CACHE_HOME" "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
+routing_ref="c694bc5c58587bec12989a347e926c0040aacada"
+interfaces_ref="2c5c806174e067fbe83ad48b724366323ba390a2"
+workspace_root="$cache_root/workspaces/fiducia-node-${routing_ref:0:12}-${interfaces_ref:0:12}"
+node_checkout="$workspace_root/fiducia-node.rs"
+
 run_preflight() {
 	git diff --check
 	nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
@@ -35,6 +40,10 @@ run_rust_toolchain() {
 	export RUSTUP_TOOLCHAIN=1.95.0
 	rustc --version
 	cargo --version
+}
+
+activate_rust_toolchain() {
+	export RUSTUP_TOOLCHAIN=1.95.0
 }
 
 ensure_checkout() {
@@ -60,13 +69,7 @@ ensure_checkout() {
 	fi
 }
 
-run_workspace() {
-	local routing_ref="c694bc5c58587bec12989a347e926c0040aacada"
-	local interfaces_ref="2c5c806174e067fbe83ad48b724366323ba390a2"
-	local workspace_root="$cache_root/workspaces/fiducia-node-${routing_ref:0:12}-${interfaces_ref:0:12}"
-	local node_checkout="$workspace_root/fiducia-node.rs"
-
-	export RUSTUP_TOOLCHAIN=1.95.0
+prepare_workspace() {
 	mkdir -p "$node_checkout"
 	rsync \
 		--archive \
@@ -85,7 +88,46 @@ run_workspace() {
 		"$workspace_root/fiducia-interfaces" \
 		"https://github.com/fiducia-cloud/fiducia-interfaces.git" \
 		"$interfaces_ref"
+}
 
+run_flags() {
+	prepare_workspace
+	cd "$node_checkout"
+	make -B -C vendor/flags-2-env all
+	vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+}
+
+run_fmt() {
+	activate_rust_toolchain
+	prepare_workspace
+	cd "$node_checkout"
+	cargo fmt --all -- --check
+}
+
+run_clippy() {
+	activate_rust_toolchain
+	prepare_workspace
+	cd "$node_checkout"
+	cargo clippy --all-targets --all-features --locked -- -D warnings
+}
+
+run_tests() {
+	activate_rust_toolchain
+	prepare_workspace
+	cd "$node_checkout"
+	cargo test --all-targets --all-features --locked
+}
+
+run_audit() {
+	activate_rust_toolchain
+	prepare_workspace
+	cd "$node_checkout"
+	cargo audit
+}
+
+run_workspace() {
+	activate_rust_toolchain
+	prepare_workspace
 	cd "$node_checkout"
 	make -B -C vendor/flags-2-env all
 	vendor/flags-2-env/build/flags2env audit .cli-flags.toml
@@ -102,6 +144,24 @@ preflight)
 rust)
 	run_rust_toolchain
 	;;
+bootstrap)
+	prepare_workspace
+	;;
+flags)
+	run_flags
+	;;
+fmt)
+	run_fmt
+	;;
+clippy)
+	run_clippy
+	;;
+test)
+	run_tests
+	;;
+audit)
+	run_audit
+	;;
 workspace)
 	run_workspace
 	;;
@@ -111,7 +171,7 @@ all)
 	run_workspace
 	;;
 *)
-	printf 'usage: agent-check [all|preflight|rust|workspace]\n' >&2
+	printf 'usage: agent-check [all|preflight|rust|bootstrap|flags|fmt|clippy|test|audit|workspace]\n' >&2
 	exit 64
 	;;
 esac
