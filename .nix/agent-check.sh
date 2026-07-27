@@ -19,14 +19,11 @@ git diff --check
 nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
 shellcheck .nix/agent-check.sh
 shfmt -d .nix/agent-check.sh
-
-workflows=()
-while IFS= read -r -d '' workflow; do
-  workflows+=("$workflow")
-done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
-if ((${#workflows[@]} > 0)); then
-  actionlint "${workflows[@]}"
-fi
+actionlint \
+  .github/workflows/ci.yml \
+  .github/workflows/cli-flags.yml \
+  .github/workflows/docker.yml \
+  .github/workflows/nix.yml
 
 nix flake check --show-trace
 nix flake check ./.nix --show-trace
