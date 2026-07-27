@@ -96,22 +96,22 @@ run_workspace() {
 }
 
 case "${1:-all}" in
-	preflight)
-		run_preflight
-		;;
-	rust)
-		run_rust_toolchain
-		;;
-	workspace)
-		run_workspace
-		;;
-	all)
-		run_preflight
-		run_rust_toolchain
-		run_workspace
-		;;
-	*)
-		printf 'usage: agent-check [all|preflight|rust|workspace]\n' >&2
-		exit 64
-		;;
+preflight)
+	run_preflight
+	;;
+rust)
+	run_rust_toolchain
+	;;
+workspace)
+	run_workspace
+	;;
+all)
+	run_preflight
+	run_rust_toolchain
+	run_workspace
+	;;
+*)
+	printf 'usage: agent-check [all|preflight|rust|workspace]\n' >&2
+	exit 64
+	;;
 esac
