@@ -68,8 +68,20 @@ jobs:
       - name: Install and verify pinned Rust
         run: nix develop -c agent-check rust
 
-      - name: Validate the standalone sibling workspace
-        run: nix develop -c agent-check workspace
+      - name: Bootstrap the standalone sibling workspace
+        run: nix develop -c agent-check bootstrap
 
-      - name: Run the default agent entrypoint
-        run: nix develop -c agent-check
+      - name: Validate the CLI flag contract
+        run: nix develop -c agent-check flags
+
+      - name: Check Rust formatting
+        run: nix develop -c agent-check fmt
+
+      - name: Run Clippy
+        run: nix develop -c agent-check clippy
+
+      - name: Run Rust tests
+        run: nix develop -c agent-check test
+
+      - name: Audit Rust dependencies
+        run: nix develop -c agent-check audit
