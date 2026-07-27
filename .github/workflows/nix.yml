@@ -52,10 +52,24 @@ jobs:
       - name: Check Nix formatting
         run: nix develop -c nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
 
-      - name: Check agent shell
+      - name: Run ShellCheck
+        run: nix develop -c shellcheck .nix/agent-check.sh
+
+      - name: Produce canonical shell formatting
         run: |
-          nix develop -c shellcheck .nix/agent-check.sh
-          nix develop -c shfmt -d .nix/agent-check.sh
+          nix develop -c shfmt -w .nix/agent-check.sh
+          mkdir -p shfmt-output
+          cp .nix/agent-check.sh shfmt-output/agent-check.sh
+
+      - name: Upload canonical shell formatting
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: shfmt-output
+          path: shfmt-output
+          retention-days: 1
+
+      - name: Check shell formatting
+        run: git diff --exit-code -- .nix/agent-check.sh
 
       - name: Check GitHub Actions
         run: nix develop -c actionlint .github/workflows/ci.yml .github/workflows/cli-flags.yml .github/workflows/docker.yml .github/workflows/nix.yml
