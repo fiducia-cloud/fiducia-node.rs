@@ -17,7 +17,11 @@ mkdir -p "$XDG_CACHE_HOME" "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
 routing_ref="c694bc5c58587bec12989a347e926c0040aacada"
 interfaces_ref="2c5c806174e067fbe83ad48b724366323ba390a2"
-flags_ref="30c0b7cc57d6db93bac68a6f620b3b06e05f2c59"
+read -r flags_mode flags_ref flags_stage flags_path < <(git ls-files --stage vendor/flags-2-env)
+if [ "$flags_mode" != "160000" ] || [ "$flags_stage" != "0" ] || [ "$flags_path" != "vendor/flags-2-env" ]; then
+	printf 'vendor/flags-2-env is not a committed stage-0 gitlink\n' >&2
+	exit 1
+fi
 workspace_root="$cache_root/workspaces/fiducia-node-${routing_ref:0:12}-${interfaces_ref:0:12}-${flags_ref:0:12}"
 node_checkout="$workspace_root/fiducia-node.rs"
 
