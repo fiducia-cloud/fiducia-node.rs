@@ -20,10 +20,10 @@ nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
 shellcheck .nix/agent-check.sh
 shfmt -d .nix/agent-check.sh
 actionlint \
-  .github/workflows/ci.yml \
-  .github/workflows/cli-flags.yml \
-  .github/workflows/docker.yml \
-  .github/workflows/nix.yml
+	.github/workflows/ci.yml \
+	.github/workflows/cli-flags.yml \
+	.github/workflows/docker.yml \
+	.github/workflows/nix.yml
 
 nix flake check --show-trace
 nix flake check ./.nix --show-trace
@@ -41,45 +41,45 @@ node_checkout="$workspace_root/fiducia-node.rs"
 
 mkdir -p "$node_checkout"
 rsync \
-  --archive \
-  --delete \
-  --exclude '/.git/' \
-  --exclude '/.cache/' \
-  --exclude '/target/' \
-  "$repo_root/" \
-  "$node_checkout/"
+	--archive \
+	--delete \
+	--exclude '/.git/' \
+	--exclude '/.cache/' \
+	--exclude '/target/' \
+	"$repo_root/" \
+	"$node_checkout/"
 
 ensure_checkout() {
-  local destination="$1"
-  local url="$2"
-  local reference="$3"
-  local actual
+	local destination="$1"
+	local url="$2"
+	local reference="$3"
+	local actual
 
-  mkdir -p "$destination"
-  if [ ! -d "$destination/.git" ]; then
-    git -C "$destination" init --quiet
-    git -C "$destination" remote add origin "$url"
-  else
-    git -C "$destination" remote set-url origin "$url"
-  fi
+	mkdir -p "$destination"
+	if [ ! -d "$destination/.git" ]; then
+		git -C "$destination" init --quiet
+		git -C "$destination" remote add origin "$url"
+	else
+		git -C "$destination" remote set-url origin "$url"
+	fi
 
-  git -C "$destination" fetch --depth 1 origin "$reference"
-  git -C "$destination" switch --detach --force FETCH_HEAD
-  actual="$(git -C "$destination" rev-parse HEAD)"
-  if [ "$actual" != "$reference" ]; then
-    printf 'expected %s at %s, found %s\n' "$reference" "$destination" "$actual" >&2
-    return 1
-  fi
+	git -C "$destination" fetch --depth 1 origin "$reference"
+	git -C "$destination" switch --detach --force FETCH_HEAD
+	actual="$(git -C "$destination" rev-parse HEAD)"
+	if [ "$actual" != "$reference" ]; then
+		printf 'expected %s at %s, found %s\n' "$reference" "$destination" "$actual" >&2
+		return 1
+	fi
 }
 
 ensure_checkout \
-  "$workspace_root/fiducia-routing.rs" \
-  "https://github.com/fiducia-cloud/fiducia-routing.rs.git" \
-  "$routing_ref"
+	"$workspace_root/fiducia-routing.rs" \
+	"https://github.com/fiducia-cloud/fiducia-routing.rs.git" \
+	"$routing_ref"
 ensure_checkout \
-  "$workspace_root/fiducia-interfaces" \
-  "https://github.com/fiducia-cloud/fiducia-interfaces.git" \
-  "$interfaces_ref"
+	"$workspace_root/fiducia-interfaces" \
+	"https://github.com/fiducia-cloud/fiducia-interfaces.git" \
+	"$interfaces_ref"
 
 cd "$node_checkout"
 make -B -C vendor/flags-2-env all
