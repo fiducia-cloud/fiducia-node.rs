@@ -3,6 +3,7 @@ let
   shellPackages =
     (with pkgs; [
       actionlint
+      binutils
       cacert
       cargo-audit
       findutils
