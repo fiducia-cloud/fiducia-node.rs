@@ -14,15 +14,18 @@ use sha2::{Digest, Sha256};
 
 use crate::indexed_queue::IndexedQueue;
 
-/// Command protocol understood by the release immediately before the hardened
-/// lock/semaphore command variants were introduced.
+/// Raw JSON command/snapshot protocol used before explicit upgrade barriers.
 pub const LEGACY_COMMAND_PROTOCOL: u16 = 1;
-/// Highest command protocol this binary can parse and apply.
-pub const CURRENT_COMMAND_PROTOCOL: u16 = 2;
+/// Protocol that introduced the hardened lock/semaphore command variants.
+pub const LOCK_COMMAND_PROTOCOL: u16 = 2;
+/// Highest command protocol this binary can parse and apply. Protocol 3 adds
+/// durable cron lifecycle controls, function targets, and run diagnostics.
+pub const CURRENT_COMMAND_PROTOCOL: u16 = 3;
 const COMMAND_PROTOCOL_ROUTING_KEY: &str = "\0fiducia-command-protocol";
-/// A non-JSON prefix is deliberate: an older binary must reject, rather than
-/// deserialize as an empty/default Store, a snapshot created after activation.
-pub(crate) const CURRENT_PROTOCOL_SNAPSHOT_MAGIC: &[u8] = b"FIDUCIA-STATE-MACHINE\0V2\n";
+/// Non-JSON prefixes are deliberate: an older binary must reject, rather than
+/// deserialize as an empty/default Store, a snapshot written after activation.
+pub(crate) const PREVIOUS_PROTOCOL_SNAPSHOT_MAGIC: &[u8] = b"FIDUCIA-STATE-MACHINE\0V2\n";
+pub(crate) const CURRENT_PROTOCOL_SNAPSHOT_MAGIC: &[u8] = b"FIDUCIA-STATE-MACHINE\0V3\n";
 
 /// Every mutation in the system, as it travels through the replicated log.
 ///
@@ -481,12 +484,49 @@ pub enum Command {
         fire_id_ms: u64,
     },
     /// Record the outcome of delivering a claimed fire (after retries).
+    /// Retained for protocol 1/2 log compatibility; protocol 3 writers use the
+    /// diagnostic variant below.
     ScheduleRecordResult {
         name: String,
         fire_id_ms: u64,
         delivered: bool,
         attempts: u32,
         error: Option<String>,
+    },
+    /// Pause or resume a schedule. A normal resume skips missed occurrences;
+    /// `catch_up` deliberately preserves the old cursor so the bounded backlog
+    /// drain can replay them.
+    ScheduleSetEnabled {
+        name: String,
+        enabled: bool,
+        now_ms: u64,
+        catch_up: bool,
+    },
+    /// Delete a schedule definition and its bounded in-memory run history.
+    ScheduleDelete {
+        name: String,
+    },
+    /// Create a manual pending run without advancing the scheduled cursor.
+    ScheduleTrigger {
+        name: String,
+        fire_id_ms: u64,
+        requested_at_ms: u64,
+    },
+    /// Protocol-3 delivery result carrying sanitized diagnostics and trace
+    /// correlation. No response body, URL, credential, or custom-code source is
+    /// ever replicated.
+    ScheduleRecordResultV2 {
+        name: String,
+        fire_id_ms: u64,
+        delivered: bool,
+        attempts: u32,
+        error: Option<String>,
+        error_class: Option<String>,
+        http_status: Option<u16>,
+        duration_ms: u64,
+        completed_at_ms: u64,
+        trace_id: Option<String>,
+        span_id: Option<String>,
     },
 
     // --- Leader election ---------------------------------------------------
@@ -612,7 +652,11 @@ impl Command {
             Command::ScheduleUpsert { name, .. }
             | Command::ScheduleRecordRun { name, .. }
             | Command::ScheduleClaimFire { name, .. }
-            | Command::ScheduleRecordResult { name, .. } => name,
+            | Command::ScheduleRecordResult { name, .. }
+            | Command::ScheduleSetEnabled { name, .. }
+            | Command::ScheduleDelete { name, .. }
+            | Command::ScheduleTrigger { name, .. }
+            | Command::ScheduleRecordResultV2 { name, .. } => name,
             Command::ElectionCampaign { name, .. }
             | Command::ElectionRenew { name, .. }
             | Command::ElectionResign { name, .. } => name,
@@ -679,7 +723,13 @@ impl Command {
             Command::ScheduleUpsert { .. } => "schedule.upsert",
             Command::ScheduleRecordRun { .. } => "schedule.record_run",
             Command::ScheduleClaimFire { .. } => "schedule.claim_fire",
-            Command::ScheduleRecordResult { .. } => "schedule.record_result",
+            Command::ScheduleRecordResult { .. } | Command::ScheduleRecordResultV2 { .. } => {
+                "schedule.record_result"
+            }
+            Command::ScheduleSetEnabled { enabled: true, .. } => "schedule.resume",
+            Command::ScheduleSetEnabled { enabled: false, .. } => "schedule.pause",
+            Command::ScheduleDelete { .. } => "schedule.delete",
+            Command::ScheduleTrigger { .. } => "schedule.trigger",
             Command::ElectionCampaign { .. } => "election.campaign",
             Command::ElectionRenew { .. } => "election.renew",
             Command::ElectionResign { .. } => "election.resign",
@@ -689,12 +739,13 @@ impl Command {
         }
     }
 
-    /// Convert availability-compatible V2 acquire requests to their historical
-    /// command shapes while a mixed-version cluster is still in phase one.
-    /// Operations with no safe legacy expression stay unavailable until the
-    /// replicated protocol activation commits.
+    /// Convert commands to a representation the replicated protocol currently
+    /// permits. Availability-compatible lock acquires and diagnostic cron results
+    /// degrade to their historical forms during a rolling upgrade; lifecycle
+    /// mutations that have no equivalent fail closed until activation commits.
     pub(crate) fn for_active_protocol(self, active: u16) -> Result<Self, u16> {
-        if active >= CURRENT_COMMAND_PROTOCOL {
+        let required = self.required_protocol();
+        if required <= active {
             return Ok(self);
         }
         match self {
@@ -704,7 +755,7 @@ impl Command {
                 ttl_ms,
                 wait,
                 wait_timeout_ms,
-            } => Ok(Command::LockAcquire {
+            } if active < LOCK_COMMAND_PROTOCOL => Ok(Command::LockAcquire {
                 keys,
                 holder,
                 ttl_ms,
@@ -718,7 +769,7 @@ impl Command {
                 ttl_ms,
                 wait,
                 wait_timeout_ms,
-            } => Ok(Command::SemaphoreAcquire {
+            } if active < LOCK_COMMAND_PROTOCOL => Ok(Command::SemaphoreAcquire {
                 key,
                 holder,
                 limit,
@@ -726,22 +777,29 @@ impl Command {
                 wait,
                 wait_timeout_ms,
             }),
-            Command::LockAcquireAttempt { .. }
-            | Command::LockRenew { .. }
-            | Command::LockCancel { .. }
-            | Command::LockCancelAttempt { .. }
-            | Command::SemaphoreAcquireAttempt { .. }
-            | Command::SemaphoreRenew { .. }
-            | Command::SemaphoreCancel { .. }
-            | Command::SemaphoreCancelAttempt { .. }
-            | Command::ActivateCommandProtocol { .. } => Err(CURRENT_COMMAND_PROTOCOL),
-            command => Ok(command),
+            Command::ScheduleRecordResultV2 {
+                name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                error,
+                ..
+            } if active < CURRENT_COMMAND_PROTOCOL => Ok(Command::ScheduleRecordResult {
+                name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                error,
+            }),
+            command => Err(command.required_protocol()),
         }
     }
 
-    pub(crate) fn requires_current_protocol(&self) -> bool {
+    /// Minimum replicated command protocol required to parse and apply this
+    /// variant without divergence.
+    pub(crate) fn required_protocol(&self) -> u16 {
         match self {
-            Command::ActivateCommandProtocol { version } => *version == CURRENT_COMMAND_PROTOCOL,
+            Command::ActivateCommandProtocol { version } => *version,
             Command::LockAcquireV2 { .. }
             | Command::LockAcquireAttempt { .. }
             | Command::LockRenew { .. }
@@ -751,8 +809,16 @@ impl Command {
             | Command::SemaphoreAcquireAttempt { .. }
             | Command::SemaphoreRenew { .. }
             | Command::SemaphoreCancel { .. }
-            | Command::SemaphoreCancelAttempt { .. } => true,
-            _ => false,
+            | Command::SemaphoreCancelAttempt { .. } => LOCK_COMMAND_PROTOCOL,
+            Command::ScheduleUpsert {
+                target: ScheduleTarget::Function { .. },
+                ..
+            }
+            | Command::ScheduleSetEnabled { .. }
+            | Command::ScheduleDelete { .. }
+            | Command::ScheduleTrigger { .. }
+            | Command::ScheduleRecordResultV2 { .. } => CURRENT_COMMAND_PROTOCOL,
+            _ => LEGACY_COMMAND_PROTOCOL,
         }
     }
 }
@@ -774,9 +840,21 @@ pub enum DeliverySemantics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScheduleTarget {
-    Webhook { url: String },
-    Queue { name: String },
-    Grpc { endpoint: String },
+    Webhook {
+        url: String,
+    },
+    Queue {
+        name: String,
+    },
+    Grpc {
+        endpoint: String,
+    },
+    /// A stored function executed by the isolated fiducia-lambda-service. The
+    /// node persists only this non-secret identifier; runtime URL and auth stay
+    /// in operator configuration.
+    Function {
+        function_id: String,
+    },
 }
 
 /// Result produced by applying a committed command.
@@ -1174,6 +1252,17 @@ pub enum RunStatus {
     Failed,
 }
 
+/// Why a run exists. The default preserves compatibility with protocol-1/2
+/// snapshots whose run records predate this field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTrigger {
+    #[default]
+    Scheduled,
+    Manual,
+    Legacy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleRun {
     pub fire_id: String,
@@ -1183,6 +1272,20 @@ pub struct ScheduleRun {
     pub target: ScheduleTarget,
     pub status: RunStatus,
     pub error: Option<String>,
+    #[serde(default)]
+    pub trigger: RunTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2179,11 +2282,18 @@ impl StateMachine {
     pub fn snapshot(&self) -> Result<Vec<u8>, serde_json::Error> {
         let store = self.locked();
         let payload = serde_json::to_vec(&*store)?;
-        if store.command_protocol < CURRENT_COMMAND_PROTOCOL {
-            return Ok(payload);
-        }
-        let mut stamped = Vec::with_capacity(CURRENT_PROTOCOL_SNAPSHOT_MAGIC.len() + payload.len());
-        stamped.extend_from_slice(CURRENT_PROTOCOL_SNAPSHOT_MAGIC);
+        let magic = match store.command_protocol {
+            LEGACY_COMMAND_PROTOCOL => return Ok(payload),
+            LOCK_COMMAND_PROTOCOL => PREVIOUS_PROTOCOL_SNAPSHOT_MAGIC,
+            CURRENT_COMMAND_PROTOCOL => CURRENT_PROTOCOL_SNAPSHOT_MAGIC,
+            _ => {
+                return Err(<serde_json::Error as serde::ser::Error>::custom(
+                    "unsupported state-machine command protocol",
+                ));
+            }
+        };
+        let mut stamped = Vec::with_capacity(magic.len() + payload.len());
+        stamped.extend_from_slice(magic);
         stamped.extend_from_slice(&payload);
         Ok(stamped)
     }
@@ -2195,14 +2305,22 @@ impl StateMachine {
     /// regress the fencing counter, or carries an inconsistent lock table, is
     /// rejected here instead of silently serving wrong authority.
     pub fn restore(&self, bytes: &[u8]) -> Result<(), serde_json::Error> {
-        let (stamped, payload) =
+        let (stamp, payload) =
             if let Some(payload) = bytes.strip_prefix(CURRENT_PROTOCOL_SNAPSHOT_MAGIC) {
-                (true, payload)
+                (Some(CURRENT_COMMAND_PROTOCOL), payload)
+            } else if let Some(payload) = bytes.strip_prefix(PREVIOUS_PROTOCOL_SNAPSHOT_MAGIC) {
+                (Some(LOCK_COMMAND_PROTOCOL), payload)
             } else {
-                (false, bytes)
+                (None, bytes)
             };
         let restored: Store = serde_json::from_slice(payload)?;
-        if stamped != (restored.command_protocol >= CURRENT_COMMAND_PROTOCOL) {
+        let expected_stamp = match restored.command_protocol {
+            LEGACY_COMMAND_PROTOCOL => None,
+            LOCK_COMMAND_PROTOCOL => Some(LOCK_COMMAND_PROTOCOL),
+            CURRENT_COMMAND_PROTOCOL => Some(CURRENT_COMMAND_PROTOCOL),
+            _ => None,
+        };
+        if stamp != expected_stamp {
             return Err(<serde_json::Error as serde::de::Error>::custom(
                 "state-machine command protocol and snapshot compatibility stamp disagree",
             ));
@@ -2230,13 +2348,12 @@ impl StateMachine {
         let mut store = self.locked();
         let now = proposed_at_ms;
         let protocol_activation = matches!(command, Command::ActivateCommandProtocol { .. });
-        // Recovery defense: builds that predate the explicit activation barrier
-        // may already have committed one of these variants. That log is already
-        // unreadable by V1, so stamp the materialized state V2 as well; otherwise
-        // compaction could accidentally turn an incompatible log into a raw JSON
-        // snapshot an older binary would accept.
-        if command.requires_current_protocol() {
-            store.command_protocol = CURRENT_COMMAND_PROTOCOL;
+        // Recovery defense: a pre-gate build may already have committed a newer
+        // command. Stamp materialized state at that command's minimum protocol so
+        // compaction can never turn an incompatible log into a snapshot an older
+        // binary would accept.
+        if !protocol_activation {
+            store.command_protocol = store.command_protocol.max(command.required_protocol());
         }
         if !protocol_activation {
             store.expire_due(now);
@@ -2246,8 +2363,8 @@ impl StateMachine {
 
         let output = match command {
             Command::ActivateCommandProtocol { version } => {
-                if version == CURRENT_COMMAND_PROTOCOL
-                    && store.command_protocol <= CURRENT_COMMAND_PROTOCOL
+                if (LOCK_COMMAND_PROTOCOL..=CURRENT_COMMAND_PROTOCOL).contains(&version)
+                    && version >= store.command_protocol
                 {
                     store.command_protocol = version;
                     json!({
@@ -2255,10 +2372,17 @@ impl StateMachine {
                         "command_protocol": store.command_protocol,
                         "revision": revision,
                     })
+                } else if version == store.command_protocol {
+                    json!({
+                        "activated": true,
+                        "duplicate": true,
+                        "command_protocol": store.command_protocol,
+                        "revision": revision,
+                    })
                 } else {
                     json!({
                         "activated": false,
-                        "reason": "unsupported_command_protocol",
+                        "reason": "unsupported_or_regressive_command_protocol",
                         "requested": version,
                         "command_protocol": store.command_protocol,
                         "revision": revision,
@@ -2665,7 +2789,46 @@ impl StateMachine {
                 delivered,
                 attempts,
                 error,
-            } => store.apply_schedule_record_result(name, fire_id_ms, delivered, attempts, error),
+            } => store.apply_schedule_record_result(
+                name, fire_id_ms, delivered, attempts, error, None, None, None, None, None, None,
+            ),
+            Command::ScheduleSetEnabled {
+                name,
+                enabled,
+                now_ms,
+                catch_up,
+            } => store.apply_schedule_set_enabled(name, enabled, now_ms, catch_up),
+            Command::ScheduleDelete { name } => store.apply_schedule_delete(name),
+            Command::ScheduleTrigger {
+                name,
+                fire_id_ms,
+                requested_at_ms,
+            } => store.apply_schedule_trigger(name, fire_id_ms, requested_at_ms),
+            Command::ScheduleRecordResultV2 {
+                name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                error,
+                error_class,
+                http_status,
+                duration_ms,
+                completed_at_ms,
+                trace_id,
+                span_id,
+            } => store.apply_schedule_record_result(
+                name,
+                fire_id_ms,
+                delivered,
+                attempts,
+                error,
+                error_class,
+                http_status,
+                Some(duration_ms),
+                Some(completed_at_ms),
+                trace_id,
+                span_id,
+            ),
             Command::ElectionCampaign {
                 name,
                 candidate,
@@ -2844,11 +3007,14 @@ impl StateMachine {
 
     /// Every schedule definition on this shard (for the firing loop to scan).
     pub fn schedule_list(&self) -> Vec<Schedule> {
-        self.locked()
+        let mut schedules: Vec<_> = self
+            .locked()
             .schedules
             .values()
             .map(|record| record.definition.clone())
-            .collect()
+            .collect();
+        schedules.sort_by(|left, right| left.name.cmp(&right.name));
+        schedules
     }
 
     pub fn service_list(&self, service: &str) -> Vec<ServiceInstance> {
@@ -2998,10 +3164,7 @@ impl Store {
     /// lock). Callers surface the error (InstallSnapshot rejects; boot fail-stops)
     /// rather than serving from silently-wrong state.
     fn validate_restored(&self) -> Result<(), String> {
-        if !matches!(
-            self.command_protocol,
-            LEGACY_COMMAND_PROTOCOL | CURRENT_COMMAND_PROTOCOL
-        ) {
+        if !(LEGACY_COMMAND_PROTOCOL..=CURRENT_COMMAND_PROTOCOL).contains(&self.command_protocol) {
             return Err(format!(
                 "unsupported state-machine command protocol {}",
                 self.command_protocol
@@ -4883,6 +5046,14 @@ impl Store {
         // every replica computes the same cursor — the state machine stays
         // deterministic and never reads the wall clock itself.)
         let next_fire_ms = next_fire_for(&cron, one_shot_at_ms, now_ms);
+        // Once protocol 3 has paused a schedule, editing its definition must not
+        // silently resume it. Before protocol 3 all existing records are enabled,
+        // so this is rolling-upgrade deterministic.
+        let enabled = self
+            .schedules
+            .get(&name)
+            .map(|record| record.definition.enabled)
+            .unwrap_or(true);
         let definition = Schedule {
             name: name.clone(),
             cron,
@@ -4890,7 +5061,7 @@ impl Store {
             target,
             delivery,
             max_retries,
-            enabled: true,
+            enabled,
             next_fire_ms,
         };
         self.schedules
@@ -4923,6 +5094,13 @@ impl Store {
                 target: record.definition.target.clone(),
                 status: RunStatus::Delivered,
                 error: None,
+                trigger: RunTrigger::Legacy,
+                error_class: None,
+                http_status: None,
+                duration_ms: None,
+                completed_at_ms: Some(fired_at_ms),
+                trace_id: None,
+                span_id: None,
             });
             trim_history(record);
         }
@@ -4957,6 +5135,13 @@ impl Store {
             target: record.definition.target.clone(),
             status: RunStatus::Pending,
             error: None,
+            trigger: RunTrigger::Scheduled,
+            error_class: None,
+            http_status: None,
+            duration_ms: None,
+            completed_at_ms: None,
+            trace_id: None,
+            span_id: None,
         });
         trim_history(record);
         // Advance the cursor: one-shots are now exhausted; crons step to the next.
@@ -4977,7 +5162,88 @@ impl Store {
         })
     }
 
-    /// Record the delivery outcome of a claimed fire (after retries).
+    fn apply_schedule_set_enabled(
+        &mut self,
+        name: String,
+        enabled: bool,
+        now_ms: u64,
+        catch_up: bool,
+    ) -> Value {
+        let Some(record) = self.schedules.get_mut(&name) else {
+            return json!({ "updated": false, "reason": "not_found", "name": name });
+        };
+        let changed = record.definition.enabled != enabled;
+        record.definition.enabled = enabled;
+        if enabled && !catch_up {
+            record.definition.next_fire_ms =
+                if let Some(one_shot) = record.definition.one_shot_at_ms {
+                    (one_shot > now_ms).then_some(one_shot)
+                } else {
+                    next_fire_for(&record.definition.cron, None, now_ms)
+                };
+        }
+        json!({
+            "updated": true,
+            "changed": changed,
+            "name": name,
+            "enabled": enabled,
+            "catch_up": catch_up,
+            "next_fire_ms": record.definition.next_fire_ms,
+        })
+    }
+
+    fn apply_schedule_delete(&mut self, name: String) -> Value {
+        let deleted = self.schedules.remove(&name).is_some();
+        json!({ "deleted": deleted, "name": name })
+    }
+
+    fn apply_schedule_trigger(
+        &mut self,
+        name: String,
+        fire_id_ms: u64,
+        requested_at_ms: u64,
+    ) -> Value {
+        let Some(record) = self.schedules.get_mut(&name) else {
+            return json!({ "triggered": false, "reason": "not_found", "name": name });
+        };
+        let fire_id = fire_id_ms.to_string();
+        if record.history.iter().any(|run| run.fire_id == fire_id) {
+            return json!({
+                "triggered": false,
+                "duplicate": true,
+                "name": name,
+                "fire_id_ms": fire_id_ms,
+            });
+        }
+        record.history.push(ScheduleRun {
+            fire_id,
+            fired_at_ms: requested_at_ms,
+            attempts: 0,
+            duplicate: false,
+            target: record.definition.target.clone(),
+            status: RunStatus::Pending,
+            error: None,
+            trigger: RunTrigger::Manual,
+            error_class: None,
+            http_status: None,
+            duration_ms: None,
+            completed_at_ms: None,
+            trace_id: None,
+            span_id: None,
+        });
+        trim_history(record);
+        json!({
+            "triggered": true,
+            "name": name,
+            "fire_id_ms": fire_id_ms,
+            "requested_at_ms": requested_at_ms,
+        })
+    }
+
+    /// Record the delivery outcome of a claimed fire (after retries). Repeated
+    /// commits are idempotent: a terminal run is never rewritten by a later
+    /// redelivery attempt.
+    #[allow(clippy::too_many_arguments)]
     fn apply_schedule_record_result(
         &mut self,
         name: String,
@@ -4985,6 +5251,12 @@ impl Store {
         delivered: bool,
         attempts: u32,
         error: Option<String>,
+        error_class: Option<String>,
+        http_status: Option<u16>,
+        duration_ms: Option<u64>,
+        completed_at_ms: Option<u64>,
+        trace_id: Option<String>,
+        span_id: Option<String>,
     ) -> Value {
         let Some(record) = self.schedules.get_mut(&name) else {
             return json!({ "recorded": false, "reason": "not_found", "name": name });
@@ -4996,13 +5268,28 @@ impl Store {
             .rev()
             .find(|r| r.fire_id == fire_id)
         {
+            if run.status != RunStatus::Pending {
+                return json!({
+                    "recorded": true,
+                    "duplicate": true,
+                    "name": name,
+                    "fire_id_ms": fire_id_ms,
+                    "delivered": run.status == RunStatus::Delivered,
+                });
+            }
             run.status = if delivered {
                 RunStatus::Delivered
             } else {
                 RunStatus::Failed
             };
             run.attempts = attempts;
-            run.error = error;
+            run.error = bounded_schedule_text(error);
+            run.error_class = bounded_schedule_text(error_class);
+            run.http_status = http_status;
+            run.duration_ms = duration_ms;
+            run.completed_at_ms = completed_at_ms;
+            run.trace_id = bounded_schedule_text(trace_id);
+            run.span_id = bounded_schedule_text(span_id);
             json!({ "recorded": true, "name": name, "fire_id_ms": fire_id_ms, "delivered": delivered })
         } else {
             json!({ "recorded": false, "reason": "no_run", "name": name, "fire_id_ms": fire_id_ms })
@@ -5346,6 +5633,22 @@ fn trim_history(record: &mut ScheduleRecord) {
     if len > MAX_SCHEDULE_HISTORY {
         record.history.drain(0..len - MAX_SCHEDULE_HISTORY);
     }
+}
+
+/// Bound attacker- or dependency-controlled diagnostic text before it enters the
+/// replicated log/snapshot. Truncate on a UTF-8 boundary.
+fn bounded_schedule_text(value: Option<String>) -> Option<String> {
+    const MAX_BYTES: usize = 512;
+    value.map(|mut text| {
+        if text.len() > MAX_BYTES {
+            let mut end = MAX_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        text
+    })
 }
 
 #[cfg(test)]
@@ -7964,6 +8267,103 @@ mod tests {
     }
 
     #[test]
+    fn cron_lifecycle_pause_resume_manual_run_diagnostics_and_delete() {
+        let sm = StateMachine::new();
+        sm.apply_at(
+            Command::ScheduleUpsert {
+                name: "billing".to_string(),
+                cron: Some("*/5 * * * *".to_string()),
+                one_shot_at_ms: None,
+                target: ScheduleTarget::Function {
+                    function_id: "billing-rollup".to_string(),
+                },
+                delivery: DeliverySemantics::ExactlyOnce,
+                max_retries: 3,
+                now_ms: 0,
+            },
+            0,
+        );
+        assert_eq!(sm.command_protocol(), CURRENT_COMMAND_PROTOCOL);
+
+        let paused = sm.apply_at(
+            Command::ScheduleSetEnabled {
+                name: "billing".to_string(),
+                enabled: false,
+                now_ms: 1_000,
+                catch_up: false,
+            },
+            1_000,
+        );
+        assert_eq!(paused.output["updated"], true);
+        assert!(!sm.schedule_get("billing").unwrap().enabled);
+
+        let trigger = sm.apply_at(
+            Command::ScheduleTrigger {
+                name: "billing".to_string(),
+                fire_id_ms: 1_234,
+                requested_at_ms: 1_200,
+            },
+            1_200,
+        );
+        assert_eq!(trigger.output["triggered"], true);
+        let duplicate = sm.apply_at(
+            Command::ScheduleTrigger {
+                name: "billing".to_string(),
+                fire_id_ms: 1_234,
+                requested_at_ms: 1_201,
+            },
+            1_201,
+        );
+        assert_eq!(duplicate.output["duplicate"], true);
+
+        sm.apply_at(
+            Command::ScheduleRecordResultV2 {
+                name: "billing".to_string(),
+                fire_id_ms: 1_234,
+                delivered: false,
+                attempts: 2,
+                error: Some("upstream unavailable".to_string()),
+                error_class: Some("http_transient".to_string()),
+                http_status: Some(503),
+                duration_ms: 812,
+                completed_at_ms: 2_000,
+                trace_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                span_id: Some("0123456789abcdef".to_string()),
+            },
+            2_000,
+        );
+        let run = &sm.schedule_history("billing")[0];
+        assert_eq!(run.trigger, RunTrigger::Manual);
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.http_status, Some(503));
+        assert_eq!(run.duration_ms, Some(812));
+        assert_eq!(run.completed_at_ms, Some(2_000));
+        assert!(run.trace_id.is_some());
+
+        let resumed = sm.apply_at(
+            Command::ScheduleSetEnabled {
+                name: "billing".to_string(),
+                enabled: true,
+                now_ms: 600_000,
+                catch_up: false,
+            },
+            600_000,
+        );
+        assert_eq!(resumed.output["enabled"], true);
+        assert!(sm.schedule_get("billing").unwrap().next_fire_ms > Some(600_000));
+
+        let deleted = sm.apply_at(
+            Command::ScheduleDelete {
+                name: "billing".to_string(),
+            },
+            600_001,
+        );
+        assert_eq!(deleted.output["deleted"], true);
+        assert!(sm.schedule_get("billing").is_none());
+        assert!(sm.schedule_history("billing").is_empty());
+    }
+
+    #[test]
     fn service_registration_carries_metadata_and_heartbeat_ttl() {
         let sm = StateMachine::new();
         let mut metadata = HashMap::new();
@@ -8386,6 +8786,28 @@ mod tests {
         let store = sm.store.lock().unwrap();
         assert_eq!(store.semaphores["legacy-pool"].limit, 2);
         assert_eq!(store.semaphores["legacy-pool"].holders.len(), 2);
+    }
+
+    #[test]
+    fn protocol_two_snapshots_remain_restorable_after_protocol_three_upgrade() {
+        let state = StateMachine::new();
+        let activated = state.apply_at(
+            Command::ActivateCommandProtocol {
+                version: LOCK_COMMAND_PROTOCOL,
+            },
+            1_000,
+        );
+        assert_eq!(activated.output["activated"], true);
+        let v2 = state.snapshot().unwrap();
+        assert!(v2.starts_with(PREVIOUS_PROTOCOL_SNAPSHOT_MAGIC));
+
+        let restored = StateMachine::new();
+        restored.restore(&v2).unwrap();
+        assert_eq!(restored.command_protocol(), LOCK_COMMAND_PROTOCOL);
+        assert!(restored
+            .snapshot()
+            .unwrap()
+            .starts_with(PREVIOUS_PROTOCOL_SNAPSHOT_MAGIC));
     }
 
     #[test]

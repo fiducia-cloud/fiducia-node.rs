@@ -623,27 +623,22 @@ fn bounded_append_request(
     request
 }
 
-/// Before a peer has advertised the current parser, send only the contiguous
-/// legacy-compatible prefix. This matters not just for newly emitted entries
-/// (which are gated elsewhere) but for recovery from a pre-gate build that may
-/// already have left an uncommitted V2 entry on disk. A safe empty heartbeat lets
-/// a current peer advertise capability without making an older peer parse an
-/// unknown command variant.
+/// Send only the contiguous prefix that a peer may safely receive. A command is
+/// sendable when the peer advertises a parser new enough, or when the command's
+/// protocol has already been durably activated (in which case a downgraded peer
+/// must fail closed rather than keep participating with divergent state).
 fn appendable_protocol_prefix(
     suffix: &[LogEntry],
     peer_protocol: u16,
     active_protocol: u16,
 ) -> &[LogEntry] {
-    if active_protocol >= CURRENT_COMMAND_PROTOCOL || peer_protocol >= CURRENT_COMMAND_PROTOCOL {
-        return suffix;
-    }
     let compatible = suffix
         .iter()
         .take_while(|entry| {
-            entry
-                .command
-                .as_ref()
-                .is_none_or(|command| !command.requires_current_protocol())
+            entry.command.as_ref().is_none_or(|command| {
+                let required = command.required_protocol();
+                required <= peer_protocol || required <= active_protocol
+            })
         })
         .count();
     &suffix[..compatible]
@@ -1364,9 +1359,9 @@ impl ShardActor {
     }
 
     /// Phase two of the rolling command upgrade. Phase one is passive: every
-    /// current follower advertises parser V2 in ordinary AppendEntries replies,
+    /// current follower advertises the current parser in ordinary AppendEntries replies,
     /// while leaders continue emitting legacy-compatible commands. Only after
-    /// *all* configured peers have positively advertised V2 do we append this
+    /// *all* configured peers have positively advertised the current protocol do we append this
     /// replicated activation record. Its commit, not the volatile advertisements,
     /// is the durable emission gate.
     fn maybe_activate_command_protocol(&mut self) {
@@ -1651,17 +1646,18 @@ impl ShardActor {
         if self.state.command_protocol() < CURRENT_COMMAND_PROTOCOL
             && !self.all_peers_support_current_command_protocol()
         {
-            if let Some(first_current) = self.log.iter().find(|entry| {
+            let active = self.state.command_protocol();
+            if let Some(first_newer) = self.log.iter().find(|entry| {
                 entry.index > self.commit_index
                     && entry
                         .command
                         .as_ref()
-                        .is_some_and(Command::requires_current_protocol)
+                        .is_some_and(|command| command.required_protocol() > active)
             }) {
-                // A pre-gate build may have persisted an uncommitted V2 entry.
-                // Even a current-version quorum must not commit across it until
-                // every configured member has completed parser phase one.
-                n = n.min(first_current.index.saturating_sub(1));
+                // A pre-gate build may have persisted an uncommitted command from
+                // a newer protocol. Do not commit across it until every configured
+                // member has completed parser phase one for this binary.
+                n = n.min(first_newer.index.saturating_sub(1));
             }
         }
         if n > self.commit_index && self.term_at(n) == self.current_term {
@@ -3725,6 +3721,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn protocol_prefix_distinguishes_lock_v2_from_cron_v3() {
+        let entries = vec![
+            LogEntry {
+                term: 3,
+                index: 1,
+                proposed_at_ms: 1,
+                command: Some(Command::LockAcquireAttempt {
+                    keys: vec!["lock".to_string()],
+                    holder: "worker".to_string(),
+                    request_id: "attempt".to_string(),
+                    ttl_ms: 1_000,
+                    wait: false,
+                    wait_timeout_ms: None,
+                }),
+            },
+            LogEntry {
+                term: 3,
+                index: 2,
+                proposed_at_ms: 2,
+                command: Some(Command::ScheduleDelete {
+                    name: "cron".to_string(),
+                }),
+            },
+        ];
+        assert_eq!(
+            appendable_protocol_prefix(
+                &entries,
+                crate::state::LOCK_COMMAND_PROTOCOL,
+                crate::state::LOCK_COMMAND_PROTOCOL,
+            )
+            .len(),
+            1,
+            "a V2 peer may receive the lock command but not the V3 cron command",
+        );
+        assert_eq!(
+            appendable_protocol_prefix(
+                &entries,
+                CURRENT_COMMAND_PROTOCOL,
+                crate::state::LOCK_COMMAND_PROTOCOL,
+            )
+            .len(),
+            2,
+        );
+        assert_eq!(
+            appendable_protocol_prefix(
+                &entries,
+                LEGACY_COMMAND_PROTOCOL,
+                CURRENT_COMMAND_PROTOCOL,
+            )
+            .len(),
+            2,
+            "durable V3 activation makes downgraded peers fail closed",
+        );
+    }
+
     #[tokio::test]
     async fn status_keeps_unresponsive_shards_in_hosted_inventory() {
         let reg = LoopbackRegistry::new();
@@ -5106,7 +5158,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_v2_entry_cannot_commit_on_only_a_current_quorum() {
+    fn recovered_newer_entry_cannot_commit_before_parser_quorum() {
         let mut actor = leader_actor();
         actor.log.push(LogEntry {
             term: actor.current_term,
@@ -5144,13 +5196,16 @@ mod tests {
             .insert("c".to_string(), CURRENT_COMMAND_PROTOCOL);
         actor.maybe_advance_commit();
         assert_eq!(actor.commit_index, 1);
-        assert_eq!(actor.state.command_protocol(), CURRENT_COMMAND_PROTOCOL);
+        assert_eq!(
+            actor.state.command_protocol(),
+            crate::state::LOCK_COMMAND_PROTOCOL
+        );
         assert!(
             actor
                 .state
                 .snapshot()
                 .unwrap()
-                .starts_with(crate::state::CURRENT_PROTOCOL_SNAPSHOT_MAGIC),
+                .starts_with(crate::state::PREVIOUS_PROTOCOL_SNAPSHOT_MAGIC),
             "implicit recovery activation still persists downgrade refusal"
         );
     }
