@@ -71,26 +71,8 @@ jobs:
       - name: Bootstrap the standalone sibling workspace
         run: nix develop -c agent-check bootstrap
 
-      - name: Capture CLI helper build
-        run: |
-          set +e
-          nix develop -c agent-check flags-build > flags-build.txt 2>&1
-          printf '%s\n' "$?" > flags-build.status
-          exit 0
-
-      - name: Upload CLI helper build transcript
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: flags-build
-          path: |
-            flags-build.txt
-            flags-build.status
-          retention-days: 1
-
-      - name: Enforce CLI helper build
-        run: |
-          cat flags-build.txt
-          test "$(cat flags-build.status)" = "0"
+      - name: Build the CLI flag helper
+        run: nix develop -c agent-check flags-build
 
       - name: Audit the CLI flag contract
         run: nix develop -c agent-check flags-audit
