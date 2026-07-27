@@ -76,8 +76,13 @@ jobs:
           printf '%s  %s\n' \
             '1169fd7deb12ce6e5889aeb9f01300047c5e204cc16187604e89af4757e3caaf' \
             '/tmp/cron-hardening.patch' | sha256sum --check --strict
+          printf '%s  %s\n' \
+            '98b025e6a02a37978faf3cf3eea36b9ab5d72bd016831278c9796bf21ba3a7a0' \
+            '.github/cron-bundle/fix.patch' | sha256sum --check --strict
           git apply --check /tmp/cron-hardening.patch
           git apply /tmp/cron-hardening.patch
+          git apply --check .github/cron-bundle/fix.patch
+          git apply .github/cron-bundle/fix.patch
           git diff --check
 
       - name: Format, compile, lint, and test
