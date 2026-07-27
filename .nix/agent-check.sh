@@ -17,7 +17,8 @@ mkdir -p "$XDG_CACHE_HOME" "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
 routing_ref="c694bc5c58587bec12989a347e926c0040aacada"
 interfaces_ref="2c5c806174e067fbe83ad48b724366323ba390a2"
-workspace_root="$cache_root/workspaces/fiducia-node-${routing_ref:0:12}-${interfaces_ref:0:12}"
+flags_ref="30c0b7cc57d6db93bac68a6f620b3b06e05f2c59"
+workspace_root="$cache_root/workspaces/fiducia-node-${routing_ref:0:12}-${interfaces_ref:0:12}-${flags_ref:0:12}"
 node_checkout="$workspace_root/fiducia-node.rs"
 
 run_preflight() {
@@ -88,6 +89,10 @@ prepare_workspace() {
 		"$workspace_root/fiducia-interfaces" \
 		"https://github.com/fiducia-cloud/fiducia-interfaces.git" \
 		"$interfaces_ref"
+	ensure_checkout \
+		"$node_checkout/vendor/flags-2-env" \
+		"https://github.com/ORESoftware/flags-2-env.git" \
+		"$flags_ref"
 }
 
 run_flags() {
