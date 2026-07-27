@@ -16,9 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect protocol and schedule call sites
+      - name: Capture protocol and schedule call sites
+        shell: bash
         run: |
-          printf '%s\n' '=== protocol call sites ==='
-          rg -n "CURRENT_COMMAND_PROTOCOL|LEGACY_COMMAND_PROTOCOL|requires_current_protocol|for_active_protocol|ActivateCommandProtocol|Schedule(Upsert|ClaimFire|RecordResult|RecordRun)" src tests || true
-          printf '%s\n' '=== workflow inventory ==='
-          find .github/workflows -maxdepth 1 -type f -print | sort
+          set -euo pipefail
+          {
+            printf '%s\n' '=== protocol call sites ==='
+            rg -n -C 4 "CURRENT_COMMAND_PROTOCOL|LEGACY_COMMAND_PROTOCOL|requires_current_protocol|for_active_protocol|ActivateCommandProtocol|Schedule(Upsert|ClaimFire|RecordResult|RecordRun)" src tests || true
+            printf '%s\n' '=== schedule tests and helpers ==='
+            rg -n -C 3 "schedule_(get|list|history)|ReadRequest::Schedule|ReadResponse::Schedule|apply_schedule" src tests || true
+            printf '%s\n' '=== workflow inventory ==='
+            find .github/workflows -maxdepth 1 -type f -print | sort
+          } > cron-audit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cron-audit
+          path: cron-audit.txt
+          if-no-files-found: error
