@@ -71,8 +71,11 @@ jobs:
       - name: Bootstrap the standalone sibling workspace
         run: nix develop -c agent-check bootstrap
 
-      - name: Validate the CLI flag contract
-        run: nix develop -c agent-check flags
+      - name: Build the CLI flag helper
+        run: nix develop -c agent-check flags-build
+
+      - name: Audit the CLI flag contract
+        run: nix develop -c agent-check flags-audit
 
       - name: Check Rust formatting
         run: nix develop -c agent-check fmt
@@ -85,3 +88,6 @@ jobs:
 
       - name: Audit Rust dependencies
         run: nix develop -c agent-check audit
+
+      - name: Run the default agent entrypoint
+        run: nix develop -c agent-check
