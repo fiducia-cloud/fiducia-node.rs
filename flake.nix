@@ -28,6 +28,7 @@
             name = "agent-check";
             runtimeInputs = with pkgs; [
               actionlint
+              binutils
               cacert
               cargo-audit
               findutils
