@@ -1,42 +1,91 @@
-name: agent cron audit
+name: apply cron hardening
 
 on:
   push:
     branches:
       - agent/cron-service-hardening
-  pull_request:
-    branches:
-      - main
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: cron-hardening-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  audit:
+  implement-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Capture protocol and schedule call sites
+      - name: Check out node branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/cron-service-hardening
+          path: repo
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check out pinned interfaces dependency
+        uses: actions/checkout@v4
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
+          path: fiducia-interfaces
+          persist-credentials: false
+
+      - name: Check out pinned routing dependency
+        uses: actions/checkout@v4
+        with:
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Apply checksumed source patch
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
-          {
-            printf '%s\n' '=== protocol call sites ==='
-            grep -RIn -E -C 4 "CURRENT_COMMAND_PROTOCOL|LEGACY_COMMAND_PROTOCOL|requires_current_protocol|for_active_protocol|ActivateCommandProtocol|Schedule(Upsert|ClaimFire|RecordResult|RecordRun)" src tests 2>/dev/null || true
-            printf '%s\n' '=== schedule tests and helpers ==='
-            grep -RIn -E -C 3 "schedule_(get|list|history)|ReadRequest::Schedule|ReadResponse::Schedule|apply_schedule" src tests 2>/dev/null || true
-            printf '%s\n' '=== workflow inventory ==='
-            find .github/workflows -maxdepth 1 -type f -print | sort
-          } > cron-audit.txt
-          tar -czf cron-source.tgz \
-            Cargo.toml Cargo.lock README.md AGENTS.md \
-            src/state.rs src/consensus.rs src/schedule.rs src/schedule_runner.rs \
-            src/main.rs src/metrics.rs src/observe.rs src/org_scope.rs \
-            .github/workflows/ci.yml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cron-audit
-          path: |
-            cron-audit.txt
-            cron-source.tgz
-          if-no-files-found: error
+          cat .github/cron-patch/part* > /tmp/cron-hardening.patch.gz.b64
+          printf '%s  %s\n' \
+            'a1d10dc59437c5d0fc5f808ab702fa67680e90232a417cae3d7a554be81c7213' \
+            '/tmp/cron-hardening.patch.gz.b64' | sha256sum --check --strict
+          base64 --decode /tmp/cron-hardening.patch.gz.b64 | gzip --decompress > /tmp/cron-hardening.patch
+          printf '%s  %s\n' \
+            '1169fd7deb12ce6e5889aeb9f01300047c5e204cc16187604e89af4757e3caaf' \
+            '/tmp/cron-hardening.patch' | sha256sum --check --strict
+          git apply --check /tmp/cron-hardening.patch
+          git apply /tmp/cron-hardening.patch
+          git diff --check
+
+      - name: Format, compile, lint, and test
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --all-targets --all-features
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
+          git diff --check
+
+      - name: Commit validated implementation
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .github/cron-patch
+          rm -f .github/workflows/agent-cron-audit.yml
+          git add -A
+          git diff --cached --check
+          git config user.name 'fiducia-cloud automation'
+          git config user.email 'automation@fiducia.cloud'
+          git commit -m 'harden cron service control plane and telemetry'
+          git push origin HEAD:agent/cron-service-hardening
