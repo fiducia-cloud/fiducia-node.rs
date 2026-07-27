@@ -1,0 +1,115 @@
+--- a/src/schedule_runner.rs
++++ b/src/schedule_runner.rs
+@@ -254,11 +254,13 @@
+         );
+         claims += 1;
+         if !deliver_in_background(
+-            node,
+-            http,
+-            in_flight,
+-            gate,
+-            config,
++            DeliveryContext {
++                node,
++                http,
++                in_flight,
++                gate,
++                config,
++            },
+             schedule.clone(),
+             fire,
+             RunTrigger::Scheduled,
+@@ -304,11 +306,13 @@
+             continue;
+         };
+         if !deliver_in_background(
+-            node,
+-            http,
+-            in_flight,
+-            gate,
+-            config,
++            DeliveryContext {
++                node,
++                http,
++                in_flight,
++                gate,
++                config,
++            },
+             schedule.clone(),
+             fire,
+             run.trigger,
+@@ -320,16 +324,28 @@
+ 
+ /// Returns false when the fire is already running or the concurrency budget is
+ /// exhausted. A committed Pending record remains durable and is retried later.
++#[derive(Clone, Copy)]
++struct DeliveryContext<'a> {
++    node: &'a Arc<Node>,
++    http: &'a reqwest::Client,
++    in_flight: &'a InFlight,
++    gate: &'a Arc<Semaphore>,
++    config: &'a RunnerConfig,
++}
++
+ fn deliver_in_background(
+-    node: &Arc<Node>,
+-    http: &reqwest::Client,
+-    in_flight: &InFlight,
+-    gate: &Arc<Semaphore>,
+-    config: &RunnerConfig,
++    context: DeliveryContext<'_>,
+     schedule: Schedule,
+     fire_id_ms: u64,
+     trigger: RunTrigger,
+ ) -> bool {
++    let DeliveryContext {
++        node,
++        http,
++        in_flight,
++        gate,
++        config,
++    } = context;
+     let key = format!("{}#{fire_id_ms}", schedule.name);
+     {
+         let mut active = in_flight
+--- a/src/schedule.rs
++++ b/src/schedule.rs
+@@ -111,8 +111,8 @@
+         return bad_request(error);
+     }
+     let max_retries = body.max_retries.unwrap_or(3);
+-    if max_retries > MAX_RETRIES {
+-        return bad_request("max_retries_exceeds_limit");
++    if let Err(error) = validate_max_retries(max_retries) {
++        return bad_request(error);
+     }
+ 
+     let result = node
+@@ -308,6 +308,14 @@
+     }
+ }
+ 
++fn validate_max_retries(max_retries: u32) -> Result<(), &'static str> {
++    if max_retries > MAX_RETRIES {
++        Err("max_retries_exceeds_limit")
++    } else {
++        Ok(())
++    }
++}
++
+ fn validate_name(name: &str) -> Result<(), &'static str> {
+     if name.is_empty() {
+         return Err("schedule_name_required");
+@@ -394,7 +402,11 @@
+             validate_name("bad\nname"),
+             Err("schedule_name_contains_control_character")
+         );
+-        assert!(MAX_RETRIES < u32::MAX);
++        assert_eq!(validate_max_retries(10), Ok(()));
++        assert_eq!(
++            validate_max_retries(11),
++            Err("max_retries_exceeds_limit")
++        );
+     }
+ 
+     #[test]
