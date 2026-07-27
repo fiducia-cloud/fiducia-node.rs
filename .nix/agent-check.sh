@@ -24,6 +24,7 @@ if [ "$flags_mode" != "160000" ] || [ "$flags_stage" != "0" ] || [ "$flags_path"
 fi
 workspace_root="$cache_root/workspaces/fiducia-node-${routing_ref:0:12}-${interfaces_ref:0:12}-${flags_ref:0:12}"
 node_checkout="$workspace_root/fiducia-node.rs"
+flags_binary="$node_checkout/vendor/flags-2-env/build/flags2env"
 
 run_preflight() {
 	git diff --check
@@ -99,11 +100,23 @@ prepare_workspace() {
 		"$flags_ref"
 }
 
-run_flags() {
+run_flags_build() {
 	prepare_workspace
+	make -B -C "$node_checkout/vendor/flags-2-env" all
+	test -x "$flags_binary"
+}
+
+run_flags_audit() {
+	if [ ! -x "$flags_binary" ]; then
+		run_flags_build
+	fi
 	cd "$node_checkout"
-	make -B -C vendor/flags-2-env all
-	vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+	"$flags_binary" audit .cli-flags.toml
+}
+
+run_flags() {
+	run_flags_build
+	run_flags_audit
 }
 
 run_fmt() {
@@ -156,6 +169,12 @@ rust)
 bootstrap)
 	prepare_workspace
 	;;
+flags-build)
+	run_flags_build
+	;;
+flags-audit)
+	run_flags_audit
+	;;
 flags)
 	run_flags
 	;;
@@ -180,7 +199,7 @@ all)
 	run_workspace
 	;;
 *)
-	printf 'usage: agent-check [all|preflight|rust|bootstrap|flags|fmt|clippy|test|audit|workspace]\n' >&2
+	printf 'usage: agent-check [all|preflight|rust|bootstrap|flags-build|flags-audit|flags|fmt|clippy|test|audit|workspace]\n' >&2
 	exit 64
 	;;
 esac
