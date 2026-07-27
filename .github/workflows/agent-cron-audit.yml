@@ -22,14 +22,21 @@ jobs:
           set -euo pipefail
           {
             printf '%s\n' '=== protocol call sites ==='
-            rg -n -C 4 "CURRENT_COMMAND_PROTOCOL|LEGACY_COMMAND_PROTOCOL|requires_current_protocol|for_active_protocol|ActivateCommandProtocol|Schedule(Upsert|ClaimFire|RecordResult|RecordRun)" src tests || true
+            grep -RIn -E -C 4 "CURRENT_COMMAND_PROTOCOL|LEGACY_COMMAND_PROTOCOL|requires_current_protocol|for_active_protocol|ActivateCommandProtocol|Schedule(Upsert|ClaimFire|RecordResult|RecordRun)" src tests 2>/dev/null || true
             printf '%s\n' '=== schedule tests and helpers ==='
-            rg -n -C 3 "schedule_(get|list|history)|ReadRequest::Schedule|ReadResponse::Schedule|apply_schedule" src tests || true
+            grep -RIn -E -C 3 "schedule_(get|list|history)|ReadRequest::Schedule|ReadResponse::Schedule|apply_schedule" src tests 2>/dev/null || true
             printf '%s\n' '=== workflow inventory ==='
             find .github/workflows -maxdepth 1 -type f -print | sort
           } > cron-audit.txt
+          tar -czf cron-source.tgz \
+            Cargo.toml Cargo.lock README.md AGENTS.md \
+            src/state.rs src/consensus.rs src/schedule.rs src/schedule_runner.rs \
+            src/main.rs src/metrics.rs src/observe.rs src/org_scope.rs \
+            .github/workflows/ci.yml
       - uses: actions/upload-artifact@v4
         with:
           name: cron-audit
-          path: cron-audit.txt
+          path: |
+            cron-audit.txt
+            cron-source.tgz
           if-no-files-found: error
