@@ -1,50 +1,78 @@
 {
-  description = "Fiducia development environment";
+  description = "Compatibility flake for the fiducia-node agent environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { nixpkgs, ... }:
+  outputs =
+    { self, nixpkgs, ... }:
     let
       systems = [
-        "x86_64-linux"
+        "aarch64-darwin"
         "aarch64-linux"
         "x86_64-darwin"
-        "aarch64-darwin"
+        "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
-      devShells = forAllSystems (system:
+      formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
+
+      packages = forAllSystems (
+        system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor system;
+          agentCheck = pkgs.writeShellApplication {
+            name = "agent-check";
+            runtimeInputs = with pkgs; [
+              actionlint
+              cacert
+              cargo-audit
+              findutils
+              gcc
+              git
+              gnumake
+              nix
+              nixfmt-rfc-style
+              rsync
+              rustup
+              shellcheck
+              shfmt
+            ];
+            text = builtins.readFile ./agent-check.sh;
+          };
         in
         {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              rustc
-              cargo
-              rustfmt
-              clippy
-              rust-analyzer
+          inherit agentCheck;
+          default = agentCheck;
+        }
+      );
 
-              git
-              direnv
-              just
-              bacon
+      apps = forAllSystems (system: {
+        "agent-check" = {
+          type = "app";
+          program = "${self.packages.${system}.agentCheck}/bin/agent-check";
+        };
+        default = self.apps.${system}."agent-check";
+      });
 
-              nodejs
-              pnpm
+      checks = forAllSystems (system: {
+        agentCheck = self.packages.${system}.agentCheck;
+      });
 
-              pkg-config
-              openssl
-            ];
-
-            shellHook = ''
-              echo "Fiducia dev shell (${system})"
-            '';
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
+          default = import ./dev-shell.nix {
+            inherit pkgs;
+            agentCheck = self.packages.${system}.agentCheck;
           };
-        });
+        }
+      );
     };
 }
