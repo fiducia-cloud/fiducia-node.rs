@@ -1,22 +1,24 @@
 { pkgs, agentCheck }:
 let
-  shellPackages = (with pkgs; [
-    actionlint
-    cacert
-    cargo-audit
-    findutils
-    gcc
-    git
-    gnumake
-    jq
-    nixfmt-rfc-style
-    pkg-config
-    rsync
-    rust-analyzer
-    rustup
-    shellcheck
-    shfmt
-  ]) ++ [ agentCheck ];
+  shellPackages =
+    (with pkgs; [
+      actionlint
+      cacert
+      cargo-audit
+      findutils
+      gcc
+      git
+      gnumake
+      jq
+      nixfmt-rfc-style
+      pkg-config
+      rsync
+      rust-analyzer
+      rustup
+      shellcheck
+      shfmt
+    ])
+    ++ [ agentCheck ];
 in
 pkgs.mkShell {
   packages = shellPackages;
