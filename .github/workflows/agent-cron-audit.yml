@@ -1,9 +1,6 @@
 name: apply cron hardening
 
 on:
-  push:
-    branches:
-      - agent/cron-service-hardening
   pull_request:
     branches:
       - main
@@ -12,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: cron-hardening-${{ github.ref }}
+  group: cron-hardening-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -33,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if compgen -G 'repo/.github/cron-patch/part*' > /dev/null; then
+          if compgen -G 'repo/.github/cron-bundle/part*' > /dev/null; then
             echo 'present=true' >> "$GITHUB_OUTPUT"
           else
             echo 'present=false' >> "$GITHUB_OUTPUT"
@@ -71,7 +68,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .github/cron-patch/part* > /tmp/cron-hardening.patch.gz.b64
+          cat .github/cron-bundle/part* > /tmp/cron-hardening.patch.gz.b64
           printf '%s  %s\n' \
             'a1d10dc59437c5d0fc5f808ab702fa67680e90232a417cae3d7a554be81c7213' \
             '/tmp/cron-hardening.patch.gz.b64' | sha256sum --check --strict
@@ -88,13 +85,24 @@ jobs:
         working-directory: repo
         shell: bash
         run: |
-          set -euo pipefail
-          cargo fmt --all
-          cargo fmt --all -- --check
-          cargo check --all-targets --all-features
-          cargo clippy --all-targets --all-features --locked -- -D warnings
-          cargo test --all-targets --all-features --locked
-          git diff --check
+          set -o pipefail
+          {
+            set -euo pipefail
+            cargo fmt --all
+            cargo fmt --all -- --check
+            cargo check --all-targets --all-features
+            cargo clippy --all-targets --all-features --locked -- -D warnings
+            cargo test --all-targets --all-features --locked
+            git diff --check
+          } 2>&1 | tee cron-build.log
+
+      - name: Upload build diagnostics
+        if: always() && steps.patch.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cron-hardening-build-${{ github.run_id }}
+          path: repo/cron-build.log
+          if-no-files-found: warn
 
       - name: Commit validated implementation
         if: steps.patch.outputs.present == 'true'
@@ -102,7 +110,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf .github/cron-patch
+          rm -rf .github/cron-bundle .github/cron-patch
+          rm -f cron-build.log
           git add -A
           git diff --cached --check
           git config user.name 'fiducia-cloud automation'
