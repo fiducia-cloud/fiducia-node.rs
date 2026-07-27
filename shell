@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Enter (or run a command inside) the repo's Nix dev shell defined in .nix/.
+# Enter (or run a command inside) the repository's canonical root Nix dev shell.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 if [[ $# -gt 0 ]]; then
-  exec nix develop "$repo_root/.nix" --command "$@"
+  exec nix develop "$repo_root" --command "$@"
 fi
 
-exec nix develop "$repo_root/.nix"
+exec nix develop "$repo_root"
