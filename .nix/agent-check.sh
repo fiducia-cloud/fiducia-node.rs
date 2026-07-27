@@ -15,7 +15,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$cache_root/cargo-target}"
 mkdir -p "$XDG_CACHE_HOME" "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
 git diff --check
-nixfmt --check flake.nix .nix/dev-shell.nix
+nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
 shellcheck .nix/agent-check.sh
 shfmt -d .nix/agent-check.sh
 
@@ -28,6 +28,7 @@ if ((${#workflows[@]} > 0)); then
 fi
 
 nix flake check --show-trace
+nix flake check ./.nix --show-trace
 
 rustup set profile minimal
 rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
