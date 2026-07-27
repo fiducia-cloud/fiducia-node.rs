@@ -21,7 +21,9 @@ nix develop ./.nix
 - `fiducia-routing.rs`: `c694bc5c58587bec12989a347e926c0040aacada`
 - `fiducia-interfaces`: `2c5c806174e067fbe83ad48b724366323ba390a2`
 
-It then runs the CLI flag contract, formatting, Clippy with warnings denied, all tests, and `cargo audit` using Rust 1.95.0 from `rust-toolchain.toml`. Rustup, Cargo, build outputs, and other caches stay below `.cache/` unless explicitly overridden.
+The `vendor/flags-2-env` helper is fetched at the exact commit recorded by the repository's stage-0 gitlink. The agent script reads that pin from the Git index, so updating the submodule does not require duplicating its SHA in Nix code.
+
+It then runs the CLI flag contract, formatting, Clippy with warnings denied, all tests, and `cargo audit` using Rust 1.95.0 from `rust-toolchain.toml`. Rustup, Cargo, build outputs, and other caches stay below `.cache/` unless explicitly overridden. Diagnostic subcommands are available for `preflight`, `rust`, `bootstrap`, `flags`, `fmt`, `clippy`, `test`, and `audit`; the default no-argument command runs the complete contract.
 
 ## Toolchain drift
 
