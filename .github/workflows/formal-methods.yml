@@ -124,5 +124,6 @@ jobs:
         with:
           name: fiducia-node-union-lock-formal-artifacts
           path: .formal-artifacts
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
