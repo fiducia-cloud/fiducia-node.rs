@@ -24,7 +24,7 @@ All over HTTP (`/v1`):
 | **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
 | **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted before Raft** through external Vault Transit or a versioned local AES-256-GCM keyring; per-write `{"plaintext": true}` opt-out. |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
-| **Cron / schedules**  | `/v1/cron/*`       | Durable schedules with at-least-once / exactly-once run records. |
+| **Cron / schedules**  | `/v1/cron/*`       | Tenant-scoped CRUD, pause/resume/manual runs, sandboxed function targets, and a trace-correlated durable run trail. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
 | **Service discovery** | `/v1/services/*`   | TTL-health registry of live service instances (Consul/etcd).   |
 | **Counters**          | `/v1/counters/*`   | Replicated signed integers with CAS via `mod_revision` (thresholds, tallies). |
@@ -70,6 +70,89 @@ fiducia() {
     -H 'content-type: application/json' "$@"
 }
 ```
+
+### Cron jobs as a service
+
+Cron definitions, lifecycle changes, manual triggers, and run results are durable
+Raft state. Every caller is confined to the organization injected by the trusted
+load-balancer hop; list responses un-scope only that caller's names. The elected
+shard leader claims each scheduled fire exactly once, while target-side
+idempotency makes an interrupted delivery safe to repeat after leader failover.
+
+The customer-facing control plane supports the complete lifecycle:
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/v1/cron/schedules?limit=50&cursor=...` | List this organization's schedules in stable name order. |
+| `PUT` | `/v1/cron/schedules/{name}` | Create or update a cron or one-shot definition. Editing a paused definition keeps it paused. |
+| `GET` | `/v1/cron/schedules/{name}` | Read one definition, including `enabled` and `next_fire_ms`. |
+| `DELETE` | `/v1/cron/schedules/{name}` | Idempotently delete the definition and its bounded run history. |
+| `POST` | `/v1/cron/schedules/{name}/pause` | Stop new scheduled claims without deleting the job. |
+| `POST` | `/v1/cron/schedules/{name}/resume` | Resume from the next future occurrence. Add `?catch_up=true` only for an intentional backlog replay. |
+| `POST` | `/v1/cron/schedules/{name}/trigger` | Enqueue a manual run, even while paused. Reuse `?fire_id_ms=...` for idempotent retries. |
+| `GET` | `/v1/cron/schedules/{name}/history?limit=50` | Read the newest-first run trail. |
+
+Create a webhook schedule:
+
+```bash
+fiducia -XPUT localhost:8090/v1/cron/schedules/billing-hourly -d '{
+  "cron":"0 * * * *",
+  "target":{"type":"webhook","url":"https://billing.example.com/internal/cron"},
+  "delivery":"exactly_once",
+  "max_retries":5
+}'
+```
+
+Create a one-shot schedule by supplying `one_shot_at_ms` instead of `cron`.
+External targets must be credential-free HTTP(S) URLs and cannot resolve to
+loopback, link-local, private, or cluster-internal hosts. The runner retries only
+transient outcomes (timeouts, connection failures, HTTP 408/425/429, and 5xx),
+obeys a bounded numeric `Retry-After`, and does not amplify permanent 4xx errors.
+
+Custom code uses the separate, sandboxed `fiducia-lambda-service` runtime. The
+schedule stores only an opaque function identifier—not source code, runtime
+credentials, or database secrets—in the replicated log:
+
+```bash
+fiducia -XPUT localhost:8090/v1/cron/schedules/nightly-reconcile -d '{
+  "cron":"30 2 * * *",
+  "target":{"type":"function","function_id":"reconcile-nightly-v3"},
+  "delivery":"exactly_once",
+  "max_retries":3
+}'
+```
+
+Operators configure `FIDUCIA_LAMBDA_SERVICE_URL` and the secret
+`FIDUCIA_LAMBDA_SERVER_AUTH_SECRET` on the node. Function targets are then sent
+to the lambda service's authenticated `/invoke/{function_id}` endpoint. A
+function target fails closed as `function_runtime_unconfigured` when that
+boundary is absent; the node never evaluates customer code itself.
+
+Each retained run reports `trigger`, `status`, `attempts`, `error_class`, optional
+HTTP status, duration, completion time, and OpenTelemetry `trace_id`/`span_id`.
+The public endpoint that previously let callers append arbitrary run records has
+been removed: only the elected runner may write delivery outcomes. Error text and
+trace identifiers are bounded before they enter Raft.
+
+The runner emits OTLP traces and low-cardinality metrics through the shared
+`fiducia-telemetry` pipeline. An OpenTelemetry Collector can export metrics to
+Prometheus, JSON logs to Loki, and traces to Tempo or another OTLP backend; Grafana
+can correlate a history row's trace ID across all three signals. Key instruments:
+
+- `fiducia.cron.claims`
+- `fiducia.cron.deliveries`
+- `fiducia.cron.delivery.attempts`
+- `fiducia.cron.delivery.retries`
+- `fiducia.cron.delivery.deferred`
+- `fiducia.cron.delivery.duration`
+- `fiducia.cron.delivery.in_flight`
+
+Metric labels stay bounded (`outcome`, `error.class`, `target.kind`, `trigger`);
+schedule and organization names are trace/log fields rather than Prometheus
+labels. That avoids a customer-controlled cardinality explosion while preserving
+per-run debugging in Loki and the tracing backend. `FIDUCIA_CRON_MAX_IN_FLIGHT`
+(default `64`, hard-clamped to `1..=1024`) provides node-wide delivery
+backpressure.
 
 ### Leader election
 
@@ -446,6 +529,9 @@ Every knob is an environment variable, read once at boot. The full surface:
 | `FIDUCIA_PEERS` | string | *(empty)* | no | Comma-separated peer node addresses; empty ⇒ single-node mode. |
 | `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Number of shards the keyspace is partitioned into (min `1`). |
 | `FIDUCIA_DATA_DIR` | string | `/var/lib/fiducia` | no | Directory for durable per-shard Raft state (log/meta/snapshot). Must be writable. |
+| `FIDUCIA_CRON_MAX_IN_FLIGHT` | integer | `64` | no | Node-wide cap on concurrently executing cron deliveries, clamped to `1..=1024`. |
+| `FIDUCIA_LAMBDA_SERVICE_URL` | URL | *(unset)* | no | Trusted base URL for sandboxed `function` schedule targets. Function delivery fails closed when unset. |
+| `FIDUCIA_LAMBDA_SERVER_AUTH_SECRET` | string | *(unset)* | **yes** | Server-auth secret sent only to the configured lambda service; never stored in Raft or logged. |
 | `FIDUCIA_RAFT_SNAPSHOT_THRESHOLD` | integer | `1024` | no | Committed entries between snapshots and compaction; `0` disables. |
 | `FIDUCIA_RAFT_PEER_MAX_BODY_BYTES` | integer | `268435456` | no | Absolute serialized request-body ceiling shared by inbound and outbound Raft HTTP. Snapshot state above this bound cannot transfer until the value is raised consistently. |
 | `FIDUCIA_RAFT_APPEND_MAX_BYTES` | integer | `8388608` | no | Target serialized size for one response-driven AppendEntries batch, clamped to the peer body ceiling. |
@@ -561,22 +647,25 @@ For a local release-equivalent check, use `cargo build --release --locked`.
 
 ### Rolling command-protocol upgrades
 
-Lock/semaphore attempt IDs, cancellation, and explicit renewals use command
-protocol V2. The Raft rollout is automatic but deliberately two-phase:
+Lock/semaphore attempt IDs, cancellation, and explicit renewals require command
+protocol V2. Cron lifecycle controls and diagnostic results require V3. The Raft
+rollout is automatic and per-command rather than an all-or-nothing binary gate:
 
-1. Upgrade every configured replica. Leaders continue writing legacy-compatible
-   acquire entries while `active_command_protocol` is 1; V2-only operations
-   return unavailable rather than placing an entry an older peer cannot parse.
-2. Each follower advertises `parser_command_protocol: 2` in AppendEntries. Only
-   after **every** configured peer has done so does the leader append and commit
-   the per-shard activation barrier. `/v1/status` then reports
-   `active_command_protocol: 2`.
+1. Upgrade every configured replica. A leader may continue emitting commands
+   understood by the active protocol, but it rejects a V2/V3-only operation
+   rather than placing an entry an older peer cannot parse.
+2. Each follower advertises its parser protocol in AppendEntries. Only after
+   **every** configured peer advertises the next version does the leader append
+   and commit that per-shard activation barrier. `/v1/status` exposes both parser
+   and active protocol versions.
+3. A protocol-2 cluster can still replicate V2 lock commands while withholding a
+   V3 cron-control entry. This prevents an unrelated feature rollout from
+   needlessly blocking established commands.
 
-Do not intentionally downgrade a shard after activation. The activation entry
-causes the previous binary to reject the retained log; after compaction, a
-non-JSON snapshot compatibility stamp preserves that fail-closed refusal. A
-recovered V2 entry left by a pre-gate build is likewise withheld from unadvertised
-peers and cannot commit until every peer has advertised the V2 parser.
+Do not intentionally downgrade a shard after activation. Every version has a
+non-JSON snapshot compatibility stamp, and retained log entries carry their
+minimum parser version. Older binaries therefore fail closed instead of silently
+restoring or committing state they cannot interpret.
 
 ## Security
 

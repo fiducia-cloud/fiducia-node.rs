@@ -73,6 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Hold the guard for the whole of `main`: v0.2.1's `init` returns a
     // `#[must_use]` TelemetryGuard that shuts the OTLP exporters down on drop.
     let _telemetry = fiducia_telemetry::init(SERVICE);
+    // The shared v0.2.1 telemetry crate initializes exporters but predates a
+    // process-wide propagator. Cron deliveries are producer spans, so install
+    // W3C Trace Context before the runner starts and inject it downstream.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
 
     // Bootstrap this node. Single-node by default; FIDUCIA_PEERS / shard count
     // come from the environment (see consensus::NodeConfig).
