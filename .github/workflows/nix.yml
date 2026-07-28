@@ -58,7 +58,7 @@ jobs:
           nix develop -c shfmt -d .nix/agent-check.sh
 
       - name: Check GitHub Actions
-        run: nix develop -c actionlint .github/workflows/ci.yml .github/workflows/cli-flags.yml .github/workflows/docker.yml .github/workflows/nix.yml
+        run: nix develop -c actionlint .github/workflows/ci.yml .github/workflows/cli-flags.yml .github/workflows/docker.yml .github/workflows/formal-methods.yml .github/workflows/nix.yml
 
       - name: Evaluate root and compatibility flakes
         run: |
