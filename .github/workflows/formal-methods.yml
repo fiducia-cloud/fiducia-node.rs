@@ -42,8 +42,14 @@ jobs:
 
       - name: Typecheck model and deterministic traces
         run: |
-          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock.qnt
-          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock_test.qnt
+          mkdir -p .formal-artifacts/typecheck
+          set -o pipefail
+          status=0
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock.qnt \
+            2>&1 | tee .formal-artifacts/typecheck/union-lock.log || status=$?
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock_test.qnt \
+            2>&1 | tee .formal-artifacts/typecheck/union-lock-test.log || status=$?
+          exit "$status"
 
       - name: Run deterministic state-machine traces
         run: |
