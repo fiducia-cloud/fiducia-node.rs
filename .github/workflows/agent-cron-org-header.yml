@@ -1,3 +1,4 @@
+# One-shot branch migration. The job deletes this file after applying the patch.
 name: apply cron function tenant propagation
 
 on:
@@ -124,6 +125,7 @@ jobs:
           source = source.replace(old, new, 1)
           path.write_text(source)
           PY
+          cargo fmt --all
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
