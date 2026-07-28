@@ -22,9 +22,9 @@ base64 = "0.22"
 tower-http = { version = "0.5", features = ["trace", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
 
 # Peer transport: the HTTP client a leader uses to send AppendEntries/RequestVote
 # to its shard peers. Intra-cluster plain HTTP, so no TLS backend is pulled in.
