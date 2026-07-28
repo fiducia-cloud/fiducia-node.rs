@@ -545,6 +545,23 @@ async fn deliver(
             };
         }
     };
+    let function_org_id = if function_auth {
+        match scoped_org(&schedule.name) {
+            Some(org_id) => Some(org_id.to_string()),
+            None => {
+                return DeliveryOutcome {
+                    delivered: false,
+                    attempts: 0,
+                    error: Some("function schedule is missing tenant scope".to_string()),
+                    error_class: Some("configuration".to_string()),
+                    http_status: None,
+                    duration_ms: elapsed_ms(started),
+                };
+            }
+        }
+    } else {
+        None
+    };
     let pinned_client = if function_auth {
         None
     } else {
@@ -610,6 +627,9 @@ async fn deliver(
             if function_auth {
                 if let Some(secret) = config.lambda_server_auth.clone() {
                     request = request.header("x-server-auth", secret);
+                }
+                if let Some(org_id) = function_org_id.as_deref() {
+                    request = request.header("x-fiducia-org-id", org_id);
                 }
             }
             request.send().await
@@ -840,6 +860,13 @@ fn status_class(status: u16) -> &'static str {
     }
 }
 
+fn scoped_org(name: &str) -> Option<&str> {
+    name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
+        .and_then(|rest| rest.split_once(fiducia_routing::ORG_SCOPE_DELIM))
+        .map(|(org_id, _)| org_id)
+        .filter(|org_id| !org_id.is_empty())
+}
+
 fn unscoped_name(name: &str) -> &str {
     name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
         .and_then(|rest| rest.split_once(fiducia_routing::ORG_SCOPE_DELIM))
@@ -877,6 +904,17 @@ mod tests {
             delivery_idempotency_key("billing-hourly", fire),
             delivery_idempotency_key("email-hourly", fire),
         );
+    }
+
+    #[test]
+    fn scoped_schedule_names_recover_tenant_and_public_name() {
+        let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+        let name = format!("{delimiter}acme{delimiter}billing-hourly");
+        assert_eq!(scoped_org(&name), Some("acme"));
+        assert_eq!(unscoped_name(&name), "billing-hourly");
+        assert_eq!(scoped_org("billing-hourly"), None);
+        let empty_org = format!("{delimiter}{delimiter}billing-hourly");
+        assert_eq!(scoped_org(&empty_org), None);
     }
 
     #[test]
