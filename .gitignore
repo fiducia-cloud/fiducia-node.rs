@@ -13,6 +13,9 @@
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/
 
+# Repository-local Nix, Rustup, Cargo, and agent workspaces
+.cache/
+
 # --- hardened baseline (auto) ---
 Thumbs.db
 *.swp

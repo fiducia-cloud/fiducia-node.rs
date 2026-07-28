@@ -1,5 +1,5 @@
 {
-  description = "Compatibility flake for the fiducia-node agent environment";
+  description = "Agent-first development environment for fiducia-node";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -42,7 +42,7 @@
               shellcheck
               shfmt
             ];
-            text = builtins.readFile ./agent-check.sh;
+            text = builtins.readFile ./.nix/agent-check.sh;
           };
         in
         {
@@ -69,7 +69,7 @@
           pkgs = pkgsFor system;
         in
         {
-          default = import ./dev-shell.nix {
+          default = import ./.nix/dev-shell.nix {
             inherit pkgs;
             agentCheck = self.packages.${system}.agentCheck;
           };

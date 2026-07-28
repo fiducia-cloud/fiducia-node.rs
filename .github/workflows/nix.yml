@@ -1,0 +1,93 @@
+name: nix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - .nix/**
+      - .envrc
+      - shell
+      - rust-toolchain.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - .nix/**
+      - .envrc
+      - shell
+      - rust-toolchain.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check Nix formatting
+        run: nix develop -c nixfmt --check flake.nix .nix/flake.nix .nix/dev-shell.nix
+
+      - name: Check agent shell
+        run: |
+          nix develop -c shellcheck .nix/agent-check.sh
+          nix develop -c shfmt -d .nix/agent-check.sh
+
+      - name: Check GitHub Actions
+        run: nix develop -c actionlint .github/workflows/ci.yml .github/workflows/cli-flags.yml .github/workflows/docker.yml .github/workflows/nix.yml
+
+      - name: Evaluate root and compatibility flakes
+        run: |
+          nix flake check --show-trace
+          nix flake check ./.nix --show-trace
+
+      - name: Install and verify pinned Rust
+        run: nix develop -c agent-check rust
+
+      - name: Bootstrap the standalone sibling workspace
+        run: nix develop -c agent-check bootstrap
+
+      - name: Build the CLI flag helper
+        run: nix develop -c agent-check flags-build
+
+      - name: Audit the CLI flag contract
+        run: nix develop -c agent-check flags-audit
+
+      - name: Check Rust formatting
+        run: nix develop -c agent-check fmt
+
+      - name: Run Clippy
+        run: nix develop -c agent-check clippy
+
+      - name: Run Rust tests
+        run: nix develop -c agent-check test
+
+      - name: Audit Rust dependencies
+        run: nix develop -c agent-check audit
+
+      - name: Run the default agent entrypoint
+        run: nix develop -c agent-check
