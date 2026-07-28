@@ -1,0 +1,133 @@
+name: apply cron function tenant propagation
+
+on:
+  push:
+    branches:
+      - agent/cron-service-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/cron-service-hardening
+          fetch-depth: 0
+      - name: Propagate the committed schedule tenant to the function runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/schedule_runner.rs')
+          source = path.read_text()
+
+          old = '''    let pinned_client = if function_auth {
+          None
+      } else {
+'''
+          new = '''    let function_org_id = if function_auth {
+          match scoped_org(&schedule.name) {
+              Some(org_id) => Some(org_id.to_string()),
+              None => {
+                  return DeliveryOutcome {
+                      delivered: false,
+                      attempts: 0,
+                      error: Some("function schedule is missing tenant scope".to_string()),
+                      error_class: Some("configuration".to_string()),
+                      http_status: None,
+                      duration_ms: elapsed_ms(started),
+                  };
+              }
+          }
+      } else {
+          None
+      };
+      let pinned_client = if function_auth {
+          None
+      } else {
+'''
+          if source.count(old) != 1:
+              raise SystemExit('function target insertion point changed')
+          source = source.replace(old, new, 1)
+
+          old = '''            if function_auth {
+                  if let Some(secret) = config.lambda_server_auth.clone() {
+                      request = request.header("x-server-auth", secret);
+                  }
+              }
+              request.send().await
+'''
+          new = '''            if function_auth {
+                  if let Some(secret) = config.lambda_server_auth.clone() {
+                      request = request.header("x-server-auth", secret);
+                  }
+                  if let Some(org_id) = function_org_id.as_deref() {
+                      request = request.header("x-fiducia-org-id", org_id);
+                  }
+              }
+              request.send().await
+'''
+          if source.count(old) != 1:
+              raise SystemExit('function request header insertion point changed')
+          source = source.replace(old, new, 1)
+
+          old = '''fn unscoped_name(name: &str) -> &str {
+      name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
+          .and_then(|rest| rest.split_once(fiducia_routing::ORG_SCOPE_DELIM))
+          .map(|(_, name)| name)
+          .unwrap_or(name)
+  }
+'''
+          new = '''fn scoped_org(name: &str) -> Option<&str> {
+      name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
+          .and_then(|rest| rest.split_once(fiducia_routing::ORG_SCOPE_DELIM))
+          .map(|(org_id, _)| org_id)
+          .filter(|org_id| !org_id.is_empty())
+  }
+
+  fn unscoped_name(name: &str) -> &str {
+      name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
+          .and_then(|rest| rest.split_once(fiducia_routing::ORG_SCOPE_DELIM))
+          .map(|(_, name)| name)
+          .unwrap_or(name)
+  }
+'''
+          if source.count(old) != 1:
+              raise SystemExit('scope helper insertion point changed')
+          source = source.replace(old, new, 1)
+
+          old = '''    #[test]
+      fn retry_policy_does_not_retry_customer_errors() {
+'''
+          new = '''    #[test]
+      fn scoped_schedule_names_recover_tenant_and_public_name() {
+          let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+          let name = format!("{delimiter}acme{delimiter}billing-hourly");
+          assert_eq!(scoped_org(&name), Some("acme"));
+          assert_eq!(unscoped_name(&name), "billing-hourly");
+          assert_eq!(scoped_org("billing-hourly"), None);
+          let empty_org = format!("{delimiter}{delimiter}billing-hourly");
+          assert_eq!(scoped_org(&empty_org), None);
+      }
+
+      #[test]
+      fn retry_policy_does_not_retry_customer_errors() {
+'''
+          if source.count(old) != 1:
+              raise SystemExit('test insertion point changed')
+          source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/schedule_runner.rs
+          git rm .github/workflows/agent-cron-org-header.yml
+          git commit -m 'fix: propagate cron tenant to function runtime'
+          git push origin HEAD:agent/cron-service-hardening
