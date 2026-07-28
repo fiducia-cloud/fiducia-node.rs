@@ -76,7 +76,7 @@ QUINT_PACKAGE='@informalsystems/quint@0.32.0'
 npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock.qnt
 npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock_test.qnt
 npx --yes --package="$QUINT_PACKAGE" quint test \
-  formal/union_lock_test.qnt --main=union_lock_test --match='.*'
+  formal/union_lock_test.qnt --main=union_lock_test --match='.*Test$'
 npx --yes --package="$QUINT_PACKAGE" quint run \
   formal/union_lock.qnt \
   --main=union_lock \
