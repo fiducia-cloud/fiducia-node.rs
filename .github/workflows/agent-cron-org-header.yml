@@ -1,4 +1,3 @@
-# One-shot branch migration. The job deletes this file after applying the patch.
 name: apply cron function tenant propagation
 
 on:
@@ -53,9 +52,10 @@ jobs:
           None
       } else {
 '''
-          if source.count(old) != 1:
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'let function_org_id = if function_auth' not in source:
               raise SystemExit('function target insertion point changed')
-          source = source.replace(old, new, 1)
 
           old = '''            if function_auth {
                   if let Some(secret) = config.lambda_server_auth.clone() {
@@ -74,9 +74,10 @@ jobs:
               }
               request.send().await
 '''
-          if source.count(old) != 1:
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'request.header("x-fiducia-org-id", org_id)' not in source:
               raise SystemExit('function request header insertion point changed')
-          source = source.replace(old, new, 1)
 
           old = '''fn unscoped_name(name: &str) -> &str {
       name.strip_prefix(fiducia_routing::ORG_SCOPE_DELIM)
@@ -99,9 +100,10 @@ jobs:
           .unwrap_or(name)
   }
 '''
-          if source.count(old) != 1:
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'fn scoped_org(name: &str)' not in source:
               raise SystemExit('scope helper insertion point changed')
-          source = source.replace(old, new, 1)
 
           old = '''    #[test]
       fn retry_policy_does_not_retry_customer_errors() {
@@ -120,16 +122,21 @@ jobs:
       #[test]
       fn retry_policy_does_not_retry_customer_errors() {
 '''
-          if source.count(old) != 1:
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'scoped_schedule_names_recover_tenant_and_public_name' not in source:
               raise SystemExit('test insertion point changed')
-          source = source.replace(old, new, 1)
+
           path.write_text(source)
           PY
           cargo fmt --all
           git diff --check
+          if git diff --quiet -- src/schedule_runner.rs; then
+            echo 'tenant propagation already applied'
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/schedule_runner.rs
-          git rm .github/workflows/agent-cron-org-header.yml
           git commit -m 'fix: propagate cron tenant to function runtime'
           git push origin HEAD:agent/cron-service-hardening
