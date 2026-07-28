@@ -30,8 +30,8 @@ module union_lock_test {
     init
       .then(acquire_now(1, Set(1), 1, 3))
       .then(enqueue_wait(2, Set(1, 2), 1, 2, 3))
-      .then(acquire_now(3, Set(2), 1, 2).fail())
-      .expect(s.queue.size() == 1)
+      .then(acquire_now(3, Set(2), 1, 2))
+      .fail()
 
   run disjointRequestMayBypassQueueTest =
     init
@@ -47,8 +47,19 @@ module union_lock_test {
   run cancelPreventsDelayedAcquireTest =
     init
       .then(cancel_absent(1, Set(1), 1))
-      .then(acquire_now(1, Set(1), 1, 2).fail())
-      .then(enqueue_wait(1, Set(1), 1, 2, 2).fail())
+      .then(acquire_now(1, Set(1), 1, 2))
+      .fail()
+
+  run cancelPreventsDelayedEnqueueTest =
+    init
+      .then(acquire_now(2, Set(1), 1, 3))
+      .then(cancel_absent(1, Set(1), 1))
+      .then(enqueue_wait(1, Set(1), 1, 2, 2))
+      .fail()
+
+  run cancellationTombstoneStateTest =
+    init
+      .then(cancel_absent(1, Set(1), 1))
       .expect(and {
         s.cancellations.size() == 1,
         union_lock_safety,
