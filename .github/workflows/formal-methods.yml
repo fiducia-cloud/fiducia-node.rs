@@ -1,0 +1,122 @@
+name: Formal methods
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/formal-methods.yml'
+      - 'formal/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/formal-methods.yml'
+      - 'formal/**'
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-methods-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+
+jobs:
+  union-lock:
+    name: Quint union-lock model
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Typecheck model and deterministic traces
+        run: |
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock.qnt
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock_test.qnt
+
+      - name: Run deterministic state-machine traces
+        run: |
+          mkdir -p .formal-artifacts/tests
+          npx --yes --package="$QUINT_PACKAGE" quint test \
+            formal/union_lock_test.qnt \
+            --main=union_lock_test \
+            --match='.*' \
+            --out-itf='.formal-artifacts/tests/{test}-{seq}.itf.json'
+
+      - name: Simulate invariants and reach critical states
+        run: |
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/union_lock.qnt \
+            --main=union_lock \
+            --max-samples=10000 \
+            --max-steps=35 \
+            --invariant=union_lock_safety \
+            --witnesses \
+              queued_work_reached \
+              concurrent_disjoint_grants_reached \
+              cancellation_tombstone_reached \
+              token_exhaustion_reached
+
+      - name: Generate model-based testing traces
+        run: |
+          mkdir -p .formal-artifacts/mbt
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/union_lock.qnt \
+            --main=union_lock \
+            --max-samples=500 \
+            --max-steps=25 \
+            --n-traces=8 \
+            --mbt \
+            --out-itf='.formal-artifacts/mbt/union-lock-{seq}.itf.json'
+
+      - name: Install Java for bounded verification
+        if: github.event_name != 'pull_request'
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Exhaustively check bounded executions with Apalache
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p .formal-artifacts/verify
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/union_lock.qnt \
+            --main=union_lock \
+            --max-steps=10 \
+            --invariant=union_lock_safety \
+            --out-itf='.formal-artifacts/verify/counterexample-{seq}.itf.json'
+
+      - name: Record verification inputs
+        if: always()
+        run: |
+          mkdir -p .formal-artifacts
+          {
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'event=%s\n' "$GITHUB_EVENT_NAME"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'node=' && node --version
+            printf 'java=' && (java -version 2>&1 | head -n 1 || true)
+            printf 'quint_package=%s\n' "$QUINT_PACKAGE"
+            sha256sum formal/fm.toml formal/union_lock.qnt formal/union_lock_test.qnt
+          } > .formal-artifacts/provenance.txt
+
+      - name: Upload traces and provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fiducia-node-union-lock-formal-artifacts
+          path: .formal-artifacts
+          if-no-files-found: warn
+          retention-days: 14
