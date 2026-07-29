@@ -19,7 +19,7 @@ nix develop ./.nix
 `agent-check` solves that without mutating the checkout. It creates an ignored workspace under `.cache/nix-agent/workspaces/`, copies the current repository into it, and fetches the exact sibling commits already pinned by the Dockerfile:
 
 - `fiducia-routing.rs`: `c694bc5c58587bec12989a347e926c0040aacada`
-- `fiducia-interfaces`: `2c5c806174e067fbe83ad48b724366323ba390a2`
+- `fiducia-interfaces`: `bd718cd72d72aa330534f3688f8fb1ce90c19d10`
 
 The `vendor/flags-2-env` helper is fetched at the exact commit recorded by the repository's stage-0 gitlink. The agent script reads that pin from the Git index, so updating the submodule does not require duplicating its SHA in Nix code.
 

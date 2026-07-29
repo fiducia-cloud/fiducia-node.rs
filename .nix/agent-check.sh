@@ -25,7 +25,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$cache_root/cargo-target}"
 mkdir -p "$XDG_CACHE_HOME" "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
 routing_ref="c694bc5c58587bec12989a347e926c0040aacada"
-interfaces_ref="2c5c806174e067fbe83ad48b724366323ba390a2"
+interfaces_ref="bd718cd72d72aa330534f3688f8fb1ce90c19d10"
 read -r flags_mode flags_ref flags_stage flags_path < <(git ls-files --stage vendor/flags-2-env)
 if [ "$flags_mode" != "160000" ] || [ "$flags_stage" != "0" ] || [ "$flags_path" != "vendor/flags-2-env" ]; then
 	printf 'vendor/flags-2-env is not a committed stage-0 gitlink\n' >&2
