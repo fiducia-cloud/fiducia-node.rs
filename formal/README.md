@@ -81,9 +81,9 @@ tokens, and the Rust exploration caps above.
 - `quint verify` uses Apalache for exhaustive checking through the configured
   bounded transition depth on pull requests, pushes to `main`, scheduled runs,
   and manual dispatch.
-- `cargo test --test formal_union_lock_refinement` checks the real Rust state
-  machine against the independent reference model and runs directly in the
-  formal-methods workflow as well as ordinary Rust CI.
+- Ordinary Rust CI runs
+  `cargo test --test formal_union_lock_refinement --locked -- --nocapture` as a
+  dedicated required step before the complete Rust test suite.
 - Generated ITF traces are retained as artifacts, but the Rust refinement
   harness does not yet consume those exact generated files. It independently
   explores the same transition contract.
