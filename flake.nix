@@ -18,7 +18,7 @@
       pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
-      formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
+      formatter = forAllSystems (system: (pkgsFor system).nixfmt);
 
       packages = forAllSystems (
         system:
@@ -31,13 +31,17 @@
               binutils
               cacert
               cargo-audit
+              coreutils
               findutils
               gcc
               git
               gnumake
+              jdk21_headless
               nix
-              nixfmt-rfc-style
+              nixfmt
+              nodejs_22
               python3
+              quint
               rsync
               rustup
               shellcheck

@@ -4,6 +4,15 @@ set -euo pipefail
 export CI="${CI:-1}"
 export NO_COLOR="${NO_COLOR:-1}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+rust_test_threads="${RUST_TEST_THREADS:-4}"
+
+if [ "$(uname -s)" = "Darwin" ]; then
+	# Rust's panic unwinder must be linked by the platform driver on macOS.
+	# The Nix clang wrapper can produce a binary whose expected-panic tests
+	# abort in __rust_start_panic instead of unwinding.
+	export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="${CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER:-/usr/bin/clang}"
+	export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="${CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER:-/usr/bin/clang}"
+fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -84,6 +93,8 @@ prepare_workspace() {
 		--delete \
 		--exclude '/.git/' \
 		--exclude '/.cache/' \
+		--exclude '/.formal-artifacts/' \
+		--exclude '/_apalache-out/' \
 		--exclude '/target/' \
 		"$repo_root/" \
 		"$node_checkout/"
@@ -139,7 +150,8 @@ run_tests() {
 	activate_rust_toolchain
 	prepare_workspace
 	cd "$node_checkout"
-	cargo test --all-targets --all-features --locked
+	cargo test --all-targets --all-features --locked -- \
+		--test-threads="$rust_test_threads"
 }
 
 run_audit() {
@@ -147,6 +159,128 @@ run_audit() {
 	prepare_workspace
 	cd "$node_checkout"
 	cargo audit
+}
+
+run_formal_typecheck() {
+	cd "$repo_root"
+	mkdir -p .formal-artifacts/typecheck
+	quint typecheck formal/union_lock.qnt 2>&1 |
+		tee .formal-artifacts/typecheck/union-lock.log
+	quint typecheck formal/union_lock_test.qnt 2>&1 |
+		tee .formal-artifacts/typecheck/union-lock-test.log
+}
+
+run_formal_test() {
+	cd "$repo_root"
+	mkdir -p .formal-artifacts/tests
+	quint test \
+		formal/union_lock_test.qnt \
+		--main=union_lock_test \
+		--match='.*Test$' \
+		--out-itf='.formal-artifacts/tests/{test}-{seq}.itf.json' 2>&1 |
+		tee .formal-artifacts/tests/quint-test.log
+}
+
+run_formal_simulate() {
+	cd "$repo_root"
+	mkdir -p .formal-artifacts/simulation
+	quint run \
+		formal/union_lock.qnt \
+		--main=union_lock \
+		--max-samples=10000 \
+		--max-steps=35 \
+		--invariant=union_lock_safety \
+		--witnesses \
+		queued_work_reached \
+		concurrent_disjoint_grants_reached \
+		cancellation_tombstone_reached \
+		token_exhaustion_reached 2>&1 |
+		tee .formal-artifacts/simulation/quint-run.log
+}
+
+run_formal_mbt() {
+	cd "$repo_root"
+	mkdir -p .formal-artifacts/mbt
+	quint run \
+		formal/union_lock.qnt \
+		--main=union_lock \
+		--max-samples=500 \
+		--max-steps=25 \
+		--n-traces=8 \
+		--mbt \
+		--out-itf='.formal-artifacts/mbt/union-lock-{seq}.itf.json' 2>&1 |
+		tee .formal-artifacts/mbt/quint-run.log
+}
+
+run_formal_verify_profile() {
+	local profile="$1"
+	local depth="$2"
+
+	cd "$repo_root"
+	mkdir -p ".formal-artifacts/verify-$profile"
+	quint verify \
+		formal/union_lock.qnt \
+		--main=union_lock \
+		--max-steps="$depth" \
+		--invariant=union_lock_safety \
+		--out-itf=".formal-artifacts/verify-$profile/counterexample-{seq}.itf.json" \
+		--verbosity=1 2>&1 |
+		tee ".formal-artifacts/verify-$profile/quint-verify.log"
+}
+
+run_formal_verify() {
+	run_formal_verify_profile fast 5
+}
+
+run_formal_verify_deep() {
+	run_formal_verify_profile deep 6
+}
+
+run_formal_refinement() {
+	run_rust_toolchain
+	prepare_workspace
+	cd "$node_checkout"
+	mkdir -p "$repo_root/.formal-artifacts/rust"
+	cargo test --test formal_union_lock_refinement --locked -- \
+		--nocapture --test-threads="$rust_test_threads" 2>&1 |
+		tee "$repo_root/.formal-artifacts/rust/refinement.log"
+}
+
+run_formal_provenance() {
+	cd "$repo_root"
+	mkdir -p .formal-artifacts
+	{
+		printf 'commit=%s\n' "${GITHUB_SHA:-$(git rev-parse HEAD)}"
+		printf 'event=%s\n' "${GITHUB_EVENT_NAME:-local}"
+		printf 'runner_os=%s\n' "${RUNNER_OS:-$(uname -s)}"
+		printf 'node='
+		node --version
+		printf 'java='
+		java -version 2>&1 | head -n 1
+		printf 'quint='
+		quint --version
+		printf 'rustc='
+		activate_rust_toolchain
+		rustc --version
+		printf 'cargo='
+		cargo --version
+		sha256sum \
+			flake.lock \
+			formal/fm.toml \
+			formal/union_lock.qnt \
+			formal/union_lock_test.qnt \
+			tests/formal_union_lock_refinement.rs
+	} >.formal-artifacts/provenance.txt
+}
+
+run_formal() {
+	run_formal_typecheck
+	run_formal_test
+	run_formal_simulate
+	run_formal_mbt
+	run_formal_verify
+	run_formal_refinement
+	run_formal_provenance
 }
 
 run_workspace() {
@@ -157,7 +291,8 @@ run_workspace() {
 	vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features --locked -- -D warnings
-	cargo test --all-targets --all-features --locked
+	cargo test --all-targets --all-features --locked -- \
+		--test-threads="$rust_test_threads"
 	cargo audit
 }
 
@@ -192,6 +327,33 @@ test)
 audit)
 	run_audit
 	;;
+formal-typecheck)
+	run_formal_typecheck
+	;;
+formal-test)
+	run_formal_test
+	;;
+formal-simulate)
+	run_formal_simulate
+	;;
+formal-mbt)
+	run_formal_mbt
+	;;
+formal-verify)
+	run_formal_verify
+	;;
+formal-verify-deep)
+	run_formal_verify_deep
+	;;
+formal-refinement)
+	run_formal_refinement
+	;;
+formal-provenance)
+	run_formal_provenance
+	;;
+formal)
+	run_formal
+	;;
 workspace)
 	run_workspace
 	;;
@@ -201,7 +363,12 @@ all)
 	run_workspace
 	;;
 *)
-	printf 'usage: agent-check [all|preflight|rust|bootstrap|flags-build|flags-audit|flags|fmt|clippy|test|audit|workspace]\n' >&2
+	printf '%s\n' \
+		'usage: agent-check <command>' \
+		'commands: all preflight rust bootstrap flags-build flags-audit flags' \
+		'          fmt clippy test audit workspace formal formal-typecheck' \
+		'          formal-test formal-simulate formal-mbt formal-verify' \
+		'          formal-verify-deep formal-refinement formal-provenance' >&2
 	exit 64
 	;;
 esac

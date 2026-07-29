@@ -6,13 +6,17 @@ let
       binutils
       cacert
       cargo-audit
+      coreutils
       findutils
       gcc
       git
       gnumake
+      jdk21_headless
       jq
-      nixfmt-rfc-style
+      nixfmt
+      nodejs_22
       pkg-config
+      quint
       rsync
       rust-analyzer
       rustup

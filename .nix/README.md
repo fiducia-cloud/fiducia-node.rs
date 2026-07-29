@@ -23,7 +23,23 @@ nix develop ./.nix
 
 The `vendor/flags-2-env` helper is fetched at the exact commit recorded by the repository's stage-0 gitlink. The agent script reads that pin from the Git index, so updating the submodule does not require duplicating its SHA in Nix code.
 
-It then runs the CLI flag contract, formatting, Clippy with warnings denied, all tests, and `cargo audit` using Rust 1.95.0 from `rust-toolchain.toml`. Rustup, Cargo, build outputs, and other caches stay below `.cache/` unless explicitly overridden. Diagnostic subcommands are available for `preflight`, `rust`, `bootstrap`, `flags`, `fmt`, `clippy`, `test`, and `audit`; the default no-argument command runs the complete contract.
+It then runs the CLI flag contract, formatting, Clippy with warnings denied, all
+tests, and `cargo audit` using Rust 1.95.0 from `rust-toolchain.toml`. The same
+locked shell supplies Quint 0.32.0, Java 21, and Node.js for the union-lock
+formal model. Rustup, Cargo, build outputs, and other caches stay below
+`.cache/` unless explicitly overridden.
+
+Diagnostic subcommands are available for `preflight`, `rust`, `bootstrap`,
+`flags`, `fmt`, `clippy`, `test`, and `audit`. Formal verification uses
+`formal`, `formal-typecheck`, `formal-test`, `formal-simulate`, `formal-mbt`,
+`formal-verify`, `formal-verify-deep`, and `formal-refinement`. The default
+no-argument command runs the complete non-formal repository contract.
+Rust test concurrency defaults to four workers so the same command remains
+stable on developer machines with lower per-process resource limits; set
+`RUST_TEST_THREADS` explicitly to override it. On macOS, Rust final links use
+the platform Clang driver so panic unwinding behaves correctly; compilers,
+headers, libraries, and all repository tools still come from the locked Nix
+shell.
 
 ## Toolchain drift
 

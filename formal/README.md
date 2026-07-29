@@ -78,9 +78,12 @@ tokens, and the Rust exploration caps above.
 - `quint test` validates named deterministic traces.
 - `quint run` explores 10,000 traces through 35 transitions and requires the
   critical-state witnesses to be reached.
-- `quint verify` uses Apalache for exhaustive checking through the configured
-  bounded transition depth on pull requests, pushes to `main`, scheduled runs,
-  and manual dispatch.
+- `quint verify` uses Apalache for exhaustive checking through depth 5 on pull
+  requests and pushes to `main`. Weekly and manually dispatched runs widen that
+  bound to depth 6. These bounds were calibrated against the checked-in model:
+  depth 5 closes in about 20 seconds and depth 6 in about 80 seconds on the
+  reference development machine, while the former depth-10 profile exceeded
+  its 30-minute hosted-runner limit.
 - Ordinary Rust CI runs
   `cargo test --test formal_union_lock_refinement --locked -- --nocapture` as a
   dedicated required step before the complete Rust test suite.
@@ -95,32 +98,14 @@ tokens, and the Rust exploration caps above.
 ## Local commands
 
 ```bash
-QUINT_PACKAGE='@informalsystems/quint@0.32.0'
-
-npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock.qnt
-npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/union_lock_test.qnt
-npx --yes --package="$QUINT_PACKAGE" quint test \
-  formal/union_lock_test.qnt --main=union_lock_test --match='.*Test$'
-npx --yes --package="$QUINT_PACKAGE" quint run \
-  formal/union_lock.qnt \
-  --main=union_lock \
-  --max-samples=10000 \
-  --max-steps=35 \
-  --invariant=union_lock_safety \
-  --witnesses \
-    queued_work_reached \
-    concurrent_disjoint_grants_reached \
-    cancellation_tombstone_reached \
-    token_exhaustion_reached
-npx --yes --package="$QUINT_PACKAGE" quint verify \
-  formal/union_lock.qnt \
-  --main=union_lock \
-  --max-steps=10 \
-  --invariant=union_lock_safety
-cargo test --test formal_union_lock_refinement --locked -- --nocapture
+nix develop -c agent-check formal
+nix develop -c agent-check formal-verify-deep
 ```
 
-Java 17 or newer is required for the bounded `quint verify` job.
+The narrower `formal-typecheck`, `formal-test`, `formal-simulate`, `formal-mbt`,
+`formal-verify`, and `formal-refinement` commands match the individual GitHub
+Actions steps. Quint 0.32.0, Java 21, Node.js, and the Rust bootstrap tooling
+come from the locked root flake.
 
 ## Next implementation slice
 

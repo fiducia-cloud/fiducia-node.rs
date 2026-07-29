@@ -56,7 +56,7 @@ separate models and integration layers under DEN-80.
 ## Run locally
 
 ```bash
-cargo test --test formal_union_lock_refinement --locked -- --nocapture
+nix develop -c agent-check formal-refinement
 ```
 
 Ordinary Rust CI runs this exact targeted command with `--nocapture`, so the

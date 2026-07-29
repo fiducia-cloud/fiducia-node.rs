@@ -37,8 +37,10 @@ max_steps = 35
 
 [verification]
 backend = "apalache"
-max_steps = 10
-profile = "pull-request-push-and-scheduled"
+max_steps = 5
+profile = "pull-request-and-push"
+scheduled_max_steps = 6
+scheduled_profile = "weekly-and-manual"
 
 [traces]
 format = "itf"
