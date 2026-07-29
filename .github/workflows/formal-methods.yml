@@ -94,14 +94,12 @@ jobs:
             2>&1 | tee .formal-artifacts/mbt/quint-run.log
 
       - name: Install Java for bounded verification
-        if: github.event_name != 'pull_request'
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Exhaustively check bounded executions with Apalache
-        if: github.event_name != 'pull_request'
         run: |
           mkdir -p .formal-artifacts/verify
           set -o pipefail
@@ -122,7 +120,7 @@ jobs:
             printf 'event=%s\n' "$GITHUB_EVENT_NAME"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'node=' && node --version
-            printf 'java=' && (java -version 2>&1 | head -n 1 || true)
+            printf 'java=' && java -version 2>&1 | head -n 1
             printf 'quint_package=%s\n' "$QUINT_PACKAGE"
             sha256sum formal/fm.toml formal/union_lock.qnt formal/union_lock_test.qnt
           } > .formal-artifacts/provenance.txt
