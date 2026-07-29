@@ -59,6 +59,7 @@ separate models and integration layers under DEN-80.
 cargo test --test formal_union_lock_refinement --locked -- --nocapture
 ```
 
-Ordinary CI runs the same test through `cargo test --all-targets --all-features
---locked`; the formal-methods workflow continues to typecheck, simulate, generate
-ITF traces, and perform bounded model checking for the Quint specification.
+Ordinary Rust CI runs the test through `cargo test --all-targets --all-features
+--locked`. The formal-methods workflow also runs this targeted command with
+`--nocapture`, records the exact explored-state summary, and uploads the log and
+provenance beside the Quint traces and bounded verifier output.
