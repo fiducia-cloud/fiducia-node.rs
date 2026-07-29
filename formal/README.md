@@ -2,8 +2,8 @@
 
 This directory contains executable specifications for correctness-critical
 `fiducia-node` state machines. Product models remain next to the implementation;
-the planned shared Rust runner in DEN-565 will discover and execute `fm.toml`
-without moving product semantics into a central repository.
+the incubating `fmctl` runner tracked by DEN-565/DEN-580 validates and executes
+`fm.toml` without moving product semantics into a central repository.
 
 ## First model: protocol-v2 union locks
 
@@ -70,15 +70,16 @@ waiter. See `RUST_REFINEMENT.md` for the exact domain and claim boundary.
 ## Exact bounds and claim strength
 
 This is a **finite abstraction plus bounded implementation refinement**, not a
-proof of the unbounded production system. CI records the model and adapter
-bounds in `fm.toml`: three holders, two keys, two request ids, two live waiters,
-six queue sequence values, logical time through eight, four abstract fencing
-tokens, and the Rust exploration caps above.
+proof of the unbounded production system. The model constants, workflow, and
+Rust harness record the domain: three holders, two keys, two request ids, two
+live waiters, six queue sequence values, logical time through eight, four
+abstract fencing tokens, and the Rust exploration caps above. `fm.toml` records
+the runner-facing toolchain, execution limits, and exploration sizes.
 
 - `quint test` validates named deterministic traces.
 - `quint run` explores 10,000 traces through 35 transitions and requires the
-  critical-state witnesses to be reached. Simulation and MBT use the fixed
-  seeds recorded in `fm.toml`, so the evidence corpus is reproducible.
+  critical-state witnesses to be reached. ITF generation uses the fixed seed
+  recorded in `fm.toml`; the workflow records the exact simulation invocation.
 - `quint verify` uses Apalache for exhaustive checking through depth 5 on pull
   requests and pushes to `main`. Weekly and manually dispatched runs widen that
   bound to depth 6. These bounds were calibrated against the checked-in model:

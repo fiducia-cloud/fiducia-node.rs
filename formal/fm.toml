@@ -1,10 +1,9 @@
-# Schema-v1 manifest for fmctl-compatible model discovery and execution.
+# Schema-v1 manifest consumed by the incubating fmctl runner.
 schema_version = 1
 project = "fiducia-node"
 model = "union-lock-v2"
 language = "quint"
 spec = "formal/union_lock.qnt"
-tests = "formal/union_lock_test.qnt"
 main = "union_lock"
 init = "init"
 step = "step"
@@ -16,47 +15,41 @@ witnesses = [
   "token_exhaustion_reached",
 ]
 
-[bounds]
-holders = 3
-keys = 2
-request_ids = 2
-max_live_queue = 2
-max_queue_sequence = 6
-max_logical_time = 8
-max_fencing_token = 4
-
 [toolchain]
 quint = "0.32.0"
 node = "22"
 java = "21"
 rust = "1.95.0"
+npx = "npx"
+
+[execution]
+timeout_seconds = 1200
+max_output_bytes = 8388608
+artifacts_dir = ".formal-artifacts"
 
 [simulation]
+backend = "typescript"
 max_samples = 10000
 max_steps = 35
-seed = 56620260730
 
 [verification]
 backend = "apalache"
 max_steps = 5
-profile = "pull-request-and-push"
-scheduled_max_steps = 6
-scheduled_profile = "weekly-and-manual"
 
 [traces]
 format = "itf"
 model_based_testing_metadata = true
+backend = "typescript"
 count = 8
 max_steps = 25
-seed = 56620260729
+max_samples = 10000
+seed = "56620260729"
 
 [adapters.rust]
 strategy = "bounded-independent-reference-and-itf-replay"
 target = "tests/formal_union_lock_refinement.rs"
-status = "implemented"
-max_depth = 5
-max_states = 25000
-max_transitions = 400000
+status = "planned"
+issue = "DEN-566"
 
 [adapters.typescript]
 strategy = "itf-json-driver"
@@ -73,7 +66,3 @@ status = "planned"
 [adapters.gleam]
 strategy = "itf-json-driver"
 status = "planned"
-
-[outputs]
-formats = ["human", "json", "junit", "sarif", "itf"]
-artifact_directory = ".formal-artifacts"
