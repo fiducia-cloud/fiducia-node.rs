@@ -1,0 +1,42 @@
+name: format-formal-refinement
+
+on:
+  push:
+    branches:
+      - alexanderdmills/den-566-union-lock-quint
+    paths:
+      - tests/formal_union_lock_refinement.rs
+      - .github/workflows/format-formal-refinement.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: alexanderdmills/den-566-union-lock-quint
+          persist-credentials: true
+      - name: Install pinned Rust formatter
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # pinned action
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - name: Format the implementation-refinement test
+        run: rustfmt --edition 2021 tests/formal_union_lock_refinement.rs
+      - name: Commit formatter output
+        shell: bash
+        run: |
+          if git diff --quiet -- tests/formal_union_lock_refinement.rs; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tests/formal_union_lock_refinement.rs
+          git commit -m "style: rustfmt formal refinement harness"
+          git push origin HEAD:alexanderdmills/den-566-union-lock-quint
