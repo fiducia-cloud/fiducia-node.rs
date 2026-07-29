@@ -1,0 +1,71 @@
+# Provisional manifest consumed directly by GitHub Actions until DEN-565 lands.
+schema_version = 1
+project = "fiducia-node"
+model = "union-lock-v2"
+language = "quint"
+spec = "formal/union_lock.qnt"
+tests = "formal/union_lock_test.qnt"
+main = "union_lock"
+init = "init"
+step = "step"
+invariants = ["union_lock_safety"]
+witnesses = [
+  "queued_work_reached",
+  "concurrent_disjoint_grants_reached",
+  "cancellation_tombstone_reached",
+  "token_exhaustion_reached",
+]
+
+[bounds]
+holders = 3
+keys = 2
+request_ids = 2
+max_live_queue = 2
+max_queue_sequence = 6
+max_logical_time = 8
+max_fencing_token = 4
+
+[toolchain]
+quint = "0.32.0"
+node = "22"
+java = "21"
+rust = "1.95.0"
+
+[simulation]
+max_samples = 10000
+max_steps = 35
+
+[verification]
+backend = "apalache"
+max_steps = 10
+profile = "pull-request-push-and-scheduled"
+
+[traces]
+format = "itf"
+model_based_testing_metadata = true
+count = 8
+max_steps = 25
+
+[adapters.rust]
+strategy = "bounded-independent-reference"
+target = "tests/formal_union_lock_refinement.rs"
+status = "implemented"
+max_depth = 5
+max_states = 25000
+max_transitions = 400000
+
+[adapters.typescript]
+strategy = "itf-json-driver"
+status = "planned"
+
+[adapters.dart]
+strategy = "itf-json-driver"
+status = "planned"
+
+[adapters.go]
+strategy = "itf-json-driver"
+status = "planned"
+
+[adapters.gleam]
+strategy = "itf-json-driver"
+status = "planned"

@@ -35,6 +35,7 @@ run_preflight() {
 		.github/workflows/ci.yml \
 		.github/workflows/cli-flags.yml \
 		.github/workflows/docker.yml \
+		.github/workflows/formal-methods.yml \
 		.github/workflows/nix.yml
 	python3 scripts/check-pure-read-paths.py
 	nix flake check --show-trace

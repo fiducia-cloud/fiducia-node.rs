@@ -29,7 +29,7 @@ jobs:
       - name: Validate GitHub Actions
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
         with:
-          args: repo/.github/workflows/ci.yml repo/.github/workflows/cli-flags.yml repo/.github/workflows/docker.yml
+          args: repo/.github/workflows/ci.yml repo/.github/workflows/cli-flags.yml repo/.github/workflows/docker.yml repo/.github/workflows/formal-methods.yml repo/.github/workflows/nix.yml
       - name: Guard pure replicated-state reads
         working-directory: repo
         run: python3 scripts/check-pure-read-paths.py
@@ -63,6 +63,9 @@ jobs:
       - name: clippy
         working-directory: repo
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Rust formal refinement
+        working-directory: repo
+        run: cargo test --test formal_union_lock_refinement --locked -- --nocapture
       - name: test
         working-directory: repo
         run: cargo test --all-targets --all-features --locked
