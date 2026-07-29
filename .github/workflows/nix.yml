@@ -3,27 +3,7 @@ name: nix
 on:
   push:
     branches: [main]
-    paths:
-      - flake.nix
-      - flake.lock
-      - .nix/**
-      - .envrc
-      - shell
-      - rust-toolchain.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/nix.yml
   pull_request:
-    paths:
-      - flake.nix
-      - flake.lock
-      - .nix/**
-      - .envrc
-      - shell
-      - rust-toolchain.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/nix.yml
   workflow_dispatch:
 
 permissions:

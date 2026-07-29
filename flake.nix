@@ -37,6 +37,7 @@
               gnumake
               nix
               nixfmt-rfc-style
+              python3
               rsync
               rustup
               shellcheck

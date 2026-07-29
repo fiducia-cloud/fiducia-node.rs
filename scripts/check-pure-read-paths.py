@@ -18,10 +18,36 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 STATE = ROOT / "src" / "state.rs"
 CONSENSUS = ROOT / "src" / "consensus.rs"
 
-READ_METHODS = (
+COORDINATION_READ_METHODS = (
     "lock_inventory",
     "semaphore_inventory",
     "election_inventory",
+)
+
+LOCAL_READ_METHODS = (
+    "kv_list",
+    "service_names",
+    "schedule_list",
+    "election_inventory",
+    "lock_inventory",
+    "semaphore_inventory",
+    "kv_get",
+    "counter_get",
+    "barrier_get",
+    "task_get",
+    "effect_get",
+    "handoff_get",
+    "decision_get",
+    "budget_get",
+    "claim_get",
+    "lock_get",
+    "semaphore_get",
+    "rate_limit_get",
+    "idempotency_get",
+    "schedule_get",
+    "schedule_history",
+    "election_get",
+    "service_list",
 )
 
 FORBIDDEN_CALLS = (
@@ -30,6 +56,9 @@ FORBIDDEN_CALLS = (
     "semaphore_promote(",
     "election_promote(",
     "next_token(",
+    "mint_token_above(",
+    "apply_at(",
+    ".apply(",
 )
 
 EXPECTED_DELEGATES = {
@@ -66,7 +95,7 @@ def main() -> int:
     consensus = CONSENSUS.read_text(encoding="utf-8")
     failures: list[str] = []
 
-    for method in READ_METHODS:
+    for method in COORDINATION_READ_METHODS:
         body = extract_function(state, method)
         delegate = EXPECTED_DELEGATES[method]
         if delegate not in body:
@@ -76,8 +105,15 @@ def main() -> int:
                 failures.append(f"{method} contains forbidden mutating call {forbidden}")
 
     query_handler = extract_function(consensus, "handle_query_local")
-    for method in READ_METHODS:
-        if f".{method}()" not in query_handler:
+    for method in LOCAL_READ_METHODS:
+        body = extract_function(state, method)
+        signature = body.partition("{")[0]
+        if "&self" not in signature or "&mut self" in signature:
+            failures.append(f"{method} must remain an immutable &self read API")
+        for forbidden in FORBIDDEN_CALLS:
+            if forbidden in body:
+                failures.append(f"{method} contains forbidden mutating call {forbidden}")
+        if f".{method}(" not in query_handler:
             failures.append(f"handle_query_local no longer routes through {method}()")
 
     if failures:

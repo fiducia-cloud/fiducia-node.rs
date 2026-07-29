@@ -4753,6 +4753,134 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_follower_coordination_reads_preserve_applied_state_and_fencing() {
+        // A local fan-out can reach a follower that is stale or partitioned.
+        // Seed that follower with expired coordination holders plus live queued
+        // successors. The read may hide expired holders, but it must not sweep,
+        // promote, mint fencing authority, or advance the Raft apply index.
+        let mut actor = follower_actor();
+        let expired_at = now_ms().saturating_sub(10_000);
+
+        let held_lock = actor.state.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["partitioned-lock".to_string()],
+                holder: "expired-lock-holder".to_string(),
+                ttl_ms: 1,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            expired_at,
+        );
+        assert_eq!(held_lock.output["fencing_token"], 1);
+        let queued_lock = actor.state.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["partitioned-lock".to_string()],
+                holder: "lock-waiter".to_string(),
+                ttl_ms: 30_000,
+                wait: true,
+                wait_timeout_ms: None,
+            },
+            expired_at,
+        );
+        assert_eq!(queued_lock.output["queued"], true);
+
+        let held_permit = actor.state.apply_at(
+            Command::SemaphoreAcquire {
+                key: "partitioned-pool".to_string(),
+                holder: "expired-permit-holder".to_string(),
+                limit: 1,
+                ttl_ms: 1,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            expired_at,
+        );
+        assert_eq!(held_permit.output["fencing_token"], 2);
+        let queued_permit = actor.state.apply_at(
+            Command::SemaphoreAcquire {
+                key: "partitioned-pool".to_string(),
+                holder: "permit-waiter".to_string(),
+                limit: 1,
+                ttl_ms: 30_000,
+                wait: true,
+                wait_timeout_ms: None,
+            },
+            expired_at,
+        );
+        assert_eq!(queued_permit.output["queued"], true);
+
+        let leadership = actor.state.apply_at(
+            Command::ElectionCampaign {
+                name: "partitioned-election".to_string(),
+                candidate: "expired-candidate".to_string(),
+                ttl_ms: 1,
+                metadata: HashMap::new(),
+            },
+            expired_at,
+        );
+        assert_eq!(leadership.output["leadership"]["fencing_token"], 3);
+
+        // Model these five commands as the follower's applied prefix. The local
+        // reads below must not turn observation into another applied transition.
+        actor.commit_index = 5;
+        actor.last_applied = 5;
+        let before_snapshot = actor.state.snapshot().unwrap();
+        let before_fencing = leadership.output["leadership"]["fencing_token"]
+            .as_u64()
+            .unwrap();
+        let before_last_applied = actor.last_applied;
+
+        let lock_inventory = match actor.handle_query_local(ReadRequest::LockInventory) {
+            ReadResponse::LockInventory(inventory) => inventory,
+            other => panic!("unexpected lock inventory response: {other:?}"),
+        };
+        assert!(lock_inventory.held.is_empty());
+        assert_eq!(lock_inventory.wait_queue.len(), 1);
+        assert_eq!(lock_inventory.wait_queue[0].holder, "lock-waiter");
+
+        let semaphore_inventory = match actor.handle_query_local(ReadRequest::SemaphoreInventory) {
+            ReadResponse::SemaphoreInventory(inventory) => inventory,
+            other => panic!("unexpected semaphore inventory response: {other:?}"),
+        };
+        assert!(semaphore_inventory[0].holders.is_empty());
+        assert_eq!(semaphore_inventory[0].wait_queue.len(), 1);
+        assert_eq!(semaphore_inventory[0].wait_queue[0].holder, "permit-waiter");
+
+        let elections = match actor.handle_query_local(ReadRequest::ElectionList) {
+            ReadResponse::ElectionList(elections) => elections,
+            other => panic!("unexpected election inventory response: {other:?}"),
+        };
+        assert!(elections.is_empty());
+
+        let after_snapshot = actor.state.snapshot().unwrap();
+        assert_eq!(actor.last_applied, before_last_applied);
+        assert_eq!(
+            after_snapshot, before_snapshot,
+            "follower-local reads must preserve holders, queues, deadlines, and fencing counters"
+        );
+
+        // A restored replica must continue above every token that existed before
+        // the partitioned reads; expiry/promotion and the new grant may allocate
+        // several fresh tokens, but none may reuse 1..=3.
+        let restored = StateMachine::new();
+        restored.restore(&after_snapshot).unwrap();
+        let next = restored.apply_at(
+            Command::LockAcquireV2 {
+                keys: vec!["after-restore".to_string()],
+                holder: "new-holder".to_string(),
+                ttl_ms: 30_000,
+                wait: false,
+                wait_timeout_ms: None,
+            },
+            now_ms(),
+        );
+        assert!(
+            next.output["fencing_token"].as_u64().unwrap() > before_fencing,
+            "snapshot restore after partitioned reads must never reuse fencing authority"
+        );
+    }
+
+    #[test]
     fn vote_is_refused_and_shard_faults_when_vote_cannot_be_persisted() {
         let mut actor = durable_actor(vec!["b".to_string(), "c".to_string()]);
         actor.store.as_ref().unwrap().fail_next(PersistOp::Meta);
