@@ -631,7 +631,7 @@ The source build is intentionally closed over immutable inputs:
   is separately pinned to Rust 1.97.0 by tag and immutable image digest. Cargo
   build, clippy, and test commands use the committed lockfile.
 - CI and Docker resolve `fiducia-interfaces` at
-  `2c5c806174e067fbe83ad48b724366323ba390a2` and `fiducia-routing.rs` at
+  `bd718cd72d72aa330534f3688f8fb1ce90c19d10` and `fiducia-routing.rs` at
   `c694bc5c58587bec12989a347e926c0040aacada`. The image build verifies each
   fetched checkout before compiling instead of following either repository's
   moving `main` branch.
