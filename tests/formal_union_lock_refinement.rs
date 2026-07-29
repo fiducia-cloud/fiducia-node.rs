@@ -427,9 +427,7 @@ impl Model {
         if !self.has_active_cancellation(attempt) {
             self.cancellations.push(Cancellation {
                 attempt,
-                expires_at_ms: self
-                    .now_ms
-                    .saturating_add(validate::MAX_TTL_MS),
+                expires_at_ms: self.now_ms.saturating_add(validate::MAX_TTL_MS),
             });
             self.cancellations.sort_by_key(|item| item.attempt);
         }
@@ -473,9 +471,7 @@ impl Model {
                 lease_expires_at_ms: None,
             };
         }
-        grant.expires_at_ms = grant
-            .expires_at_ms
-            .max(self.now_ms.saturating_add(ttl_ms));
+        grant.expires_at_ms = grant.expires_at_ms.max(self.now_ms.saturating_add(ttl_ms));
         Outcome::Renew {
             renewed: true,
             lease_expires_at_ms: Some(grant.expires_at_ms),
@@ -551,9 +547,9 @@ impl Model {
     }
 
     fn has_active_cancellation(&self, attempt: Attempt) -> bool {
-        self.cancellations.iter().any(|item| {
-            item.attempt == attempt && item.expires_at_ms > self.now_ms
-        })
+        self.cancellations
+            .iter()
+            .any(|item| item.attempt == attempt && item.expires_at_ms > self.now_ms)
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -561,11 +557,7 @@ impl Model {
             .iter()
             .map(|grant| grant.expires_at_ms)
             .chain(self.queue.iter().map(|waiter| waiter.wait_expires_at_ms))
-            .chain(
-                self.cancellations
-                    .iter()
-                    .map(|item| item.expires_at_ms),
-            )
+            .chain(self.cancellations.iter().map(|item| item.expires_at_ms))
             .filter(|deadline| *deadline > self.now_ms)
             .min()
     }
@@ -647,12 +639,7 @@ impl Projection {
         let cancellations = model
             .cancellations
             .iter()
-            .map(|item| {
-                (
-                    cancellation_identity(item.attempt),
-                    item.expires_at_ms,
-                )
-            })
+            .map(|item| (cancellation_identity(item.attempt), item.expires_at_ms))
             .collect();
         let mut held = BTreeMap::new();
         for grant in &model.grants {
@@ -736,12 +723,7 @@ impl Projection {
             .as_object()
             .expect("snapshot cancellation entries")
             .iter()
-            .map(|(identity, entry)| {
-                (
-                    identity.clone(),
-                    required_u64(entry, "expires_at_ms"),
-                )
-            })
+            .map(|(identity, entry)| (identity.clone(), required_u64(entry, "expires_at_ms")))
             .collect();
 
         Self {
@@ -788,10 +770,7 @@ impl Coverage {
                     ..
                 },
             ) => {
-                let existing_grant = parent
-                    .grants
-                    .iter()
-                    .find(|grant| grant.attempt == *attempt);
+                let existing_grant = parent.grants.iter().find(|grant| grant.attempt == *attempt);
                 let existing_waiter = parent
                     .queue
                     .iter()
@@ -831,22 +810,13 @@ impl Coverage {
                     ..
                 },
             ) => {
-                let had_grant = parent
-                    .grants
-                    .iter()
-                    .any(|grant| grant.attempt == *attempt);
-                let had_waiter = parent
-                    .queue
-                    .iter()
-                    .any(|waiter| waiter.attempt == *attempt);
+                let had_grant = parent.grants.iter().any(|grant| grant.attempt == *attempt);
+                let had_waiter = parent.queue.iter().any(|waiter| waiter.attempt == *attempt);
                 if had_grant && *acquired && !*cancelled {
                     self.cancel_active = true;
                 } else if had_waiter
                     && *cancelled
-                    && !child
-                        .queue
-                        .iter()
-                        .any(|waiter| waiter.attempt == *attempt)
+                    && !child.queue.iter().any(|waiter| waiter.attempt == *attempt)
                 {
                     self.cancel_queued = true;
                 } else if !had_grant
@@ -875,10 +845,7 @@ impl Coverage {
                     self.wrong_renew_rejected = true;
                 }
             }
-            (
-                Action::Release { holder, token },
-                Outcome::Release { released, .. },
-            ) => {
+            (Action::Release { holder, token }, Outcome::Release { released, .. }) => {
                 let authorized = parent
                     .grants
                     .iter()
@@ -1059,7 +1026,9 @@ fn bounded_union_lock_refinement_matches_reference_model() {
     coverage.assert_complete();
     eprintln!(
         "bounded union-lock refinement explored {} states and {} transitions through depth {}",
-        seen.len(), transitions, MAX_DEPTH
+        seen.len(),
+        transitions,
+        MAX_DEPTH
     );
 }
 
@@ -1118,10 +1087,10 @@ fn fencing_token_exhaustion_fails_closed_without_dropping_waiters() {
     assert_eq!(projection.last_token, u64::MAX);
 
     let empty = StateMachine::new();
-    let exhausted_empty_snapshot = mutate_snapshot(
-        &empty.snapshot().expect("empty snapshot"),
-        |value| value["next_fencing_token"] = Value::from(u64::MAX),
-    );
+    let exhausted_empty_snapshot =
+        mutate_snapshot(&empty.snapshot().expect("empty snapshot"), |value| {
+            value["next_fencing_token"] = Value::from(u64::MAX)
+        });
     empty
         .restore(&exhausted_empty_snapshot)
         .expect("restore empty exhausted counter");
@@ -1330,7 +1299,11 @@ fn overlaps(left: u8, right: u8) -> bool {
 }
 
 fn different_holder(holder: u8) -> u8 {
-    if holder == 1 { 2 } else { 1 }
+    if holder == 1 {
+        2
+    } else {
+        1
+    }
 }
 
 fn required_bool(value: &Value, field: &str) -> bool {
