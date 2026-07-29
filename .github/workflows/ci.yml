@@ -60,6 +60,9 @@ jobs:
       - name: clippy
         working-directory: repo
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Rust formal refinement
+        working-directory: repo
+        run: cargo test --test formal_union_lock_refinement --locked -- --nocapture
       - name: test
         working-directory: repo
         run: cargo test --all-targets --all-features --locked
