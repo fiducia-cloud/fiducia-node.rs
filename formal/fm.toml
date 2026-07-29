@@ -34,6 +34,7 @@ rust = "1.95.0"
 [simulation]
 max_samples = 10000
 max_steps = 35
+seed = 56620260730
 
 [verification]
 backend = "apalache"
@@ -47,9 +48,10 @@ format = "itf"
 model_based_testing_metadata = true
 count = 8
 max_steps = 25
+seed = 56620260729
 
 [adapters.rust]
-strategy = "bounded-independent-reference"
+strategy = "bounded-independent-reference-and-itf-replay"
 target = "tests/formal_union_lock_refinement.rs"
 status = "implemented"
 max_depth = 5

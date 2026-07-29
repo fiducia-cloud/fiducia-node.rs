@@ -15,6 +15,7 @@ mod validate;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -29,6 +30,8 @@ const RETRY_WAIT_TTL_MS: u64 = 9_000;
 const MAX_DEPTH: usize = 5;
 const MAX_STATES: usize = 25_000;
 const MAX_TRANSITIONS: usize = 400_000;
+const ITF_MAX_TOKEN: u64 = 4;
+const ITF_TIME_UNIT_MS: u64 = validate::MAX_TTL_MS / 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Attempt {
@@ -954,6 +957,438 @@ struct Frontier {
     model: Model,
     snapshot: Vec<u8>,
     trace: Vec<Action>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ItfGrant {
+    attempt: Attempt,
+    token: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ItfWaiter {
+    attempt: Attempt,
+    ttl: u64,
+    wait_expires_at: u64,
+    seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ItfCancellation {
+    attempt: Attempt,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ItfState {
+    now: u64,
+    next_token: u64,
+    grants: Vec<ItfGrant>,
+    queue: Vec<ItfWaiter>,
+    cancellations: Vec<ItfCancellation>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ItfProjection {
+    last_token: u64,
+    grants: Vec<Grant>,
+    queue: Vec<(Attempt, u64, u64)>,
+    cancellations: BTreeMap<String, u64>,
+    held: BTreeMap<String, u64>,
+}
+
+impl ItfState {
+    fn from_trace_state(state: &Value) -> Self {
+        let state = state.get("s").expect("ITF state variable 's'");
+        let mut grants = itf_set(&state["grants"])
+            .iter()
+            .map(|grant| ItfGrant {
+                attempt: itf_attempt(&grant["attempt"]),
+                token: itf_u64(&grant["token"]),
+                expires_at: itf_u64(&grant["expires_at"]),
+            })
+            .collect::<Vec<_>>();
+        grants.sort_by_key(|grant| grant.token);
+
+        let mut queue = itf_set(&state["queue"])
+            .iter()
+            .map(|waiter| ItfWaiter {
+                attempt: itf_attempt(&waiter["attempt"]),
+                ttl: itf_u64(&waiter["ttl"]),
+                wait_expires_at: itf_u64(&waiter["wait_expires_at"]),
+                seq: itf_u64(&waiter["seq"]),
+            })
+            .collect::<Vec<_>>();
+        queue.sort_by_key(|waiter| waiter.seq);
+
+        let mut cancellations = itf_set(&state["cancellations"])
+            .iter()
+            .map(|cancellation| ItfCancellation {
+                attempt: itf_attempt(&cancellation["attempt"]),
+                expires_at: itf_u64(&cancellation["expires_at"]),
+            })
+            .collect::<Vec<_>>();
+        cancellations.sort_by_key(|item| item.attempt);
+
+        let next_token = itf_u64(&state["next_token"]);
+        let minted_tokens = itf_set(&state["minted_tokens"])
+            .iter()
+            .map(itf_u64)
+            .collect::<HashSet<_>>();
+        let expected_tokens = (1..next_token).collect::<HashSet<_>>();
+        assert_eq!(
+            minted_tokens, expected_tokens,
+            "ITF minted-token history must be contiguous"
+        );
+
+        Self {
+            now: itf_u64(&state["now"]),
+            next_token,
+            grants,
+            queue,
+            cancellations,
+        }
+    }
+
+    fn promote_to_quiescence(&mut self) {
+        while self.next_token <= ITF_MAX_TOKEN {
+            let mut reserved = 0u8;
+            let mut grantable = None;
+            for (index, waiter) in self.queue.iter().enumerate() {
+                let held = self
+                    .grants
+                    .iter()
+                    .any(|grant| overlaps(grant.attempt.keys, waiter.attempt.keys));
+                if !held && !overlaps(reserved, waiter.attempt.keys) {
+                    grantable = Some(index);
+                    break;
+                }
+                reserved |= waiter.attempt.keys;
+            }
+            let Some(index) = grantable else {
+                break;
+            };
+            let waiter = self.queue.remove(index);
+            self.grants.push(ItfGrant {
+                attempt: waiter.attempt,
+                token: self.next_token,
+                expires_at: self.now + waiter.ttl,
+            });
+            self.next_token += 1;
+            self.grants.sort_by_key(|grant| grant.token);
+        }
+    }
+
+    fn projection(&self) -> ItfProjection {
+        let grants = self
+            .grants
+            .iter()
+            .map(|grant| Grant {
+                attempt: grant.attempt,
+                token: grant.token,
+                expires_at_ms: itf_time_ms(grant.expires_at),
+            })
+            .collect::<Vec<_>>();
+        let queue = self
+            .queue
+            .iter()
+            .map(|waiter| {
+                (
+                    waiter.attempt,
+                    waiter.ttl * ITF_TIME_UNIT_MS,
+                    itf_time_ms(waiter.wait_expires_at),
+                )
+            })
+            .collect();
+        let cancellations = self
+            .cancellations
+            .iter()
+            .map(|item| {
+                (
+                    cancellation_identity(item.attempt),
+                    itf_time_ms(item.expires_at),
+                )
+            })
+            .collect();
+        let mut held = BTreeMap::new();
+        for grant in &grants {
+            for key in grant.attempt.key_names() {
+                let previous = held.insert(key, grant.token);
+                assert!(previous.is_none(), "ITF state grants one key twice");
+            }
+        }
+        ItfProjection {
+            last_token: self.next_token - 1,
+            grants,
+            queue,
+            cancellations,
+            held,
+        }
+    }
+}
+
+impl ItfProjection {
+    fn from_machine(machine: &StateMachine) -> Self {
+        let projection = Projection::from_machine(machine);
+        let last_token = if projection.last_token == u64::MAX {
+            ITF_MAX_TOKEN
+        } else {
+            projection.last_token
+        };
+        let queue = projection
+            .queue
+            .into_iter()
+            .map(|waiter| (waiter.attempt, waiter.ttl_ms, waiter.wait_expires_at_ms))
+            .collect();
+        Self {
+            last_token,
+            grants: projection.grants,
+            queue,
+            cancellations: projection.cancellations,
+            held: projection.held,
+        }
+    }
+}
+
+#[test]
+fn generated_itf_traces_replay_against_production() {
+    let Some(trace_dir) = std::env::var_os("FIDUCIA_ITF_TRACE_DIR") else {
+        assert_ne!(
+            std::env::var("FIDUCIA_REQUIRE_ITF_REPLAY").as_deref(),
+            Ok("1"),
+            "FIDUCIA_ITF_TRACE_DIR is required for the formal conformance profile"
+        );
+        eprintln!("ITF replay skipped; run `nix develop -c agent-check formal-refinement`");
+        return;
+    };
+    let trace_dir = PathBuf::from(trace_dir);
+    let mut traces = std::fs::read_dir(&trace_dir)
+        .unwrap_or_else(|error| panic!("read ITF directory {}: {error}", trace_dir.display()))
+        .map(|entry| entry.expect("read ITF directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".itf."))
+        })
+        .collect::<Vec<_>>();
+    traces.sort();
+    assert!(
+        !traces.is_empty(),
+        "no generated ITF traces found in {}",
+        trace_dir.display()
+    );
+
+    let mut replayed_states = 0usize;
+    for trace in &traces {
+        replayed_states += replay_itf_trace(trace);
+    }
+    eprintln!(
+        "replayed {} generated ITF traces ({} states) against production",
+        traces.len(),
+        replayed_states
+    );
+}
+
+fn replay_itf_trace(path: &Path) -> usize {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("read ITF trace {}: {error}", path.display()));
+    let trace: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("decode ITF trace {}: {error}", path.display()));
+    assert_eq!(
+        trace["#meta"]["format"],
+        "ITF",
+        "trace format: {}",
+        path.display()
+    );
+    assert_eq!(
+        trace["#meta"]["status"],
+        "ok",
+        "trace status: {}",
+        path.display()
+    );
+    let states = trace["states"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ITF states array: {}", path.display()));
+    assert!(
+        states.len() >= 2,
+        "ITF trace is too short: {}",
+        path.display()
+    );
+
+    let machine = StateMachine::new();
+    let initial = ItfState::from_trace_state(&states[0]);
+    assert_eq!(
+        ItfProjection::from_machine(&machine),
+        initial.projection(),
+        "initial ITF state diverged: {}",
+        path.display()
+    );
+
+    for pair in states.windows(2) {
+        replay_itf_transition(&machine, &pair[0], &pair[1], path);
+        let mut expected = ItfState::from_trace_state(&pair[1]);
+        expected.promote_to_quiescence();
+        if expected.next_token > ITF_MAX_TOKEN {
+            force_production_token_exhaustion(&machine);
+        }
+        assert_eq!(
+            ItfProjection::from_machine(&machine),
+            expected.projection(),
+            "ITF state diverged at index {} in {} after action {}",
+            pair[1]["#meta"]["index"],
+            path.display(),
+            pair[1]["mbt::actionTaken"]
+        );
+    }
+    states.len()
+}
+
+fn replay_itf_transition(machine: &StateMachine, previous: &Value, next: &Value, path: &Path) {
+    let action = next["mbt::actionTaken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing MBT action in {}", path.display()));
+    let previous_state = ItfState::from_trace_state(previous);
+    let now_ms = itf_time_ms(previous_state.now);
+    let holder = || itf_pick_u64(next, "holder") as u8;
+    let keys = || itf_pick_keys(next);
+    let request_id = || itf_pick_u64(next, "request_id") as u8;
+    let attempt = || Attempt::new(holder(), keys(), request_id());
+    let ttl_ms = || itf_pick_u64(next, "ttl") * ITF_TIME_UNIT_MS;
+    let wait_timeout_ms = || itf_pick_u64(next, "wait_ttl") * ITF_TIME_UNIT_MS;
+
+    match action {
+        "acquire_now" => {
+            let attempt = attempt();
+            machine.apply_at(
+                Command::LockAcquireAttempt {
+                    keys: attempt.key_names(),
+                    holder: attempt.holder_name(),
+                    request_id: attempt.request_name(),
+                    ttl_ms: ttl_ms(),
+                    wait: false,
+                    wait_timeout_ms: Some(wait_timeout_ms()),
+                },
+                now_ms,
+            );
+        }
+        "enqueue_wait" | "retry_attempt" => {
+            let attempt = attempt();
+            machine.apply_at(
+                Command::LockAcquireAttempt {
+                    keys: attempt.key_names(),
+                    holder: attempt.holder_name(),
+                    request_id: attempt.request_name(),
+                    ttl_ms: ttl_ms(),
+                    wait: true,
+                    wait_timeout_ms: Some(wait_timeout_ms()),
+                },
+                now_ms,
+            );
+        }
+        "renew" => {
+            let attempt = attempt();
+            machine.apply_at(
+                Command::LockRenew {
+                    keys: attempt.key_names(),
+                    holder: attempt.holder_name(),
+                    fencing_token: itf_pick_u64(next, "token"),
+                    ttl_ms: ttl_ms(),
+                },
+                now_ms,
+            );
+        }
+        "release" => {
+            machine.apply_at(
+                Command::LockRelease {
+                    holder: Attempt::new(holder(), 0b01, 1).holder_name(),
+                    fencing_token: itf_pick_u64(next, "token"),
+                },
+                now_ms,
+            );
+        }
+        "cancel_active_retry" | "cancel_queued" | "cancel_absent" => {
+            let attempt = attempt();
+            machine.apply_at(
+                Command::LockCancelAttempt {
+                    keys: attempt.key_names(),
+                    holder: attempt.holder_name(),
+                    request_id: attempt.request_name(),
+                },
+                now_ms,
+            );
+        }
+        "tick" => {
+            let next_now = itf_u64(&next["s"]["now"]);
+            machine.apply_at(
+                Command::KvDelete {
+                    key: "__itf_clock_tick__".to_string(),
+                },
+                itf_time_ms(next_now),
+            );
+        }
+        "snapshot_round_trip" => {
+            let snapshot = machine.snapshot().expect("ITF snapshot");
+            machine.restore(&snapshot).expect("ITF snapshot restore");
+        }
+        "promote_head" | "promote_after_blocked_head" | "idle" => {}
+        other => panic!("unsupported ITF action '{other}' in {}", path.display()),
+    }
+}
+
+fn force_production_token_exhaustion(machine: &StateMachine) {
+    if Projection::from_machine(machine).last_token == u64::MAX {
+        return;
+    }
+    let snapshot = mutate_snapshot(
+        &machine.snapshot().expect("token exhaustion snapshot"),
+        |value| {
+            value["next_fencing_token"] = Value::from(u64::MAX);
+        },
+    );
+    machine
+        .restore(&snapshot)
+        .expect("restore token exhaustion snapshot");
+}
+
+fn itf_u64(value: &Value) -> u64 {
+    value["#bigint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected ITF bigint, found {value}"))
+        .parse()
+        .unwrap_or_else(|error| panic!("parse ITF bigint {value}: {error}"))
+}
+
+fn itf_set(value: &Value) -> &[Value] {
+    value["#set"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected ITF set, found {value}"))
+}
+
+fn itf_attempt(value: &Value) -> Attempt {
+    Attempt::new(
+        itf_u64(&value["holder"]) as u8,
+        itf_set(&value["keys"])
+            .iter()
+            .fold(0u8, |mask, key| mask | (1 << (itf_u64(key) - 1))),
+        itf_u64(&value["request_id"]) as u8,
+    )
+}
+
+fn itf_pick_u64(state: &Value, name: &str) -> u64 {
+    itf_u64(&state["mbt::nondetPicks"][name]["value"])
+}
+
+fn itf_pick_keys(state: &Value) -> u8 {
+    itf_set(&state["mbt::nondetPicks"]["lock_keys"]["value"])
+        .iter()
+        .fold(0u8, |mask, key| mask | (1 << (itf_u64(key) - 1)))
+}
+
+fn itf_time_ms(time: u64) -> u64 {
+    BASE_TIME_MS + time * ITF_TIME_UNIT_MS
 }
 
 #[test]

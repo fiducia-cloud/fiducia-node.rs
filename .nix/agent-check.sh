@@ -189,6 +189,7 @@ run_formal_simulate() {
 		--main=union_lock \
 		--max-samples=10000 \
 		--max-steps=35 \
+		--seed=56620260730 \
 		--invariant=union_lock_safety \
 		--witnesses \
 		queued_work_reached \
@@ -207,6 +208,7 @@ run_formal_mbt() {
 		--max-samples=500 \
 		--max-steps=25 \
 		--n-traces=8 \
+		--seed=56620260729 \
 		--mbt \
 		--out-itf='.formal-artifacts/mbt/union-lock-{seq}.itf.json' 2>&1 |
 		tee .formal-artifacts/mbt/quint-run.log
@@ -237,11 +239,17 @@ run_formal_verify_deep() {
 }
 
 run_formal_refinement() {
+	local traces=("$repo_root"/.formal-artifacts/mbt/*.itf.json)
+	if [ ! -e "${traces[0]}" ]; then
+		run_formal_mbt
+	fi
 	run_rust_toolchain
 	prepare_workspace
 	cd "$node_checkout"
 	mkdir -p "$repo_root/.formal-artifacts/rust"
-	cargo test --test formal_union_lock_refinement --locked -- \
+	FIDUCIA_ITF_TRACE_DIR="$repo_root/.formal-artifacts/mbt" \
+		FIDUCIA_REQUIRE_ITF_REPLAY=1 \
+		cargo test --test formal_union_lock_refinement --locked -- \
 		--nocapture --test-threads="$rust_test_threads" 2>&1 |
 		tee "$repo_root/.formal-artifacts/rust/refinement.log"
 }

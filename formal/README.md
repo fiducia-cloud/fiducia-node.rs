@@ -77,19 +77,22 @@ tokens, and the Rust exploration caps above.
 
 - `quint test` validates named deterministic traces.
 - `quint run` explores 10,000 traces through 35 transitions and requires the
-  critical-state witnesses to be reached.
+  critical-state witnesses to be reached. Simulation and MBT use the fixed
+  seeds recorded in `fm.toml`, so the evidence corpus is reproducible.
 - `quint verify` uses Apalache for exhaustive checking through depth 5 on pull
   requests and pushes to `main`. Weekly and manually dispatched runs widen that
   bound to depth 6. These bounds were calibrated against the checked-in model:
-  depth 5 closes in about 20 seconds and depth 6 in about 80 seconds on the
+  depth 5 closes in about 33 seconds and depth 6 in about four minutes on the
   reference development machine, while the former depth-10 profile exceeded
   its 30-minute hosted-runner limit.
 - Ordinary Rust CI runs
   `cargo test --test formal_union_lock_refinement --locked -- --nocapture` as a
   dedicated required step before the complete Rust test suite.
-- Generated ITF traces are retained as artifacts, but the Rust refinement
-  harness does not yet consume those exact generated files. It independently
-  explores the same transition contract.
+- The formal profile replays every generated MBT/ITF trace through the
+  production Rust state machine and compares its canonical authority-bearing
+  projection after each transition. The adapter accounts for production's
+  eager promotion closure and maps the model's bounded token-exhaustion state
+  to the implementation's `u64::MAX` fail-closed branch.
 - Liveness is not yet claimed. A later model must state fairness, logical-clock,
   eventual-release, and non-exhaustion assumptions explicitly.
 - Raft transport, partitions, stale leaders, disk faults, and multi-process
@@ -109,10 +112,7 @@ come from the locked root flake.
 
 ## Next implementation slice
 
-The next adapter slice is to feed the generated ITF corpus through the existing
-canonical Rust projection so one counterexample can move unchanged from Quint
-to a checked-in implementation regression. The next distributed-system slice
-is a separate Raft model and fault harness for partitions, stale leaders,
-leadership transfer, crash/restart, durable log recovery, and duplicate delivery.
-TypeScript, Dart, Go, and Gleam adapters should use the same versioned
-JSON-lines/ITF contract from DEN-565.
+The next distributed-system slice is a separate Raft model and fault harness
+for partitions, stale leaders, leadership transfer, crash/restart, durable log
+recovery, and duplicate delivery. TypeScript, Dart, Go, and Gleam adapters
+should use the same versioned JSON-lines/ITF contract from DEN-565.

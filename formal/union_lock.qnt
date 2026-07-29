@@ -172,7 +172,6 @@ module union_lock {
       or {
         conflicts_with_grants(s.grants, lock_keys),
         conflicts_with_queue(s.queue, lock_keys),
-        s.next_token > MAX_TOKEN,
       },
       s.queue.size() < MAX_QUEUE,
       s.next_queue_seq <= MAX_QUEUE_SEQ,
@@ -385,6 +384,33 @@ module union_lock {
   action snapshot_round_trip: bool = s' = s
   action idle: bool = s' = s
 
+  pure def has_grantable_waiter(state: State): bool = or {
+    state.queue.exists(waiter => and {
+      is_head(state.queue, waiter),
+      not(conflicts_with_grants(state.grants, waiter.attempt.keys)),
+      not(has_active_cancellation(
+        state.cancellations,
+        state.now,
+        waiter.attempt
+      )),
+      state.next_token <= MAX_TOKEN,
+    }),
+    state.queue.size() == 2 and state.queue.exists(candidate =>
+      state.queue.exists(first => and {
+        is_head(state.queue, first),
+        is_before(first, candidate),
+        conflicts_with_grants(state.grants, first.attempt.keys),
+        not(conflicts_with_grants(state.grants, candidate.attempt.keys)),
+        not(overlaps(first.attempt.keys, candidate.attempt.keys)),
+        not(has_active_cancellation(
+          state.cancellations,
+          state.now,
+          candidate.attempt
+        )),
+        state.next_token <= MAX_TOKEN,
+      })),
+  }
+
   action step: bool = {
     nondet holder = HOLDERS.oneOf()
     nondet lock_keys = KEY_SETS.oneOf()
@@ -392,21 +418,25 @@ module union_lock {
     nondet ttl = TTLS.oneOf()
     nondet wait_ttl = TTLS.oneOf()
     nondet token = TOKENS.oneOf()
-    any {
-      acquire_now(holder, lock_keys, request_id, ttl),
-      enqueue_wait(holder, lock_keys, request_id, ttl, wait_ttl),
-      retry_attempt(holder, lock_keys, request_id),
-      renew(holder, lock_keys, request_id, token, ttl),
-      release(holder, token),
-      cancel_active_retry(holder, lock_keys, request_id),
-      cancel_queued(holder, lock_keys, request_id),
-      cancel_absent(holder, lock_keys, request_id),
-      tick,
-      promote_head(holder, lock_keys, request_id),
-      promote_after_blocked_head(holder, lock_keys, request_id),
-      snapshot_round_trip,
-      idle,
-    }
+    if (has_grantable_waiter(s))
+      any {
+        promote_head(holder, lock_keys, request_id),
+        promote_after_blocked_head(holder, lock_keys, request_id),
+      }
+    else
+      any {
+        acquire_now(holder, lock_keys, request_id, ttl),
+        enqueue_wait(holder, lock_keys, request_id, ttl, wait_ttl),
+        retry_attempt(holder, lock_keys, request_id),
+        renew(holder, lock_keys, request_id, token, ttl),
+        release(holder, token),
+        cancel_active_retry(holder, lock_keys, request_id),
+        cancel_queued(holder, lock_keys, request_id),
+        cancel_absent(holder, lock_keys, request_id),
+        tick,
+        snapshot_round_trip,
+        idle,
+      }
   }
 
   val domain_bounds = and {

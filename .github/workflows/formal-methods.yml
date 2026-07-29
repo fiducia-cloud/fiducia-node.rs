@@ -68,7 +68,7 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: nix develop -c agent-check formal-verify-deep
 
-      - name: Run bounded production refinement
+      - name: Run bounded production refinement and ITF replay
         run: nix develop -c agent-check formal-refinement
 
       - name: Record verification inputs
