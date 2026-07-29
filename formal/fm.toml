@@ -1,4 +1,4 @@
-# Provisional manifest consumed directly by GitHub Actions until DEN-565 lands.
+# Schema-v1 manifest for fmctl-compatible model discovery and execution.
 schema_version = 1
 project = "fiducia-node"
 model = "union-lock-v2"
@@ -73,3 +73,7 @@ status = "planned"
 [adapters.gleam]
 strategy = "itf-json-driver"
 status = "planned"
+
+[outputs]
+formats = ["human", "json", "junit", "sarif", "itf"]
+artifact_directory = ".formal-artifacts"
