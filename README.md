@@ -179,8 +179,9 @@ fiducia -XPOST localhost:8090/v1/elections/prod%2Finvoice-reconciler%2Fleader/re
   -d '{"candidate":"pod-a","fencing_token":41}'
 ```
 
-5. If renew fails, times out beyond the customer's safety threshold, or returns
-   `not_leader`, the replica must stop doing leader-only work.
+5. If renew fails, times out beyond the customer's safety threshold, returns
+   `renewed:false`, or returns `not_leader`, the replica must immediately stop
+   or cancel leader-only work.
 6. The customer passes the `fencing_token` into any downstream stateful system
    that can enforce it. For example, a database row, storage object, or payment
    processor idempotency table should reject writes from an older token. That is
@@ -525,7 +526,7 @@ Every knob is an environment variable, read once at boot. The full surface:
 |----------|------|---------|---------|---------|
 | `PORT` | integer | `8090` | no | Client/data-plane port (`/healthz`, `/readyz`, `/v1/*`). |
 | `FIDUCIA_PEER_PORT` | integer | `9090` | no | Peer-plane port for node↔node Raft RPC (`/raft/*`). |
-| `FIDUCIA_NODE_ID` | string | `node-a` | no | Stable Raft member id / client redirect target for this node. |
+| `FIDUCIA_NODE_ID` | string | `node-a` | no | Stable Raft member id and trusted-hop leader hint for this node. |
 | `FIDUCIA_PEERS` | string | *(empty)* | no | Comma-separated peer node addresses; empty ⇒ single-node mode. |
 | `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Number of shards the keyspace is partitioned into (min `1`). |
 | `FIDUCIA_DATA_DIR` | string | `/var/lib/fiducia` | no | Directory for durable per-shard Raft state (log/meta/snapshot). Must be writable. |

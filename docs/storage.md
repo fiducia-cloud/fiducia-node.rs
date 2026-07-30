@@ -22,8 +22,11 @@ public contract follows the production path:
    wait queue, limiter bucket, schedule history, election holder, or service
    registry entry.
 
-Reads come from leader-applied state. Followers return a `not_leader` response
-with the leader address so the load balancer can reroute.
+Reads come from leader-applied state. Followers return a retryable
+`503 not_leader` response with `Retry-After` and, when known, a trusted-hop
+leader hint so the load balancer can reroute. They do not emit `Location`;
+generic clients retry their configured Fiducia endpoint without forwarding
+credentials to a server-selected authority.
 
 ## Durable Engine
 

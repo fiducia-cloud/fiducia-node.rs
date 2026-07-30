@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    http::{header::LOCATION, HeaderValue, StatusCode, Uri},
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -276,7 +276,7 @@ pub struct ChangeEvent {
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// Stable, addressable identifier for this node (e.g. `node-a:8090`). Used as
-    /// the Raft member id and as the redirect target sent to clients.
+    /// the Raft member id and as a trusted-hop leader hint sent to the load balancer.
     pub node_id: String,
     /// Addresses of peer nodes. Empty in single-node mode.
     pub peers: Vec<String>,
@@ -3331,8 +3331,10 @@ pub enum ProposeError {
 
 /// Render a proposal result as an HTTP response.
 ///
-/// Followers return a redirect plus leader headers so the LB can repair a stale
-/// shard->leader cache without already knowing the current leader.
+/// Followers return a retryable unavailable response plus trusted-hop leader
+/// headers so the LB can repair a stale shard->leader cache. This deliberately
+/// is not an HTTP redirect: a generic client must never forward credentials to a
+/// server-selected `Location`.
 pub fn propose_response(result: Result<ProposeOutcome, ProposeError>, uri: &Uri) -> Response {
     match result {
         Ok(outcome) => {
@@ -3346,7 +3348,7 @@ pub fn read_error_response(err: ProposeError, uri: &Uri) -> Response {
     error_response(err, uri)
 }
 
-fn error_response(err: ProposeError, uri: &Uri) -> Response {
+fn error_response(err: ProposeError, _uri: &Uri) -> Response {
     match err {
         ProposeError::NotLeader { shard, leader } => {
             let body = Json(serde_json::json!({
@@ -3355,12 +3357,16 @@ fn error_response(err: ProposeError, uri: &Uri) -> Response {
                     "reason": "not_leader",
                     "shard": shard,
                     "leader": leader,
+                    "retryable": true,
                 }
             }));
-            let mut response = (StatusCode::TEMPORARY_REDIRECT, body).into_response();
+            let mut response = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
             response
                 .headers_mut()
                 .insert("x-fiducia-not-leader", HeaderValue::from_static("true"));
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
             response.headers_mut().insert(
                 "x-fiducia-shard",
                 HeaderValue::from_str(&shard.to_string())
@@ -3369,11 +3375,6 @@ fn error_response(err: ProposeError, uri: &Uri) -> Response {
             if let Some(leader) = leader {
                 if let Ok(value) = HeaderValue::from_str(&leader) {
                     response.headers_mut().insert("x-fiducia-leader", value);
-                }
-                if let Some(location) = leader_location(&leader, uri) {
-                    if let Ok(value) = HeaderValue::from_str(&location) {
-                        response.headers_mut().insert(LOCATION, value);
-                    }
                 }
             }
             response
@@ -3384,14 +3385,6 @@ fn error_response(err: ProposeError, uri: &Uri) -> Response {
         )
             .into_response(),
     }
-}
-
-fn leader_location(leader: &str, uri: &Uri) -> Option<String> {
-    if !(leader.starts_with("http://") || leader.starts_with("https://")) {
-        return None;
-    }
-    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    Some(format!("{}{}", leader.trim_end_matches('/'), path))
 }
 
 #[cfg(test)]
@@ -3436,8 +3429,8 @@ mod tests {
     // --- shared-interface contract (node wire types ⇄ fiducia-interfaces) -
 
     #[test]
-    fn propose_error_redirect_is_wire_compatible_with_shared_interface() {
-        // The load balancer parses the node's NotLeader redirect via
+    fn propose_error_is_wire_compatible_with_shared_interface() {
+        // The load balancer parses the node's NotLeader payload via
         // `fiducia_interfaces::ProposeError` to learn the leader to retry against.
         // This pins that the node emits exactly the shape the LB consumes.
         let node_err = ProposeError::NotLeader {
@@ -3456,6 +3449,7 @@ mod tests {
         ));
         assert_eq!(shared.shard, 7);
         assert_eq!(shared.leader.as_deref(), Some("http://leader-a:8090"));
+        assert_eq!(shared.retryable, None);
     }
 
     #[test]
@@ -3471,10 +3465,11 @@ mod tests {
         assert_eq!(shared.shard, 3);
         assert_eq!(shared.log_index, 42);
         assert_eq!(shared.revision, 9);
+        assert_eq!(shared.output, serde_json::json!({ "ok": true }));
     }
 
     #[tokio::test]
-    async fn not_leader_http_response_redirects_to_leader_and_names_shard() {
+    async fn not_leader_http_response_is_retryable_without_redirecting_credentials() {
         let uri: Uri = "/v1/kv/orders/checkout?wait=true".parse().unwrap();
         let response = propose_response(
             Err(ProposeError::NotLeader {
@@ -3484,26 +3479,32 @@ mod tests {
             &uri,
         );
 
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response.headers().get("x-fiducia-not-leader").unwrap(),
             "true"
         );
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
         assert_eq!(response.headers().get("x-fiducia-shard").unwrap(), "7");
         assert_eq!(
             response.headers().get("x-fiducia-leader").unwrap(),
             "http://leader-a:8090"
         );
-        assert_eq!(
-            response.headers().get(LOCATION).unwrap(),
-            "http://leader-a:8090/v1/kv/orders/checkout?wait=true"
-        );
+        assert!(response.headers().get("location").is_none());
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["reason"], "not_leader");
         assert_eq!(json["error"]["leader"], "http://leader-a:8090");
         assert_eq!(json["error"]["shard"], 7);
+        assert_eq!(json["error"]["retryable"], true);
+        let shared: fiducia_interfaces::ProposeError =
+            serde_json::from_value(json["error"].clone()).unwrap();
+        assert!(matches!(
+            shared.reason,
+            fiducia_interfaces::ProposeErrorReason::NotLeader
+        ));
+        assert_eq!(shared.retryable, Some(true));
     }
 
     // --- multi-node cluster tests over the in-process loopback transport ---
