@@ -3,84 +3,31 @@ name: Formal methods
 on:
   pull_request:
     paths:
-      - '.github/workflows/formal-methods.yml'
-      - '.nix/**'
-      - 'flake.lock'
-      - 'flake.nix'
+      - 'src/**'
+      - 'tests/**'
       - 'formal/**'
-      - 'tests/formal_union_lock_refinement.rs'
+      - 'docs/FORMAL_METHODS.md'
+      - '.github/workflows/formal-methods.yml'
   push:
     branches: [main]
     paths:
-      - '.github/workflows/formal-methods.yml'
-      - '.nix/**'
-      - 'flake.lock'
-      - 'flake.nix'
+      - 'src/**'
+      - 'tests/**'
       - 'formal/**'
-      - 'tests/formal_union_lock_refinement.rs'
-  schedule:
-    - cron: '23 6 * * 1'
+      - 'docs/FORMAL_METHODS.md'
+      - '.github/workflows/formal-methods.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  union-lock:
-    name: Quint union-lock model
+  bounded-coordination-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
     steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
-
-      - name: Validate the locked repository contract
-        run: nix develop -c agent-check preflight
-
-      - name: Install and verify pinned Rust
-        run: nix develop -c agent-check rust
-
-      - name: Typecheck model and deterministic traces
-        run: nix develop -c agent-check formal-typecheck
-
-      - name: Run deterministic state-machine traces
-        run: nix develop -c agent-check formal-test
-
-      - name: Simulate invariants and reach critical states
-        run: nix develop -c agent-check formal-simulate
-
-      - name: Generate model-based testing traces
-        run: nix develop -c agent-check formal-mbt
-
-      - name: Exhaustively check pull-request bound with Apalache
-        run: nix develop -c agent-check formal-verify
-
-      - name: Exhaustively check wider scheduled bound with Apalache
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: nix develop -c agent-check formal-verify-deep
-
-      - name: Run bounded production refinement and ITF replay
-        run: nix develop -c agent-check formal-refinement
-
-      - name: Record verification inputs
-        if: always()
-        run: nix develop -c agent-check formal-provenance
-
-      - name: Upload traces and provenance
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: fiducia-node-union-lock-formal-artifacts
-          path: .formal-artifacts
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
+      - name: Exhaust lease and fencing model
+        run: python3 formal/check_model.py
