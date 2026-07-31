@@ -146,7 +146,7 @@ def main() -> None:
                 assert not accepted, "a stale fencing token was accepted"
 
     print(
-        f"fiducia lease model: {len(seen)} states, "
+        f"fiducia lease/fencing sentinel: {len(seen)} states, "
         f"{transitions} transitions; all invariants hold"
     )
 

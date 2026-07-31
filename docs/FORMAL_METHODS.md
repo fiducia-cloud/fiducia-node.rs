@@ -1,152 +1,159 @@
-# Formal-methods procedure: coordination safety
+# Formal change and evidence procedure
 
-This repository implements coordination primitives whose failures are
-qualitatively different from ordinary request failures: a split-brain grant,
-stale fencing token, or double-committed effect can cause two workers to perform
-an irreversible action. Changes to the Raft state machine and the replicated
-coordination APIs therefore require an explicit model/evidence step.
+Fiducia's coordination guarantees are safety contracts, not implementation
+intentions. A change to consensus, locking, leases, fencing, snapshots, or an
+exactly-once workflow must identify the affected invariant and provide evidence
+at the model, trace, and production-refinement layers.
 
-## Verification boundary
+This procedure complements the repository's existing formal verification stack;
+it does not replace it.
 
-The executable model in `formal/check_model.py` is a deliberately small
-abstraction of the lease and fencing contract. Production concepts refine into
-it as follows:
+## Verification stack
 
-| Production concept | Abstract model |
-| --- | --- |
-| committed Raft grant | `acquire(actor)` |
-| lease term / monotonically allocated fence | `next_token` / `token` |
-| current effective owner | `holder` with `deadline > now` |
-| expiry or committed release | `tick+expire` / `release` |
-| downstream stale-writer defense | `downstream_max` |
+| Layer | Repository mechanism | Purpose |
+| --- | --- | --- |
+| protocol model | Quint specifications under `formal/` | precise state transitions and invariants |
+| bounded checking | Apalache through `agent-check formal-verify*` | exhaustive counterexample search within reviewed bounds |
+| deterministic traces | `agent-check formal-test` / `formal-simulate` | named critical histories and invariant reachability |
+| model-based traces | `agent-check formal-mbt` | generate implementation-facing transition histories |
+| production refinement | `tests/formal_union_lock_refinement.rs` and ITF replay | show Rust behavior refines model transitions |
+| independent sentinel | `formal/check_lease_fencing_sentinel.py` | dependency-free cross-check of lease/fence fundamentals |
+| provenance | `agent-check formal-provenance` | record tools, inputs, bounds, and artifacts used by CI |
 
-The model does **not** prove the full Raft implementation, network transport,
-storage engine, clock source, or every higher-level primitive. It makes the
-safety contract precise and creates a review gate for the implementation tests
-that refine it.
+The Python sentinel is intentionally smaller and independent. It is useful as a
+fast disagreement detector; passing it is not a substitute for Quint typechecking,
+Apalache, or Rust refinement tests.
 
-## Required invariants
+## Safety obligations
 
-A change touching consensus, leases, ownership, or effects must preserve all of
-the following:
+A relevant change must preserve every applicable obligation:
 
-1. **Single effective holder.** At most one holder is effective for a key or
-   atomic key-union at a logical instant.
-2. **Monotonic fencing.** Every new committed grant has a token strictly greater
-   than every earlier grant in that namespace.
-3. **Stale-operation rejection.** Renew, release, commit, and completion require
-   the exact current owner and fencing token.
-4. **Fail-closed expiry.** A lease at or beyond its deadline is not effective,
-   even if cleanup has not yet removed its record.
-5. **Quorum before visibility.** A client-visible success is derived from a
-   committed entry, never merely from leader-local acceptance.
-6. **Leader-term commit rule.** A leader does not use an earlier-term entry to
-   infer commitment of its current term without the Raft commitment rule.
-7. **Exactly-once effects are fenced, not assumed.** Retries may occur; an
-   idempotency/effect record plus the current fence prevents duplicate external
-   effects.
-8. **Snapshot refinement.** Install/restore preserves committed state,
-   allocation counters, tombstones, and the minimum fencing token that a future
-   grant must exceed.
+1. **Single effective owner:** one key or atomic key-union cannot have two
+   effective holders at the same logical instant.
+2. **Monotonic fencing:** every newly committed grant receives a token strictly
+   greater than all earlier grants in the namespace, including after restart or
+   snapshot installation.
+3. **Exact stale-operation rejection:** renew, release, complete, cancel, and
+   downstream mutation reject a stale holder/token pair.
+4. **Commit before visibility:** client-visible success derives from committed
+   and applied replicated state, not leader-local acceptance.
+5. **Atomic union semantics:** a multi-key request acquires all keys or none;
+   cancellation and timeout cannot leave a hidden partial grant.
+6. **Ambiguous retry safety:** timeout and transport loss are modeled as unknown
+   outcomes; request identity, cancellation, and idempotency make retry safe.
+7. **Snapshot refinement:** restore preserves allocation counters, tombstones,
+   queue order where promised, and all other safety-relevant monotonic state.
+8. **Exactly-once effects are fenced:** external effects may be retried, but a
+   committed effect/idempotency record and fencing token prevent duplication.
+9. **Fail-closed readiness:** a node with unavailable, corrupt, or unapplied
+   durable state cannot advertise readiness for authoritative traffic.
 
-Liveness claims must be stated separately. For example, FIFO queue progress
-requires an eventual-leader/eventual-delivery assumption and must not be
-presented as an unconditional safety proof.
+Liveness is reviewed separately. FIFO progress, eventual grant, and leader
+availability require explicit fairness, delivery, and eventual-synchrony
+assumptions; they must not be presented as unconditional safety theorems.
+
+## When this procedure is required
+
+Use the full procedure for changes to:
+
+- election, append, commit, apply, recovery, snapshot, or membership behavior;
+- locks, semaphores, elections, tasks, handoffs, barriers, effects, budgets,
+  decisions, idempotency, or cron-claim semantics;
+- fencing-token allocation, persistence, comparison, or serialization;
+- expiry, queueing, cancellation, retry, deduplication, and ambiguous responses;
+- storage or readiness paths that can affect authoritative state.
+
+A presentation-only or telemetry-only change may state "no formal transition
+change" only when it names the untouched safety boundary and provides the
+ordinary regression tests that support that classification.
 
 ## Change procedure
 
-### 1. Classify the change
+### 1. State the semantic delta first
 
-A formal review is required when a PR changes any of these surfaces:
+Before editing production code, write down:
 
-- Raft election, append, commit, apply, snapshot, or recovery logic;
-- lock, semaphore, election, task, handoff, barrier, effect, budget, decision,
-  idempotency, cron-claim, or multi-key ownership semantics;
-- fencing-token allocation, comparison, persistence, or API serialization;
-- expiration, cancellation, retry, deduplication, or ambiguous-result handling;
-- readiness behavior that can admit a node with unsafe or unavailable state.
+- the old and new transition;
+- state variables and guards affected;
+- invariant(s) potentially weakened or strengthened;
+- assumptions and finite bounds;
+- the Rust function/module expected to refine the transition.
 
-Pure telemetry, spelling, generated documentation, and request presentation do
-not require a model change unless they alter a value used in a safety decision.
+If the intended behavior cannot be stated as a transition and postcondition, the
+change is not ready for implementation review.
 
-### 2. Update the abstract transition first
+### 2. Update the strongest applicable model
 
-Before changing production code, add or modify the smallest transition in
-`formal/check_model.py` that captures the intended semantic change. Record:
+Change the Quint model and named deterministic traces whenever the abstract
+behavior changes. Add a minimal counterexample trace before the fix when
+practical. Keep symmetry reductions and bounds reviewable; do not increase a
+bound merely to make a failing run disappear.
 
-- the state variables added or removed;
-- the invariant affected;
-- the finite bound used by the checker;
-- assumptions intentionally left outside the model; and
-- the production function/module expected to refine the transition.
+Update `formal/check_lease_fencing_sentinel.py` when lease/fence fundamentals
+change. A disagreement between the sentinel and the Quint model is a review
+blocker until the abstraction mismatch is explained.
 
-A bounded model is not accepted merely because it finds no counterexample. The
-bound must exercise at least two actors, expiry, reacquisition, and a stale
-fencing attempt.
+### 3. Add production refinement evidence
 
-### 3. Run the bounded checker
-
-```sh
-python3 formal/check_model.py
-```
-
-The checker performs exhaustive breadth-first exploration within its declared
-bounds and independently exhausts the downstream fence predicate. A failure
-must print or be reduced to a reproducible state/action sequence before the PR
-is approved.
-
-### 4. Add refinement tests in Rust
-
-For every changed abstract transition, add a deterministic production test at
-the narrowest layer that can prove the refinement. At minimum, relevant changes
-need tests for:
+For each changed abstract transition, add a deterministic Rust test at the
+narrowest layer that exercises the real state machine. Relevant changes should
+cover, as applicable:
 
 - grant → commit → apply ordering;
-- lease expiry followed by reacquisition with a greater token;
-- delayed stale renew/release/write after reacquisition;
+- expiry and reacquisition with a greater fence;
+- delayed stale renew/release/write after reassignment;
 - leader failover between acceptance and response;
-- snapshot/restart with no token regression;
-- atomic multi-key all-or-nothing behavior; and
-- ambiguous client retry with idempotent result recovery.
+- snapshot/restart without token regression;
+- multi-key all-or-nothing behavior;
+- ambiguous retry and cancellation ordering;
+- ITF/model-generated trace replay.
 
-Use controlled logical time and deterministic message scheduling where
-possible. A wall-clock sleep or a probabilistic chaos run may supplement, but
-must not replace, a deterministic counterexample test.
+Wall-clock sleeps and probabilistic chaos runs may supplement but cannot replace
+a deterministic trace.
+
+### 4. Run the locked verification commands
+
+```sh
+python3 formal/check_lease_fencing_sentinel.py
+nix develop -c agent-check formal-typecheck
+nix develop -c agent-check formal-test
+nix develop -c agent-check formal-simulate
+nix develop -c agent-check formal-mbt
+nix develop -c agent-check formal-verify
+nix develop -c agent-check formal-refinement
+nix develop -c agent-check formal-provenance
+```
+
+Use `formal-verify-deep` for scheduled/manual deep bounds and before merging a
+change that expands protocol state or concurrency.
 
 ### 5. Record evidence in the PR
 
-The PR description must include a **Formal evidence** section containing:
+Every applicable PR should contain:
 
 ```text
-Model transition(s):
-Invariant(s):
-Bound / assumptions:
+Formal surface:
+Old → new transition:
+Safety/liveness obligation(s):
+Model/spec files:
+Bounds and assumptions:
+Deterministic/model-generated traces:
 Production refinement tests:
 Commands and results:
 Known unproved surface:
+Artifact/provenance location:
 ```
 
-If the model is intentionally unchanged, explain why the implementation change
-is a refinement-preserving refactor and name the tests that demonstrate this.
+## Reviewer stop conditions
 
-## Reviewer checklist
+Block approval when any of these is unresolved:
 
-A reviewer should block the PR when any answer is unclear:
-
-- Can two histories produce two effective owners for the same namespace?
-- Can a restored or newly elected node allocate a lower/equal fencing token?
-- Can a stale token mutate state after expiry, cancellation, or reassignment?
-- Does an API success correspond to committed/applied state?
-- Is wall-clock time being confused with Raft/logical ordering?
-- Are retry and timeout outcomes modeled as unknown rather than as failure?
-- Do snapshots and migrations preserve every safety-relevant monotonic field?
-- Is a liveness statement relying on an unstated fairness or synchrony
-  assumption?
-
-## Escalation path
-
-The bounded Python model is the mandatory baseline. Introduce or update a
-TLA+/PlusCal, Alloy, Apalache, Kani, Loom, Shuttle, or model-based property test
-when the change adds concurrency or state dimensions that cannot be represented
-without collapsing a safety distinction. Keep the smaller model as a fast CI
-sentinel and link the stronger artifact from this document.
+- a success response can precede commit/apply;
+- two histories can produce two effective owners;
+- a restored node can reuse or lower a fence;
+- timeout is treated as proof of failure;
+- a stale token can mutate replicated or downstream state;
+- a snapshot/migration omits a monotonic field or tombstone;
+- a liveness claim relies on unstated fairness/synchrony;
+- the model changed without a production refinement trace, or vice versa;
+- tool versions, bounds, or verification inputs are not reproducible.
