@@ -2,7 +2,7 @@ diff --git a/src/kv.rs b/src/kv.rs
 index 44232cc..0000000 100644
 --- a/src/kv.rs
 +++ b/src/kv.rs
-@@ -28,7 +28,7 @@ use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+@@ -28,6 +28,6 @@ use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
  use axum::{
      extract::{Query, State},
 -    http::{StatusCode, Uri},
@@ -10,7 +10,7 @@ index 44232cc..0000000 100644
      response::{
          sse::{Event, KeepAlive, Sse},
          IntoResponse, Response,
-@@ -50,6 +50,9 @@ const KV_ENVELOPE_V2_PREFIX: &str = "fcenc:v2:";
+@@ -50,5 +50,8 @@ const KV_ENVELOPE_V2_PREFIX: &str = "fcenc:v2:";
  const KV_VAULT_ENVELOPE_PREFIX: &str = "fcenc:vault:v1:";
  const VAULT_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 +const TRUSTED_SCOPES_HEADER: &str = "x-fiducia-scopes";
@@ -70,7 +70,7 @@ index 44232cc..0000000 100644
  async fn seal_for_write(
      node: &Node,
      storage_key: &str,
-@@ -665,6 +694,7 @@ async fn put_key(
+@@ -665,5 +694,6 @@ async fn put_key(
      State(node): State<Arc<Node>>,
      org: OrgScope,
 +    headers: HeaderMap,
@@ -87,7 +87,7 @@ index 44232cc..0000000 100644
      // Seal before the value enters the log, so ciphertext is what gets
      // replicated and persisted (log + snapshot). Sealing here (once) keeps the
      // replicated command byte-identical across replicas.
-@@ -820,6 +853,18 @@ fn bad_request(detail: &str) -> Response {
+@@ -820,6 +853,17 @@ fn bad_request(detail: &str) -> Response {
          .into_response()
  }
  
@@ -105,7 +105,7 @@ index 44232cc..0000000 100644
  fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {
      tracing::error!(operation, error = %error, "KV protection operation failed");
      (
-@@ -845,6 +890,43 @@ mod kv_cipher_tests {
+@@ -845,6 +889,50 @@ mod kv_cipher_tests {
              .expect("valid test keyring")
      }
  
