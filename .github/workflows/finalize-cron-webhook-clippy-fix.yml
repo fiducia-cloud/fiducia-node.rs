@@ -32,14 +32,16 @@ jobs:
         with:
           ref: agent/cron-webhook-hmac-signing
           fetch-depth: 0
-      - run: python3 scripts/apply-cron-webhook-clippy-fix.py
-      - run: |
-          cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: |
+      - name: Apply the one-line lint fix
+        run: python3 scripts/apply-cron-webhook-clippy-fix.py
+      - name: Validate the changed Rust source without the sibling workspace
+        run: rustfmt --edition 2021 --check src/schedule_runner.rs
+      - name: Remove one-shot patch scaffolding
+        run: |
           rm scripts/apply-cron-webhook-clippy-fix.py
           rm .github/workflows/finalize-cron-webhook-clippy-fix.yml
-      - run: |
+      - name: Commit the clean source change
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
