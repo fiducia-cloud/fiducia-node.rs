@@ -26,6 +26,11 @@ is intentionally opt-in for backward compatibility; webhook receivers that
 require authentication should fail closed until every delivering node has the
 same secret configured.
 
+During rollout, alert on missing or invalid signatures and unexpected schedule
+identities, but never log the raw signature header, request body, or signing
+secret. A successful HTTP response should be emitted only after the receiver's
+idempotency claim and authenticated work are durably complete.
+
 The secret currently defines one node-cluster webhook trust domain. Do not share
 it with untrusted receivers. Rotate it by first making receivers accept both the
 old and new secret, rolling the new value across all nodes, and then removing the
