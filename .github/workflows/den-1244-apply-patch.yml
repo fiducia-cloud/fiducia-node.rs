@@ -1,6 +1,10 @@
 name: apply DEN-1244 plaintext policy patch
 
 on:
+  pull_request:
+    paths:
+      - .github/patches/den-1244.patch
+      - .github/workflows/den-1244-apply-patch.yml
   push:
     branches:
       - agent/den-1244-plaintext-policy
@@ -17,14 +21,18 @@ concurrency:
 
 jobs:
   apply:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      TARGET_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
     steps:
-      - name: Check out the branch with push credentials
+      - name: Check out the source branch with push credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
           fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
 
       - name: Validate and apply the reviewed patch
         run: |
@@ -39,4 +47,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/kv.rs
           git commit -m "fix(DEN-1244): require admin scope for plaintext KV"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "HEAD:${TARGET_BRANCH}"
