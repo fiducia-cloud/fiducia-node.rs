@@ -30,7 +30,7 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use axum::{
     extract::{Query, State},
-    http::{StatusCode, Uri},
+    http::{HeaderMap, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -55,6 +55,9 @@ const KV_ENVELOPE_V1_PREFIX: &str = "fcenc:v1:";
 const KV_ENVELOPE_V2_PREFIX: &str = "fcenc:v2:";
 const KV_VAULT_ENVELOPE_PREFIX: &str = "fcenc:vault:v1:";
 const VAULT_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+const TRUSTED_SCOPES_HEADER: &str = "x-fiducia-scopes";
+const ADMIN_WRITE_SCOPE: &str = "admin:write";
+const SECRET_KEYSPACE_PREFIX: &str = "secret/";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct KvProtection {
@@ -105,8 +108,9 @@ impl std::error::Error for KvCryptoError {}
 /// **Default posture:** when Vault Transit or a local AES-256-GCM keyring is
 /// configured, values are sealed *before* they enter the Raft log — so the
 /// on-disk log, snapshots, and in-memory state machine all hold ciphertext.
-/// A client may opt a specific write out with `"plaintext": true`; that value
-/// is stored verbatim.
+/// A trusted caller may request a plaintext write only with the explicit
+/// `admin:write` scope and never in the reserved `secret/` keyspace. Ordinary
+/// `kv:write` and wildcard identities fail closed with HTTP 403.
 ///
 /// Sealing happens once, on the node that receives the PUT, and the resulting
 /// envelope string is what gets replicated — so every replica stores identical
@@ -693,8 +697,36 @@ fn is_fiducia_envelope(value: &str) -> bool {
     value.starts_with("fcenc:")
 }
 
-/// Seal a to-be-written value with the node's cipher unless the caller opted
-/// out or encryption is disabled.
+/// Whether the trusted-hop identity may intentionally persist one plaintext KV
+/// value. The load balancer strips all client-supplied `x-fiducia-*` headers and
+/// injects one canonical space-separated scope header after authentication.
+///
+/// Fail closed when the header is absent, malformed, duplicated, or merely
+/// carries `*`: plaintext is a separate administrative authority, not an
+/// implication of broad data-plane access. Secret-delivery keys never permit an
+/// opt-out, including for administrators.
+fn plaintext_write_authorized(headers: &HeaderMap, caller_key: &str) -> bool {
+    if caller_key == "secret" || caller_key.starts_with(SECRET_KEYSPACE_PREFIX) {
+        return false;
+    }
+
+    let mut values = headers.get_all(TRUSTED_SCOPES_HEADER).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    value
+        .split_ascii_whitespace()
+        .any(|scope| scope == ADMIN_WRITE_SCOPE)
+}
+
+/// Seal a to-be-written value with the node's cipher unless a separately
+/// authorized plaintext request reached this point or encryption is disabled.
 async fn seal_for_write(
     node: &Node,
     storage_key: &str,
@@ -807,6 +839,7 @@ async fn get_or_list(
 async fn put_key(
     State(node): State<Arc<Node>>,
     org: OrgScope,
+    headers: HeaderMap,
     uri: Uri,
     Query(q): Query<KvParams>,
     Json(body): Json<PutBody>,
@@ -814,6 +847,9 @@ async fn put_key(
     let Some(key) = q.key else {
         return bad_request("missing `key`");
     };
+    if body.plaintext && !plaintext_write_authorized(&headers, &key) {
+        return plaintext_write_forbidden();
+    }
     // Seal before the value enters the log, so ciphertext is what gets
     // replicated and persisted (log + snapshot). Sealing here (once) keeps the
     // replicated command byte-identical across replicas.
@@ -964,6 +1000,17 @@ fn bad_request(detail: &str) -> Response {
         .into_response()
 }
 
+fn plaintext_write_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "plaintext_kv_forbidden",
+            "detail": "plaintext:true requires admin:write and is never permitted for the secret keyspace"
+        })),
+    )
+        .into_response()
+}
+
 fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {
     tracing::error!(operation, error = %error, "KV protection operation failed");
     (
@@ -995,6 +1042,50 @@ mod kv_cipher_tests {
                 .collect(),
         )
         .expect("valid test keyring")
+    }
+
+    fn scope_headers(values: &[&'static str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                TRUSTED_SCOPES_HEADER,
+                axum::http::HeaderValue::from_static(value),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn plaintext_write_requires_exact_admin_scope_and_non_secret_keyspace() {
+        assert!(!plaintext_write_authorized(&HeaderMap::new(), "flags/a"));
+        assert!(!plaintext_write_authorized(
+            &scope_headers(&["kv:write"]),
+            "flags/a"
+        ));
+        assert!(!plaintext_write_authorized(
+            &scope_headers(&["*"]),
+            "flags/a"
+        ));
+        assert!(plaintext_write_authorized(
+            &scope_headers(&["kv:write admin:write"]),
+            "flags/a"
+        ));
+        assert!(!plaintext_write_authorized(
+            &scope_headers(&["admin:write", "kv:write"]),
+            "flags/a"
+        ));
+        assert!(!plaintext_write_authorized(
+            &scope_headers(&["admin:write"]),
+            "secret/database-password"
+        ));
+        assert!(!plaintext_write_authorized(
+            &scope_headers(&["admin:write"]),
+            "secret"
+        ));
+        assert!(plaintext_write_authorized(
+            &scope_headers(&["admin:write"]),
+            "secrets/non-reserved-name"
+        ));
     }
 
     #[test]
