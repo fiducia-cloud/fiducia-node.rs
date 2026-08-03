@@ -1,3 +1,4 @@
+# One-shot transformer removed after validation succeeds.
 from pathlib import Path
 
 path = Path("src/schedule_runner.rs")
