@@ -8,6 +8,7 @@
 //! collector/Prometheus path.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,9 +16,10 @@ use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
 use opentelemetry::propagation::Injector;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::{global, KeyValue};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -32,6 +34,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_IN_FLIGHT: usize = 64;
 const MAX_MAX_IN_FLIGHT: usize = 1_024;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+const MIN_WEBHOOK_SIGNING_SECRET_BYTES: usize = 32;
+const HMAC_SHA256_BLOCK_BYTES: usize = 64;
+const WEBHOOK_SIGNATURE_HEADER: &str = "X-Fiducia-Signature-256";
 
 /// Tracks fires currently being delivered by this node. The key never contains a
 /// target URL or secret.
@@ -41,6 +46,7 @@ type InFlight = Arc<Mutex<HashSet<String>>>;
 struct RunnerConfig {
     lambda_base_url: Option<Url>,
     lambda_server_auth: Option<HeaderValue>,
+    webhook_signing_secret: Option<Arc<[u8]>>,
     max_in_flight: usize,
 }
 
@@ -57,10 +63,27 @@ impl RunnerConfig {
         let lambda_server_auth = std::env::var("FIDUCIA_LAMBDA_SERVER_AUTH_SECRET")
             .ok()
             .and_then(|value| HeaderValue::from_str(&value).ok());
+        let webhook_signing_secret = webhook_signing_secret_from_env();
         Self {
             lambda_base_url,
             lambda_server_auth,
+            webhook_signing_secret,
             max_in_flight,
+        }
+    }
+}
+
+fn webhook_signing_secret_from_env() -> Option<Arc<[u8]>> {
+    match std::env::var("FIDUCIA_CRON_WEBHOOK_SIGNING_SECRET") {
+        Ok(value) if value.len() >= MIN_WEBHOOK_SIGNING_SECRET_BYTES => {
+            Some(Arc::<[u8]>::from(value.into_bytes()))
+        }
+        Ok(_) => panic!(
+            "FIDUCIA_CRON_WEBHOOK_SIGNING_SECRET must contain at least {MIN_WEBHOOK_SIGNING_SECRET_BYTES} bytes"
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("FIDUCIA_CRON_WEBHOOK_SIGNING_SECRET must be valid UTF-8")
         }
     }
 }
@@ -154,6 +177,7 @@ pub fn spawn(node: Arc<Node>) {
     tracing::info!(
         cron.max_in_flight = config.max_in_flight,
         cron.lambda_configured = config.lambda_base_url.is_some(),
+        cron.webhook_signing_configured = config.webhook_signing_secret.is_some(),
         "cron runner configured"
     );
     tokio::spawn(run(node, config));
@@ -587,6 +611,14 @@ async fn deliver(
         "fired_at_ms": fire_id_ms,
         "target_kind": target_kind(&schedule.target),
     });
+    // Sign the exact byte sequence sent on the wire. Computing this once before
+    // retries keeps the body, signature, and idempotency identity stable.
+    let body_bytes = serde_json::to_vec(&body).expect("schedule delivery body must serialize");
+    let webhook_signature = webhook_signature_header(
+        &schedule.target,
+        config.webhook_signing_secret.as_deref(),
+        &body_bytes,
+    );
     let max_attempts = schedule.max_retries.saturating_add(1);
     let idempotency_key = delivery_idempotency_key(name, fire_id_ms);
     let mut attempts = 0u32;
@@ -621,9 +653,13 @@ async fn deliver(
             let mut request = http
                 .post(url.clone())
                 .headers(headers)
+                .header(CONTENT_TYPE, "application/json")
                 .header("Idempotency-Key", &idempotency_key)
                 .header("X-Fiducia-Schedule", name)
-                .json(&body);
+                .body(body_bytes.clone());
+            if let Some(signature) = webhook_signature.clone() {
+                request = request.header(WEBHOOK_SIGNATURE_HEADER, signature);
+            }
             if function_auth {
                 if let Some(secret) = config.lambda_server_auth.clone() {
                     request = request.header("x-server-auth", secret);
@@ -706,6 +742,53 @@ async fn deliver(
         http_status: last_status,
         duration_ms: elapsed_ms(started),
     }
+}
+
+fn webhook_signature_header(
+    target: &ScheduleTarget,
+    signing_secret: Option<&[u8]>,
+    body: &[u8],
+) -> Option<HeaderValue> {
+    if !matches!(target, ScheduleTarget::Webhook { .. }) {
+        return None;
+    }
+    let signing_secret = signing_secret?;
+    let value = hmac_sha256_header_value(signing_secret, body);
+    Some(HeaderValue::from_str(&value).expect("HMAC-SHA256 signature is a valid header value"))
+}
+
+fn hmac_sha256_header_value(secret: &[u8], body: &[u8]) -> String {
+    let mut key_block = [0_u8; HMAC_SHA256_BLOCK_BYTES];
+    if secret.len() > HMAC_SHA256_BLOCK_BYTES {
+        let digest = Sha256::digest(secret);
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..secret.len()].copy_from_slice(secret);
+    }
+
+    let mut inner_pad = [0x36_u8; HMAC_SHA256_BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; HMAC_SHA256_BLOCK_BYTES];
+    for (index, byte) in key_block.iter().copied().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(body);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    let digest = outer.finalize();
+
+    let mut value = String::with_capacity("sha256=".len() + digest.len() * 2);
+    value.push_str("sha256=");
+    for byte in digest {
+        write!(&mut value, "{byte:02x}").expect("writing hexadecimal to String cannot fail");
+    }
+    value
 }
 
 fn record_retry(target: &ScheduleTarget, trigger: RunTrigger, reason: &'static str) {
@@ -947,12 +1030,38 @@ mod tests {
     }
 
     #[test]
+    fn webhook_hmac_matches_rfc_4231_and_is_scoped_to_webhook_targets() {
+        let secret = vec![0x0b; 20];
+        let body = b"Hi There";
+        let expected = "sha256=b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+        assert_eq!(hmac_sha256_header_value(&secret, body), expected);
+
+        let webhook = ScheduleTarget::Webhook {
+            url: "https://messaging-intel.example/internal/cron".to_string(),
+        };
+        assert_eq!(
+            webhook_signature_header(&webhook, Some(&secret), body)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected,
+        );
+        assert!(webhook_signature_header(&webhook, None, body).is_none());
+
+        let function = ScheduleTarget::Function {
+            function_id: "fn_1".to_string(),
+        };
+        assert!(webhook_signature_header(&function, Some(&secret), body).is_none());
+    }
+
+    #[test]
     fn lambda_base_is_operator_controlled_and_normalized() {
         let base = normalize_lambda_base("http://fiducia-lambda:8080/api").unwrap();
         assert_eq!(base.as_str(), "http://fiducia-lambda:8080/api/");
         let config = RunnerConfig {
             lambda_base_url: Some(base),
             lambda_server_auth: Some(HeaderValue::from_static("secret")),
+            webhook_signing_secret: None,
             max_in_flight: 1,
         };
         let (resolved, authenticated) = resolved_target(
