@@ -75,7 +75,7 @@ impl RunnerConfig {
 
 fn webhook_signing_secret_from_env() -> Option<Arc<[u8]>> {
     match std::env::var("FIDUCIA_CRON_WEBHOOK_SIGNING_SECRET") {
-        Ok(value) if value.as_bytes().len() >= MIN_WEBHOOK_SIGNING_SECRET_BYTES => {
+        Ok(value) if value.len() >= MIN_WEBHOOK_SIGNING_SECRET_BYTES => {
             Some(Arc::<[u8]>::from(value.into_bytes()))
         }
         Ok(_) => panic!(
