@@ -23,7 +23,7 @@ jobs:
   apply:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       TARGET_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
     steps:
@@ -34,11 +34,185 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.TARGET_BRANCH }}
 
-      - name: Validate and apply the reviewed patch
+      - name: Apply the reviewed source transformation exactly once
         run: |
           set -euo pipefail
-          git apply --check .github/patches/den-1244.patch
-          git apply .github/patches/den-1244.patch
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/kv.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one source match, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "    http::{StatusCode, Uri},",
+              "    http::{HeaderMap, StatusCode, Uri},",
+              "HeaderMap import",
+          )
+          replace_once(
+              "const VAULT_RESPONSE_MAX_BYTES: usize = 64 * 1024;\n",
+              "const VAULT_RESPONSE_MAX_BYTES: usize = 64 * 1024;\n"
+              "const TRUSTED_SCOPES_HEADER: &str = \"x-fiducia-scopes\";\n"
+              "const ADMIN_WRITE_SCOPE: &str = \"admin:write\";\n"
+              "const SECRET_KEYSPACE_PREFIX: &str = \"secret/\";\n",
+              "plaintext policy constants",
+          )
+          replace_once(
+              "/// A client may opt a specific write out with `\\\"plaintext\\\": true`; that value\n"
+              "/// is stored verbatim.\n",
+              "/// A trusted caller may request a plaintext write only with the explicit\n"
+              "/// `admin:write` scope and never in the reserved `secret/` keyspace. Ordinary\n"
+              "/// `kv:write` and wildcard identities fail closed with HTTP 403.\n",
+              "KV protection posture documentation",
+          )
+          replace_once(
+              "/// Seal a to-be-written value with the node's cipher unless the caller opted\n"
+              "/// out or encryption is disabled.\n"
+              "async fn seal_for_write(\n",
+              "/// Whether the trusted-hop identity may intentionally persist one plaintext KV\n"
+              "/// value. The load balancer strips all client-supplied `x-fiducia-*` headers and\n"
+              "/// injects one canonical space-separated scope header after authentication.\n"
+              "///\n"
+              "/// Fail closed when the header is absent, malformed, duplicated, or merely\n"
+              "/// carries `*`: plaintext is a separate administrative authority, not an\n"
+              "/// implication of broad data-plane access. Secret-delivery keys never permit an\n"
+              "/// opt-out, including for administrators.\n"
+              "fn plaintext_write_authorized(headers: &HeaderMap, caller_key: &str) -> bool {\n"
+              "    if caller_key == \"secret\" || caller_key.starts_with(SECRET_KEYSPACE_PREFIX) {\n"
+              "        return false;\n"
+              "    }\n"
+              "\n"
+              "    let mut values = headers.get_all(TRUSTED_SCOPES_HEADER).iter();\n"
+              "    let Some(value) = values.next() else {\n"
+              "        return false;\n"
+              "    };\n"
+              "    if values.next().is_some() {\n"
+              "        return false;\n"
+              "    }\n"
+              "    let Ok(value) = value.to_str() else {\n"
+              "        return false;\n"
+              "    };\n"
+              "    value\n"
+              "        .split_ascii_whitespace()\n"
+              "        .any(|scope| scope == ADMIN_WRITE_SCOPE)\n"
+              "}\n"
+              "\n"
+              "/// Seal a to-be-written value with the node's cipher unless a separately\n"
+              "/// authorized plaintext request reached this point or encryption is disabled.\n"
+              "async fn seal_for_write(\n",
+              "plaintext authorization helper",
+          )
+          replace_once(
+              "async fn put_key(\n"
+              "    State(node): State<Arc<Node>>,\n"
+              "    org: OrgScope,\n"
+              "    uri: Uri,\n",
+              "async fn put_key(\n"
+              "    State(node): State<Arc<Node>>,\n"
+              "    org: OrgScope,\n"
+              "    headers: HeaderMap,\n"
+              "    uri: Uri,\n",
+              "PUT handler trusted headers",
+          )
+          replace_once(
+              "    let Some(key) = q.key else {\n"
+              "        return bad_request(\"missing `key`\");\n"
+              "    };\n"
+              "    // Seal before the value enters the log, so ciphertext is what gets\n",
+              "    let Some(key) = q.key else {\n"
+              "        return bad_request(\"missing `key`\");\n"
+              "    };\n"
+              "    if body.plaintext && !plaintext_write_authorized(&headers, &key) {\n"
+              "        return plaintext_write_forbidden();\n"
+              "    }\n"
+              "    // Seal before the value enters the log, so ciphertext is what gets\n",
+              "plaintext PUT authorization gate",
+          )
+          replace_once(
+              "fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {\n",
+              "fn plaintext_write_forbidden() -> Response {\n"
+              "    (\n"
+              "        StatusCode::FORBIDDEN,\n"
+              "        Json(json!({\n"
+              "            \"error\": \"plaintext_kv_forbidden\",\n"
+              "            \"detail\": \"plaintext:true requires admin:write and is never permitted for the secret keyspace\"\n"
+              "        })),\n"
+              "    )\n"
+              "        .into_response()\n"
+              "}\n"
+              "\n"
+              "fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {\n",
+              "stable plaintext denial response",
+          )
+          replace_once(
+              "        .expect(\"valid test keyring\")\n"
+              "    }\n"
+              "\n"
+              "    #[test]\n"
+              "    fn seal_then_unseal_round_trips_with_protection_metadata() {\n",
+              "        .expect(\"valid test keyring\")\n"
+              "    }\n"
+              "\n"
+              "    fn scope_headers(values: &[&'static str]) -> HeaderMap {\n"
+              "        let mut headers = HeaderMap::new();\n"
+              "        for value in values {\n"
+              "            headers.append(\n"
+              "                TRUSTED_SCOPES_HEADER,\n"
+              "                axum::http::HeaderValue::from_static(value),\n"
+              "            );\n"
+              "        }\n"
+              "        headers\n"
+              "    }\n"
+              "\n"
+              "    #[test]\n"
+              "    fn plaintext_write_requires_exact_admin_scope_and_non_secret_keyspace() {\n"
+              "        assert!(!plaintext_write_authorized(&HeaderMap::new(), \"flags/a\"));\n"
+              "        assert!(!plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"kv:write\"]),\n"
+              "            \"flags/a\"\n"
+              "        ));\n"
+              "        assert!(!plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"*\"]),\n"
+              "            \"flags/a\"\n"
+              "        ));\n"
+              "        assert!(plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"kv:write admin:write\"]),\n"
+              "            \"flags/a\"\n"
+              "        ));\n"
+              "        assert!(!plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"admin:write\", \"kv:write\"]),\n"
+              "            \"flags/a\"\n"
+              "        ));\n"
+              "        assert!(!plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"admin:write\"]),\n"
+              "            \"secret/database-password\"\n"
+              "        ));\n"
+              "        assert!(!plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"admin:write\"]),\n"
+              "            \"secret\"\n"
+              "        ));\n"
+              "        assert!(plaintext_write_authorized(\n"
+              "            &scope_headers(&[\"admin:write\"]),\n"
+              "            \"secrets/non-reserved-name\"\n"
+              "        ));\n"
+              "    }\n"
+              "\n"
+              "    #[test]\n"
+              "    fn seal_then_unseal_round_trips_with_protection_metadata() {\n",
+              "plaintext policy unit tests",
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Format the changed Rust source
+        run: cargo fmt --all
 
       - name: Commit the source and tests
         run: |
