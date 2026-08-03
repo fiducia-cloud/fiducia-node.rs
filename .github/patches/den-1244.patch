@@ -31,7 +31,7 @@ index 44232cc..0000000 100644
  ///
  /// Sealing happens once, on the node that receives the PUT, and the resulting
  /// envelope string is what gets replicated — so every replica stores identical
-@@ -598,8 +602,33 @@ fn is_fiducia_envelope(value: &str) -> bool {
+@@ -598,8 +602,36 @@ fn is_fiducia_envelope(value: &str) -> bool {
      value.starts_with("fcenc:")
  }
  
@@ -70,14 +70,14 @@ index 44232cc..0000000 100644
  async fn seal_for_write(
      node: &Node,
      storage_key: &str,
-@@ -665,5 +694,6 @@ async fn put_key(
+@@ -665,5 +697,6 @@ async fn put_key(
      State(node): State<Arc<Node>>,
      org: OrgScope,
 +    headers: HeaderMap,
      uri: Uri,
      Query(q): Query<KvParams>,
      Json(body): Json<PutBody>,
-@@ -672,6 +702,9 @@ async fn put_key(
+@@ -672,6 +705,9 @@ async fn put_key(
      let Some(key) = q.key else {
          return bad_request("missing `key`");
      };
@@ -87,7 +87,7 @@ index 44232cc..0000000 100644
      // Seal before the value enters the log, so ciphertext is what gets
      // replicated and persisted (log + snapshot). Sealing here (once) keeps the
      // replicated command byte-identical across replicas.
-@@ -820,6 +853,17 @@ fn bad_request(detail: &str) -> Response {
+@@ -820,6 +856,17 @@ fn bad_request(detail: &str) -> Response {
          .into_response()
  }
  
@@ -105,7 +105,7 @@ index 44232cc..0000000 100644
  fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {
      tracing::error!(operation, error = %error, "KV protection operation failed");
      (
-@@ -845,6 +889,50 @@ mod kv_cipher_tests {
+@@ -845,6 +892,50 @@ mod kv_cipher_tests {
              .expect("valid test keyring")
      }
  
