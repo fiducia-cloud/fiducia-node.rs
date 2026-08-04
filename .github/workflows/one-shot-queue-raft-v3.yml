@@ -1,0 +1,177 @@
+name: one-shot queue and Raft hardening v3
+
+on:
+  push:
+    branches:
+      - audit/queue-raft-recovery-hardening
+
+permissions:
+  contents: write
+
+concurrency:
+  group: queue-raft-hardening-v3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: audit/queue-raft-recovery-hardening
+          persist-credentials: true
+          path: fiducia-node.rs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Apply fail-closed queue and recovery hardening
+        working-directory: fiducia-node.rs
+        run: python3 .github/scripts/apply_queue_raft_hardening.py
+      - name: Refine attempt identity validation and add boundary regressions
+        working-directory: fiducia-node.rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/state.rs")
+          text = path.read_text()
+          old = '''            if self.locks.grants.values().any(|grant| {
+                grant.holder == queued.holder && grant.keys == queued.keys
+            }) {
+                return Err("the same union-lock identity is both granted and queued".to_string());
+            }
+'''
+          new = '''            if let Some(request_id) = queued.request_id.as_deref() {
+                if self.locks.grants.values().any(|grant| {
+                    grant.holder == queued.holder
+                        && grant.keys == queued.keys
+                        && grant.request_id.as_deref() == Some(request_id)
+                }) {
+                    return Err(
+                        "the same union-lock attempt is both granted and queued".to_string(),
+                    );
+                }
+            }
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one stable-identity validation block, found {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          marker = '    // Proves whether a lost-response RETRY of an acquire is safe server-side —\n'
+          tests = '''    #[test]
+    fn restore_allows_distinct_attempts_for_the_same_stable_lock_identity() {
+        let mut store = Store::default();
+        store.next_fencing_token = 1;
+        store.locks.grants.insert(
+            1,
+            LockGrant {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                fencing_token: 1,
+                lease_expires_ms: 10_000,
+                request_id: Some("granted-attempt".to_string()),
+            },
+        );
+        store.locks.held.insert("a".to_string(), 1);
+        assert!(store.locks.queue.push_back(
+            ("owner".to_string(), vec!["a".to_string()]),
+            QueuedLock {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                ttl_ms: 1_000,
+                requested_ms: 1,
+                wait_expires_ms: Some(2_000),
+                request_id: Some("queued-attempt".to_string()),
+            },
+        ));
+
+        StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect("attempt identity, not only holder/key identity, controls duplication");
+    }
+
+    #[test]
+    fn restore_rejects_one_attempt_that_is_both_granted_and_queued() {
+        let mut store = Store::default();
+        store.next_fencing_token = 1;
+        store.locks.grants.insert(
+            1,
+            LockGrant {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                fencing_token: 1,
+                lease_expires_ms: 10_000,
+                request_id: Some("same-attempt".to_string()),
+            },
+        );
+        store.locks.held.insert("a".to_string(), 1);
+        assert!(store.locks.queue.push_back(
+            ("owner".to_string(), vec!["a".to_string()]),
+            QueuedLock {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                ttl_ms: 1_000,
+                requested_ms: 1,
+                wait_expires_ms: Some(2_000),
+                request_id: Some("same-attempt".to_string()),
+            },
+        ));
+
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect_err("one attempt cannot own authority and still wait for it");
+        assert!(error.to_string().contains("same union-lock attempt"));
+    }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit(f"expected one test insertion marker, found {text.count(marker)}")
+          path.write_text(text.replace(marker, tests + marker, 1))
+
+          docs = Path("docs/lock-queue-raft-boundary.md")
+          docs.write_text('''# Lock queue and Raft boundary\n\n`IndexedQueue` is a deterministic keyed FIFO container modeled after `@oresoftware/linked-queue`: insertion is ordered, one queue key is unique, and cancellation/removal is direct rather than a linear scan. It owns no clocks, terms, quorum knowledge, leases, or network responses.\n\nThe replicated state machine owns lock semantics. A logical waiter consists of its canonical holder/key identity, optional attempt identity, requested time, wait deadline, and requested lease. Enqueue, cancellation, expiry, grant, renewal, release, and promotion become authoritative only when their command is committed and applied in Raft order. A leader-local HTTP waiter or response channel is ephemeral and must never be treated as queue authority.\n\nThe Raft log persists commands, not slab indexes, hash-map buckets, or linked-list pointers. Queue internals remain orthogonal to Raft, while the queue's logical ordered entries are part of replicated state and therefore survive log replay and snapshots. Snapshot decoding fails closed on duplicate queue keys or inconsistent redundant indexes.\n\nA stable holder/key identity may have a current grant and a later queued attempt; attempt IDs distinguish those operations. The exact same attempt may not be both granted and queued. Fencing tokens remain the authority boundary for renew/release after promotion or leader change.\n''')
+          PY
+      - name: Format
+        working-directory: fiducia-node.rs
+        run: cargo fmt --all
+      - name: Test all targets and features
+        working-directory: fiducia-node.rs
+        run: cargo test --locked --all-targets --all-features
+      - name: Clippy
+        working-directory: fiducia-node.rs
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Commit verified source and remove one-shot machinery
+        working-directory: fiducia-node.rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -f \
+            .github/scripts/apply_queue_raft_hardening.py \
+            .github/workflows/one-shot-queue-raft-audit.yml \
+            .github/workflows/one-shot-queue-raft-pr.yml \
+            .github/workflows/one-shot-queue-raft-diagnose.yml \
+            .github/workflows/one-shot-queue-raft-v2.yml \
+            .github/workflows/one-shot-queue-raft-v3.yml \
+            .github/one-shot-queue-raft-trigger
+          git add src/indexed_queue.rs src/state.rs src/persist.rs docs/lock-queue-raft-boundary.md
+          git diff --cached --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'fix: harden lock queues and Raft recovery invariants'
+          git push origin HEAD:audit/queue-raft-recovery-hardening
