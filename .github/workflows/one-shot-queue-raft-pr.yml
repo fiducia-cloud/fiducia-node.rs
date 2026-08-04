@@ -1,0 +1,104 @@
+name: one-shot queue hardening through PR validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'audit/queue-raft-recovery-hardening'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+          path: fiducia-node.rs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Extract and apply the staged source patch
+        working-directory: fiducia-node.rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/one-shot-queue-raft-audit.yml').read_text()
+          marker = '      - name: Apply fail-closed queue and recovery patches\n'
+          start = workflow.index(marker) + len(marker)
+          run_marker = '        run: |\n'
+          start = workflow.index(run_marker, start) + len(run_marker)
+          end = workflow.index('      - name: Format\n', start)
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+          Path('/tmp/apply-queue-raft.sh').write_text(script + '\n')
+          PY
+          bash /tmp/apply-queue-raft.sh
+      - name: Align low-level persistence tests with exact hard-state validation
+        working-directory: fiducia-node.rs
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/persist.rs')
+          text = path.read_text()
+          replacements = {
+              'let (mut store, _) = ShardStore::open(&root, 0).unwrap();\n        store.append_tail(&[entry(1, 1, "a")]).unwrap();':
+                  'let (mut store, _) = ShardStore::open(&root, 0).unwrap();\n        store.save_meta(1, None, 0).unwrap();\n        store.append_tail(&[entry(1, 1, "a")]).unwrap();',
+              'let (mut store, _) = ShardStore::open(&root, 9).unwrap();\n            store.append_tail(&[entry(1, 1, "a")]).unwrap();':
+                  'let (mut store, _) = ShardStore::open(&root, 9).unwrap();\n            store.save_meta(1, None, 0).unwrap();\n            store.append_tail(&[entry(1, 1, "a")]).unwrap();',
+              'let (mut store, _) = ShardStore::open(&root, 10).unwrap();\n            store.append_tail(&[entry(1, 1, "a")]).unwrap();':
+                  'let (mut store, _) = ShardStore::open(&root, 10).unwrap();\n            store.save_meta(1, None, 0).unwrap();\n            store.append_tail(&[entry(1, 1, "a")]).unwrap();',
+              'let (mut store, _) = ShardStore::open(&root, 11).unwrap();\n            store\n                .rewrite(&[entry(1, 1, "a"), entry(3, 1, "missing-two")])':
+                  'let (mut store, _) = ShardStore::open(&root, 11).unwrap();\n            store.save_meta(1, None, 0).unwrap();\n            store\n                .rewrite(&[entry(1, 1, "a"), entry(3, 1, "missing-two")])',
+          }
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one persistence-test target, found {count}: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+      - name: Format
+        working-directory: fiducia-node.rs
+        run: cargo fmt --all
+      - name: Test all targets and features
+        working-directory: fiducia-node.rs
+        run: cargo test --all-targets --all-features --locked
+      - name: Clippy
+        working-directory: fiducia-node.rs
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Commit verified source and remove one-shot machinery
+        working-directory: fiducia-node.rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm \
+            .github/workflows/one-shot-queue-raft-audit.yml \
+            .github/workflows/one-shot-queue-raft-pr.yml \
+            .github/one-shot-queue-raft-trigger
+          git add src/indexed_queue.rs src/state.rs src/persist.rs
+          git diff --cached --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'fix: harden lock queues and Raft recovery invariants'
+          git push origin HEAD:audit/queue-raft-recovery-hardening
