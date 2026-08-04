@@ -135,6 +135,70 @@ jobs:
               raise SystemExit("expected one state-test insertion marker")
           path.write_text(text.replace(marker, tests + marker, 1))
           PY
+      - name: Keep adversarial test construction Clippy-clean
+        working-directory: fiducia-node.rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          queue_path = Path("src/indexed_queue.rs")
+          queue = queue_path.read_text()
+          map_entry_pattern = re.compile(
+              r"let expected = if values\.contains_key\(&key\) \{\s*"
+              r"false\s*\} else \{\s*"
+              r"order\.push_back\(key\);\s*"
+              r"values\.insert\(key, step\);\s*"
+              r"true\s*\};"
+          )
+          queue_replacement = """let expected =
+                          if let std::collections::hash_map::Entry::Vacant(entry) = values.entry(key) {
+                              order.push_back(key);
+                              entry.insert(step);
+                              true
+                          } else {
+                              false
+                          };"""
+          queue, queue_count = map_entry_pattern.subn(queue_replacement, queue)
+          if queue_count != 1:
+              raise SystemExit(
+                  f"expected exactly one contains_key/insert test pattern, found {queue_count}"
+              )
+          queue_path.write_text(queue)
+
+          state_path = Path("src/state.rs")
+          state = state_path.read_text()
+          token_one_pattern = re.compile(
+              r"let mut store = Store::default\(\);\s*"
+              r"store\.next_fencing_token = 1;"
+          )
+          token_one_replacement = """let mut store = Store {
+                  next_fencing_token: 1,
+                  ..Store::default()
+              };"""
+          state, token_one_count = token_one_pattern.subn(token_one_replacement, state)
+          if token_one_count != 3:
+              raise SystemExit(
+                  f"expected three token-one Store test initializers, found {token_one_count}"
+              )
+
+          token_two_pattern = re.compile(
+              r"let mut store = Store::default\(\);\s*"
+              r"store\.next_fencing_token = 2;"
+          )
+          token_two_replacement = """let mut store = Store {
+                  next_fencing_token: 2,
+                  ..Store::default()
+              };"""
+          state, token_two_count = token_two_pattern.subn(token_two_replacement, state)
+          if token_two_count != 1:
+              raise SystemExit(
+                  f"expected one token-two Store test initializer, found {token_two_count}"
+              )
+          state_path.write_text(state)
+          PY
       - name: Format
         working-directory: fiducia-node.rs
         run: cargo fmt --all
