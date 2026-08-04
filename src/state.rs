@@ -3179,18 +3179,48 @@ impl Store {
             ));
         }
         for (key, token) in &self.locks.held {
-            if !self.locks.grants.contains_key(token) {
+            let Some(grant) = self.locks.grants.get(token) else {
                 return Err(format!(
                     "held lock key '{key}' references missing grant token {token}"
+                ));
+            };
+            if !grant.keys.iter().any(|grant_key| grant_key == key) {
+                return Err(format!(
+                    "held lock key '{key}' is absent from grant token {token}'s key set"
                 ));
             }
         }
         for (&token, grant) in &self.locks.grants {
-            if grant.fencing_token != token {
+            if token == 0 || grant.fencing_token != token {
                 return Err(format!(
                     "lock grant indexed at token {token} carries fencing_token {}",
                     grant.fencing_token
                 ));
+            }
+            if grant.holder.trim().is_empty()
+                || grant.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                || grant.holder.chars().any(char::is_control)
+            {
+                return Err(format!("lock grant {token} carries an invalid holder"));
+            }
+            if grant.keys.is_empty()
+                || grant.keys.len() > crate::validate::MAX_LOCK_KEYS
+                || canonical_keys(&grant.keys).as_slice() != grant.keys.as_slice()
+                || grant
+                    .keys
+                    .iter()
+                    .any(|key| key.is_empty() || key.len() > crate::validate::MAX_KEY_BYTES)
+            {
+                return Err(format!(
+                    "lock grant {token} carries a non-canonical or invalid key set"
+                ));
+            }
+            if grant.request_id.as_ref().is_some_and(|request_id| {
+                request_id.trim().is_empty()
+                    || request_id.len() > crate::validate::MAX_REQUEST_ID_BYTES
+                    || request_id.chars().any(char::is_control)
+            }) {
+                return Err(format!("lock grant {token} carries an invalid request id"));
             }
             for key in &grant.keys {
                 if self.locks.held.get(key) != Some(&token) {
@@ -3200,6 +3230,98 @@ impl Store {
                 }
             }
         }
+        for ((indexed_holder, indexed_keys), queued) in self.locks.queue.iter() {
+            if indexed_holder != &queued.holder || indexed_keys.as_slice() != queued.keys.as_slice()
+            {
+                return Err("lock queue index does not match its queued request".to_string());
+            }
+            if queued.holder.trim().is_empty()
+                || queued.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                || queued.holder.chars().any(char::is_control)
+                || queued.keys.is_empty()
+                || queued.keys.len() > crate::validate::MAX_LOCK_KEYS
+                || canonical_keys(&queued.keys).as_slice() != queued.keys.as_slice()
+                || queued
+                    .keys
+                    .iter()
+                    .any(|key| key.is_empty() || key.len() > crate::validate::MAX_KEY_BYTES)
+                || queued.ttl_ms == 0
+                || queued.ttl_ms > crate::validate::MAX_TTL_MS
+                || queued
+                    .wait_expires_ms
+                    .is_some_and(|expires| expires < queued.requested_ms)
+                || queued.request_id.as_ref().is_some_and(|request_id| {
+                    request_id.trim().is_empty()
+                        || request_id.len() > crate::validate::MAX_REQUEST_ID_BYTES
+                        || request_id.chars().any(char::is_control)
+                })
+            {
+                return Err("lock queue carries an invalid request".to_string());
+            }
+            if self.locks.grants.values().any(|grant| {
+                grant.holder == queued.holder
+                    && grant.keys == queued.keys
+                    && grant.request_id == queued.request_id
+            }) {
+                return Err(
+                    "the same lock acquisition attempt is both granted and queued".to_string(),
+                );
+            }
+        }
+
+        for (key, semaphore) in &self.semaphores {
+            if key.is_empty()
+                || key.len() > crate::validate::MAX_KEY_BYTES
+                || semaphore.limit == 0
+                || semaphore.limit > crate::validate::MAX_SEMAPHORE_LIMIT
+                || semaphore.holders.len() > semaphore.limit as usize
+            {
+                return Err(format!("semaphore '{key}' carries an invalid limit or key"));
+            }
+
+            let mut holders = std::collections::HashSet::<&str>::new();
+            let mut tokens = std::collections::HashSet::<u64>::new();
+            for slot in &semaphore.holders {
+                if slot.holder.trim().is_empty()
+                    || slot.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                    || slot.holder.chars().any(char::is_control)
+                    || slot.fencing_token == 0
+                    || !holders.insert(slot.holder.as_str())
+                    || !tokens.insert(slot.fencing_token)
+                    || slot.request_id.as_ref().is_some_and(|request_id| {
+                        request_id.trim().is_empty()
+                            || request_id.len() > crate::validate::MAX_REQUEST_ID_BYTES
+                            || request_id.chars().any(char::is_control)
+                    })
+                {
+                    return Err(format!("semaphore '{key}' carries an invalid holder"));
+                }
+            }
+
+            for (indexed_holder, queued) in semaphore.queue.iter() {
+                if indexed_holder != &queued.holder
+                    || queued.holder.trim().is_empty()
+                    || queued.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                    || queued.holder.chars().any(char::is_control)
+                    || holders.contains(queued.holder.as_str())
+                    || queued.ttl_ms == 0
+                    || queued.ttl_ms > crate::validate::MAX_TTL_MS
+                    || queued
+                        .wait_expires_ms
+                        .is_some_and(|expires| expires < queued.requested_ms)
+                    || queued.request_id.as_ref().is_some_and(|request_id| {
+                        request_id.trim().is_empty()
+                            || request_id.len() > crate::validate::MAX_REQUEST_ID_BYTES
+                            || request_id.chars().any(char::is_control)
+                    })
+                {
+                    return Err(format!(
+                        "semaphore '{key}' carries an invalid queued waiter"
+                    ));
+                }
+            }
+        }
+
         self.lock_cancellations.validate("lock")?;
         self.semaphore_cancellations.validate("semaphore")?;
         Ok(())
@@ -5691,6 +5813,155 @@ mod tests {
             wait_timeout_ms: None,
         })
         .output
+    }
+
+    #[test]
+    fn restore_rejects_a_ghost_held_key_missing_from_the_grant() {
+        let mut store = Store {
+            next_fencing_token: 1,
+            ..Store::default()
+        };
+        store.locks.grants.insert(
+            1,
+            LockGrant {
+                holder: "owner".to_string(),
+                keys: vec!["real".to_string()],
+                fencing_token: 1,
+                lease_expires_ms: 10_000,
+                request_id: None,
+            },
+        );
+        store.locks.held.insert("real".to_string(), 1);
+        store.locks.held.insert("ghost".to_string(), 1);
+
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect_err("a ghost reverse-index key would remain blocked forever");
+        assert!(error.to_string().contains("absent from grant"));
+    }
+
+    #[test]
+    fn restore_rejects_a_lock_queue_index_value_identity_mismatch() {
+        let mut store = Store::default();
+        assert!(store.locks.queue.push_back(
+            ("indexed-holder".to_string(), vec!["a".to_string()]),
+            QueuedLock {
+                holder: "different-holder".to_string(),
+                keys: vec!["a".to_string()],
+                ttl_ms: 1_000,
+                requested_ms: 1,
+                wait_expires_ms: Some(2_000),
+                request_id: None,
+            },
+        ));
+
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect_err("queue cancellation identity must survive recovery exactly");
+        assert!(error.to_string().contains("queue index"));
+    }
+
+    #[test]
+    fn restore_rejects_a_semaphore_with_more_holders_than_its_limit() {
+        let mut store = Store {
+            next_fencing_token: 2,
+            ..Store::default()
+        };
+        store.semaphores.insert(
+            "pool".to_string(),
+            Semaphore {
+                limit: 1,
+                holders: vec![
+                    SemaphoreSlot {
+                        holder: "a".to_string(),
+                        fencing_token: 1,
+                        lease_expires_ms: 10_000,
+                        request_id: None,
+                    },
+                    SemaphoreSlot {
+                        holder: "b".to_string(),
+                        fencing_token: 2,
+                        lease_expires_ms: 10_000,
+                        request_id: None,
+                    },
+                ],
+                queue: IndexedQueue::new(),
+            },
+        );
+
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect_err("over-capacity semaphore state cannot be authoritative");
+        assert!(error.to_string().contains("invalid limit"));
+    }
+
+    #[test]
+    fn restore_allows_same_union_identity_with_distinct_attempt_ids() {
+        let mut store = Store {
+            next_fencing_token: 1,
+            ..Store::default()
+        };
+        store.locks.grants.insert(
+            1,
+            LockGrant {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                fencing_token: 1,
+                lease_expires_ms: 10_000,
+                request_id: Some("attempt-1".to_string()),
+            },
+        );
+        store.locks.held.insert("a".to_string(), 1);
+        assert!(store.locks.queue.push_back(
+            ("owner".to_string(), vec!["a".to_string()]),
+            QueuedLock {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                ttl_ms: 1_000,
+                requested_ms: 1,
+                wait_expires_ms: Some(2_000),
+                request_id: Some("attempt-2".to_string()),
+            },
+        ));
+
+        StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect("distinct attempts may share a union identity across grant and queue");
+    }
+
+    #[test]
+    fn restore_rejects_exact_lock_attempt_both_granted_and_queued() {
+        let mut store = Store {
+            next_fencing_token: 1,
+            ..Store::default()
+        };
+        store.locks.grants.insert(
+            1,
+            LockGrant {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                fencing_token: 1,
+                lease_expires_ms: 10_000,
+                request_id: Some("attempt-1".to_string()),
+            },
+        );
+        store.locks.held.insert("a".to_string(), 1);
+        assert!(store.locks.queue.push_back(
+            ("owner".to_string(), vec!["a".to_string()]),
+            QueuedLock {
+                holder: "owner".to_string(),
+                keys: vec!["a".to_string()],
+                ttl_ms: 1_000,
+                requested_ms: 1,
+                wait_expires_ms: Some(2_000),
+                request_id: Some("attempt-1".to_string()),
+            },
+        ));
+
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&store).unwrap())
+            .expect_err("one exact attempt cannot hold authority and remain queued");
+        assert!(error.to_string().contains("acquisition attempt"));
     }
 
     // Proves whether a lost-response RETRY of an acquire is safe server-side —

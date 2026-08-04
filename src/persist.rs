@@ -135,6 +135,7 @@ impl ShardStore {
         };
         let terminated = log_bytes.ends_with(b"\n");
         let mut previous_index: Option<u64> = None;
+        let mut previous_term: Option<u64> = None;
         let lines: Vec<&[u8]> = log_bytes.split(|byte| *byte == b'\n').collect();
         for (line_number, line) in lines.iter().enumerate() {
             let is_last = line_number + 1 == lines.len();
@@ -168,6 +169,17 @@ impl ShardStore {
                     line_number + 1
                 )));
             }
+            if let Some(previous) = previous_term {
+                if entry.term < previous {
+                    return Err(invalid_data(format!(
+                        "raft log term descends at line {}: previous {}, found {}",
+                        line_number + 1,
+                        previous,
+                        entry.term
+                    )));
+                }
+            }
+            previous_term = Some(entry.term);
             if let Some(previous) = previous_index {
                 let expected = previous
                     .checked_add(1)
@@ -212,7 +224,7 @@ impl ShardStore {
                 "raft meta is missing while durable snapshot/log state exists",
             ));
         }
-        let durable_term = meta.current_term.max(1);
+        let durable_term = meta.current_term;
         if snapshot_term > durable_term || log.iter().any(|entry| entry.term > durable_term) {
             return Err(invalid_data(format!(
                 "durable snapshot/log term exceeds persisted current term {durable_term}"
@@ -476,6 +488,7 @@ mod tests {
     fn append_tail_only_writes_new_entries() {
         let root = tmpdir();
         let (mut store, _) = ShardStore::open(&root, 0).unwrap();
+        store.save_meta(1, None, 0).unwrap();
         store.append_tail(&[entry(1, 1, "a")]).unwrap();
         let log = vec![entry(1, 1, "a"), entry(2, 1, "b")];
         store.append_tail(&log).unwrap(); // appends only index 2
@@ -505,6 +518,7 @@ mod tests {
         let root = tmpdir();
         {
             let (mut store, _) = ShardStore::open(&root, 9).unwrap();
+            store.save_meta(1, None, 0).unwrap();
             store.append_tail(&[entry(1, 1, "a")]).unwrap();
         }
         // Simulate a crash mid-append: a partial JSON line with no newline.
@@ -524,6 +538,7 @@ mod tests {
         let root = tmpdir();
         {
             let (mut store, _) = ShardStore::open(&root, 10).unwrap();
+            store.save_meta(1, None, 0).unwrap();
             store.append_tail(&[entry(1, 1, "a")]).unwrap();
         }
         let log_path = root.join("shard-10").join("log");
@@ -542,6 +557,7 @@ mod tests {
         let root = tmpdir();
         {
             let (mut store, _) = ShardStore::open(&root, 11).unwrap();
+            store.save_meta(1, None, 0).unwrap();
             store
                 .rewrite(&[entry(1, 1, "a"), entry(3, 1, "missing-two")])
                 .unwrap();
@@ -593,6 +609,35 @@ mod tests {
         let error = open_error(&root, 14);
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("term exceeds"));
+    }
+
+    #[test]
+    fn descending_log_terms_are_rejected_as_impossible_raft_history() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 15).unwrap();
+            store.save_meta(3, None, 0).unwrap();
+            store
+                .rewrite(&[entry(1, 3, "newer"), entry(2, 2, "older")])
+                .unwrap();
+        }
+
+        let error = open_error(&root, 15);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("term descends"));
+    }
+
+    #[test]
+    fn term_one_log_cannot_hide_behind_term_zero_hard_state() {
+        let root = tmpdir();
+        {
+            let (mut store, _) = ShardStore::open(&root, 16).unwrap();
+            store.append_tail(&[entry(1, 1, "future")]).unwrap();
+        }
+
+        let error = open_error(&root, 16);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("persisted current term 0"));
     }
 
     #[test]

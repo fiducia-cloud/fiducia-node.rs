@@ -31,12 +31,21 @@
 //! `Serialize`/`Deserialize` — as an ordered sequence of `[key, value]` pairs —
 //! so it can also be captured in a state-machine snapshot and restored verbatim
 //! without replaying from the beginning of the log.
+//!
+//! Snapshot decoding is deliberately strict. A duplicate key is malformed
+//! authority-bearing state and is rejected instead of being silently repaired:
+//! dropping either value would make recovery choose queue state that no committed
+//! command ever produced.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
+use serde::de::{self, Deserialize, Deserializer, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeSeq, Serializer};
+
+/// Release an empty queue's backing allocations after a large burst, while
+/// retaining small slabs so ordinary lock handoffs do not allocate on every use.
+const RELEASE_EMPTY_CAPACITY_AT: usize = 1_024;
 
 /// One slab slot: a queued element and its neighbor links (slab indices).
 #[derive(Debug, Clone)]
@@ -114,6 +123,7 @@ impl<K: Eq + Hash + Clone, V> IndexedQueue<K, V> {
         }
         self.tail = Some(idx);
         self.index.insert(key, idx);
+        self.debug_validate();
         true
     }
 
@@ -204,9 +214,77 @@ impl<K: Eq + Hash + Clone, V> IndexedQueue<K, V> {
             Some(n) => self.slab[n].as_mut().expect("next occupied").prev = node.prev,
             None => self.tail = node.prev,
         }
-        self.index.remove(&node.key);
-        self.free.push(idx);
+        let removed = self.index.remove(&node.key);
+        debug_assert_eq!(removed, Some(idx));
+
+        if self.index.is_empty() {
+            self.head = None;
+            self.tail = None;
+            if self.slab.capacity() >= RELEASE_EMPTY_CAPACITY_AT {
+                // A bursty lock key can grow a queue's slab and hash index to a
+                // large high-water mark. Once fully drained there is no live slot
+                // whose index must remain stable, so release large allocations.
+                self.slab = Vec::new();
+                self.free = Vec::new();
+                self.index = HashMap::new();
+            } else {
+                self.free.push(idx);
+            }
+        } else {
+            self.free.push(idx);
+        }
+
+        self.debug_validate();
         (node.key, node.value)
+    }
+
+    /// Assert every redundant representation agrees. This is compiled out of
+    /// release builds, but runs after each mutation in tests/debug builds so
+    /// randomized churn catches a broken link at the operation that caused it.
+    fn debug_validate(&self) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(self.index.is_empty(), self.head.is_none());
+            debug_assert_eq!(self.index.is_empty(), self.tail.is_none());
+
+            let mut visited = vec![false; self.slab.len()];
+            let mut current = self.head;
+            let mut previous = None;
+            let mut count = 0usize;
+
+            while let Some(slot) = current {
+                debug_assert!(slot < self.slab.len(), "queue link outside slab");
+                debug_assert!(!visited[slot], "queue contains a link cycle");
+                visited[slot] = true;
+
+                let node = self.slab[slot].as_ref().expect("linked slot occupied");
+                debug_assert_eq!(node.prev, previous);
+                debug_assert_eq!(self.index.get(&node.key), Some(&slot));
+
+                previous = Some(slot);
+                current = node.next;
+                count += 1;
+                debug_assert!(count <= self.index.len(), "queue traversal exceeded index");
+            }
+
+            debug_assert_eq!(previous, self.tail);
+            debug_assert_eq!(count, self.index.len());
+
+            let mut free_seen = vec![false; self.slab.len()];
+            for &slot in &self.free {
+                debug_assert!(slot < self.slab.len(), "free slot outside slab");
+                debug_assert!(!free_seen[slot], "free list contains a duplicate slot");
+                free_seen[slot] = true;
+                debug_assert!(self.slab[slot].is_none(), "free slot is occupied");
+            }
+
+            for (slot, node) in self.slab.iter().enumerate() {
+                match node {
+                    Some(_) => debug_assert!(visited[slot], "occupied slot is unreachable"),
+                    None => debug_assert!(free_seen[slot], "vacant slot is not reusable"),
+                }
+            }
+        }
     }
 }
 
@@ -263,17 +341,19 @@ where
             type Value = IndexedQueue<K, V>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a sequence of [key, value] pairs in FIFO order")
+                f.write_str("a sequence of unique [key, value] pairs in FIFO order")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut queue = IndexedQueue::new();
                 while let Some((key, value)) = seq.next_element::<(K, V)>()? {
-                    // Last-writer-wins on a duplicate key would silently drop an
-                    // element; a well-formed snapshot has none, so push_back's
-                    // dedup simply ignores it.
-                    queue.push_back(key, value);
+                    if !queue.push_back(key, value) {
+                        return Err(de::Error::custom(
+                            "duplicate key in serialized IndexedQueue",
+                        ));
+                    }
                 }
+                queue.debug_validate();
                 Ok(queue)
             }
         }
@@ -284,6 +364,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
+
     use super::*;
 
     fn drain_order<K: Eq + Hash + Clone, V>(mut q: IndexedQueue<K, V>) -> Vec<V> {
@@ -384,6 +466,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fully_drained_queue_releases_its_large_high_water_mark() {
+        let mut q = IndexedQueue::new();
+        for n in 0..2_048 {
+            q.push_back(n, n);
+        }
+        for _ in 0..2_048 {
+            q.pop_front();
+        }
+
+        assert!(q.is_empty());
+        assert!(q.slab.is_empty(), "drain releases the backing slab");
+        assert_eq!(q.slab.capacity(), 0, "large slab allocation is released");
+        assert!(q.free.is_empty(), "no stale free-list allocation remains");
+        assert_eq!(q.index.capacity(), 0, "large hash allocation is released");
+
+        assert!(q.push_back(7, 70));
+        assert_eq!(q.pop_front(), Some((7, 70)));
+    }
+
+    #[test]
     fn iter_yields_fifo_order() {
         let mut q = IndexedQueue::new();
         for n in [3, 1, 2] {
@@ -416,6 +518,85 @@ mod tests {
         assert!(restored.contains(&"first".into()));
         let order: Vec<i64> = restored.iter().map(|(_, v)| *v).collect();
         assert_eq!(order, vec![1, 3], "restored queue preserves FIFO order");
+    }
+
+    #[test]
+    fn snapshot_with_a_duplicate_key_is_rejected() {
+        let error = serde_json::from_str::<IndexedQueue<String, i64>>(r#"[["same",1],["same",2]]"#)
+            .expect_err("duplicate queue identities are malformed recovery state");
+
+        assert!(
+            error.to_string().contains("duplicate key"),
+            "error explains the rejected invariant: {error}"
+        );
+    }
+
+    #[test]
+    fn deterministic_churn_matches_a_simple_reference_queue() {
+        let mut queue: IndexedQueue<u16, u64> = IndexedQueue::new();
+        let mut order: VecDeque<u16> = VecDeque::new();
+        let mut values: HashMap<u16, u64> = HashMap::new();
+        let mut rng = 0x6a09_e667_f3bc_c909u64;
+
+        for step in 0..25_000u64 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+
+            let key = (rng % 97) as u16;
+            match (rng >> 8) % 5 {
+                0 | 1 => {
+                    let expected = if let std::collections::hash_map::Entry::Vacant(entry) =
+                        values.entry(key)
+                    {
+                        order.push_back(key);
+                        entry.insert(step);
+                        true
+                    } else {
+                        false
+                    };
+                    assert_eq!(queue.push_back(key, step), expected);
+                }
+                2 => {
+                    let expected = values.remove(&key);
+                    if expected.is_some() {
+                        let position = order
+                            .iter()
+                            .position(|candidate| *candidate == key)
+                            .unwrap();
+                        order.remove(position);
+                    }
+                    assert_eq!(queue.remove(&key), expected);
+                }
+                3 => {
+                    let expected = order.pop_front().map(|front| {
+                        let value = values.remove(&front).unwrap();
+                        (front, value)
+                    });
+                    assert_eq!(queue.pop_front(), expected);
+                }
+                _ => {
+                    assert_eq!(queue.contains(&key), values.contains_key(&key));
+                    assert_eq!(queue.get(&key), values.get(&key));
+                }
+            }
+
+            let actual: Vec<(u16, u64)> = queue.iter().map(|(key, value)| (*key, *value)).collect();
+            let expected: Vec<(u16, u64)> = order
+                .iter()
+                .map(|key| (*key, *values.get(key).unwrap()))
+                .collect();
+            assert_eq!(actual, expected, "reference mismatch after step {step}");
+            assert_eq!(queue.len(), values.len());
+            for (position, key) in order.iter().enumerate() {
+                assert_eq!(queue.position(key), Some(position));
+            }
+
+            if step % 257 == 0 {
+                let bytes = serde_json::to_vec(&queue).unwrap();
+                queue = serde_json::from_slice(&bytes).unwrap();
+            }
+        }
     }
 
     #[test]
