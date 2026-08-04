@@ -51,27 +51,18 @@ jobs:
 
           path = Path("src/state.rs")
           text = path.read_text()
-          old = '''            if self.locks.grants.values().any(|grant| {
-              grant.holder == queued.holder && grant.keys == queued.keys
-            }) {
-              return Err("the same union-lock identity is both granted and queued".to_string());
-            }
-          '''
-          new = '''            if self.locks.grants.values().any(|grant| {
-              grant.holder == queued.holder
-                && grant.keys == queued.keys
-                && grant.request_id == queued.request_id
-            }) {
-              return Err(
-                "the same lock acquisition attempt is both granted and queued".to_string(),
-              );
-            }
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(
-                  "expected exactly one over-broad granted/queued lock invariant"
-              )
-          text = text.replace(old, new, 1)
+          old_condition = "grant.holder == queued.holder && grant.keys == queued.keys"
+          new_condition = """grant.holder == queued.holder
+                          && grant.keys == queued.keys
+                          && grant.request_id == queued.request_id"""
+          old_error = '"the same union-lock identity is both granted and queued"'
+          new_error = '"the same lock acquisition attempt is both granted and queued"'
+          if text.count(old_condition) != 1:
+              raise SystemExit("expected exactly one over-broad lock condition")
+          if text.count(old_error) != 1:
+              raise SystemExit("expected exactly one over-broad lock error")
+          text = text.replace(old_condition, new_condition, 1)
+          text = text.replace(old_error, new_error, 1)
 
           marker = "    // Proves whether a lost-response RETRY of an acquire is safe server-side —\n"
           tests = '''    #[test]
