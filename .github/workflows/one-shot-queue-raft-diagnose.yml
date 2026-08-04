@@ -1,0 +1,39 @@
+name: diagnose one-shot queue patch
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'audit/queue-raft-recovery-hardening'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Apply with anchor diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/one-shot-queue-raft-audit.yml').read_text()
+          marker = '      - name: Apply fail-closed queue and recovery patches\n'
+          start = workflow.index(marker) + len(marker)
+          start = workflow.index('        run: |\n', start) + len('        run: |\n')
+          end = workflow.index('      - name: Format\n', start)
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+          needle = 'raise SystemExit(f"{path}: expected one replacement target, found {count}")'
+          replacement = 'raise SystemExit(f"{path}: expected one replacement target, found {count}; anchor={old[:240]!r}")'
+          if needle not in script:
+              raise SystemExit('diagnostic error anchor not found')
+          Path('/tmp/apply.sh').write_text(script.replace(needle, replacement) + '\n')
+          PY
+          bash /tmp/apply.sh
