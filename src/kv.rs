@@ -30,7 +30,7 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, Uri},
+    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -697,6 +697,15 @@ fn is_fiducia_envelope(value: &str) -> bool {
     value.starts_with("fcenc:")
 }
 
+/// Reserved caller-facing keyspace used by the secrets client surface.
+///
+/// Keep this check at the node boundary as well as in clients: callers can use
+/// the generic KV API directly, so client-side value stripping alone is not a
+/// confidentiality boundary.
+fn is_secret_keyspace(caller_key: &str) -> bool {
+    caller_key == "secret" || caller_key.starts_with(SECRET_KEYSPACE_PREFIX)
+}
+
 /// Whether the trusted-hop identity may intentionally persist one plaintext KV
 /// value. The load balancer strips all client-supplied `x-fiducia-*` headers and
 /// injects one canonical space-separated scope header after authentication.
@@ -706,7 +715,7 @@ fn is_fiducia_envelope(value: &str) -> bool {
 /// implication of broad data-plane access. Secret-delivery keys never permit an
 /// opt-out, including for administrators.
 fn plaintext_write_authorized(headers: &HeaderMap, caller_key: &str) -> bool {
-    if caller_key == "secret" || caller_key.starts_with(SECRET_KEYSPACE_PREFIX) {
+    if is_secret_keyspace(caller_key) {
         return false;
     }
 
@@ -813,22 +822,24 @@ async fn get_or_list(
                 Ok(ReadResponse::Kv(Some(mut entry))) => {
                     let unsealed = match unseal_for_read(&node, &storage_key, &entry.value).await {
                         Ok(value) => value,
-                        Err(error) => return crypto_failure("decrypt", &error),
+                        Err(error) => return no_store(crypto_failure("decrypt", &error)),
                     };
                     entry.value = unsealed.value;
-                    Json(json!({
-                        "key": key,
-                        "found": true,
-                        "entry": entry,
-                        "protection": unsealed.protection,
-                    }))
-                    .into_response()
+                    no_store(
+                        Json(json!({
+                            "key": key,
+                            "found": true,
+                            "entry": entry,
+                            "protection": unsealed.protection,
+                        }))
+                        .into_response(),
+                    )
                 }
                 Ok(ReadResponse::Kv(None)) => {
-                    Json(json!({ "key": key, "found": false })).into_response()
+                    no_store(Json(json!({ "key": key, "found": false })).into_response())
                 }
-                Err(err) => read_error_response(err, &uri),
-                _ => Json(json!({ "error": "unavailable" })).into_response(),
+                Err(err) => no_store(read_error_response(err, &uri)),
+                _ => no_store(Json(json!({ "error": "unavailable" })).into_response()),
             }
         }
         None => list(node, org, q.prefix.unwrap_or_default()).await,
@@ -901,20 +912,41 @@ async fn list(node: Arc<Node>, org: OrgScope, prefix: String) -> Response {
         };
         let unsealed = match unseal_for_read(&node, &storage_key, &item.entry.value).await {
             Ok(value) => value,
-            Err(error) => return crypto_failure("decrypt", &error),
+            Err(error) => return no_store(crypto_failure("decrypt", &error)),
         };
-        let mut row = json!({
-            "key": unscoped,
-            "value": unsealed.value,
-            "mod_revision": item.entry.mod_revision,
-            "protection": unsealed.protection,
-        });
-        if let Some(expires_at_ms) = item.entry.expires_at_ms {
-            row["expires_at_ms"] = json!(expires_at_ms);
-        }
-        keys.push(row);
+        keys.push(list_row(
+            unscoped,
+            unsealed,
+            item.entry.mod_revision,
+            item.entry.expires_at_ms,
+        ));
     }
-    Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response()
+    no_store(Json(json!({ "prefix": prefix, "count": keys.len(), "keys": keys })).into_response())
+}
+
+/// Render one prefix-list row. Reserved secret values are deliberately absent:
+/// an explicit single-key GET is the only API operation that may reveal one.
+fn list_row(
+    caller_key: &str,
+    unsealed: UnsealedValue,
+    mod_revision: u64,
+    expires_at_ms: Option<u64>,
+) -> serde_json::Value {
+    let UnsealedValue { value, protection } = unsealed;
+    let mut row = json!({
+        "key": caller_key,
+        "mod_revision": mod_revision,
+        "protection": protection,
+    });
+    if is_secret_keyspace(caller_key) {
+        row["value_redacted"] = json!(true);
+    } else {
+        row["value"] = json!(value);
+    }
+    if let Some(expires_at_ms) = expires_at_ms {
+        row["expires_at_ms"] = json!(expires_at_ms);
+    }
+    row
 }
 
 /// SSE stream of change events for a key (or, when `prefix`, every key under it).
@@ -998,6 +1030,13 @@ fn bad_request(detail: &str) -> Response {
         Json(json!({ "error": "bad_request", "detail": detail })),
     )
         .into_response()
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn plaintext_write_forbidden() -> Response {
@@ -1086,6 +1125,47 @@ mod kv_cipher_tests {
             &scope_headers(&["admin:write"]),
             "secrets/non-reserved-name"
         ));
+    }
+
+    #[test]
+    fn prefix_listing_redacts_reserved_secret_values_at_the_server_boundary() {
+        let protection = KvProtection {
+            at_rest: "encrypted",
+            provider: Some("local_keyring"),
+            key_id: Some("current".to_string()),
+            key_version: None,
+        };
+        let secret = list_row(
+            "secret/database-password",
+            UnsealedValue {
+                value: "must-not-leak".to_string(),
+                protection: protection.clone(),
+            },
+            7,
+            Some(99),
+        );
+        assert!(secret.get("value").is_none());
+        assert_eq!(secret["value_redacted"], true);
+        assert_eq!(secret["mod_revision"], 7);
+        assert_eq!(secret["expires_at_ms"], 99);
+
+        let config = list_row(
+            "flags/checkout",
+            UnsealedValue {
+                value: "enabled".to_string(),
+                protection,
+            },
+            8,
+            None,
+        );
+        assert_eq!(config["value"], "enabled");
+        assert!(config.get("value_redacted").is_none());
+    }
+
+    #[test]
+    fn kv_read_responses_are_explicitly_non_cacheable() {
+        let response = no_store(Json(json!({ "found": true })).into_response());
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
     }
 
     #[test]

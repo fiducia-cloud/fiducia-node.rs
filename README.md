@@ -22,7 +22,7 @@ All over HTTP (`/v1`):
 | **Locks (multi-key)** | `/v1/locks/*`      | Mutual exclusion over a **union** of keys — the flagship. Atomic all-or-nothing, FIFO, deadlock-free, fencing tokens, TTL leases. |
 | **Semaphores**        | `/v1/semaphores/*` | Counting locks: up to `limit` concurrent holders, FIFO queue beyond the cap. |
 | **Idempotency keys**  | `/v1/idempotency/*` | Retry-safe first-claim / duplicate-replay records with TTLs, owner fencing, and optional result payloads. |
-| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted before Raft** through external Vault Transit or a versioned local AES-256-GCM keyring; per-write `{"plaintext": true}` opt-out. |
+| **Config KV + watches** | `/v1/kv/*`       | Linearizable, versioned key/value with live SSE `watch` streams (etcd/znode). **Encrypted before Raft** through external Vault Transit or a versioned local AES-256-GCM keyring; per-write `{"plaintext": true}` opt-out outside the reserved `secret/` keyspace. |
 | **Rate limiting**     | `/v1/rate-limit/*` | Atomic token-bucket / sliding-window checks per tenant+key.     |
 | **Cron / schedules**  | `/v1/cron/*`       | Tenant-scoped CRUD, pause/resume/manual runs, sandboxed function targets, and a trace-correlated durable run trail. |
 | **Leader election**   | `/v1/elections/*`  | Clients campaign for a named leadership with TTL leases + fencing tokens. |
@@ -321,6 +321,14 @@ fiducia -XPUT 'localhost:8090/v1/kv?key=flags/checkout' -d '{"value":"on"}'
 fiducia -N    'localhost:8090/v1/kv?key=flags/checkout&watch=true'  # SSE watch
 fiducia       'localhost:8090/v1/locks?key=orders/42'               # inspect
 ```
+
+The client secrets surface stores values under the reserved `secret/` prefix.
+Those writes can never use the plaintext opt-out. Prefix listings return secret
+names, revisions, expiry, and protection metadata with `value_redacted: true`,
+but omit the value even when a generic KV client lists the empty prefix. An
+explicit single-key `GET` is the only reveal operation. KV read responses carry
+`Cache-Control: no-store` so revealed values are not retained by conforming HTTP
+caches.
 
 This is also why the load balancer can read the routing key the same way on every
 by-key request — it's always `?key=`, never a per-endpoint path shape.
