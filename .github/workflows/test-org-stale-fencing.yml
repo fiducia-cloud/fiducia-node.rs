@@ -1,0 +1,146 @@
+name: DEN-1391 test-org stale-fencing proof
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/test-org-stale-fencing.yml"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/test-org-stale-fencing.yml"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEST_HARNESS_COMMIT: 6d528be1e6563f4cb23cbab428830e49f3d64dd9
+  ROUTING_COMMIT: c694bc5c58587bec12989a347e926c0040aacada
+  INTERFACES_COMMIT: ee8fe689e93d104ecfca14e3999eaf6a17e4a804
+
+jobs:
+  three-node-stale-fencing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out node candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: source/fiducia-node.rs
+
+      - name: Validate this workflow
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: source/fiducia-node.rs/.github/workflows/test-org-stale-fencing.yml
+
+      - name: Check out exact routing sibling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: ${{ env.ROUTING_COMMIT }}
+          path: source/fiducia-routing.rs
+
+      - name: Check out exact generated interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ${{ env.INTERFACES_COMMIT }}
+          path: source/fiducia-interfaces
+
+      - name: Check out immutable test-org harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud-test/locks-leases-fencing-e2e
+          ref: ${{ env.TEST_HARNESS_COMMIT }}
+          path: harness
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.22.1"
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: source/fiducia-node.rs
+
+      - name: Verify immutable test-org and sibling pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$TEST_HARNESS_COMMIT"
+          test "$(git -C source/fiducia-routing.rs rev-parse HEAD)" = "$ROUTING_COMMIT"
+          test "$(git -C source/fiducia-interfaces rev-parse HEAD)" = "$INTERFACES_COMMIT"
+          node --check harness/scripts/stale-fencing-e2e.mjs
+          node harness/scripts/validate-plan.mjs
+
+      - name: Format, lint, test, and build the node candidate
+        working-directory: source/fiducia-node.rs
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --bin fiducia-node -- -D warnings
+          cargo test --locked locks::tests
+          cargo build --locked --bin fiducia-node
+
+      - name: Resolve exact candidate identity
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git -C source/fiducia-node.rs rev-parse HEAD)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+
+      - name: Run the test-org three-node stale-fencing scenario
+        env:
+          FIDUCIA_NODE_BIN: ${{ github.workspace }}/source/fiducia-node.rs/target/debug/fiducia-node
+          FIDUCIA_NODE_SOURCE_COMMIT: ${{ steps.candidate.outputs.commit }}
+          FIDUCIA_FENCING_EVIDENCE_PATH: ${{ github.workspace }}/test-results/stale-fencing-evidence.json
+        run: node harness/scripts/stale-fencing-e2e.mjs
+
+      - name: Validate bounded synthetic evidence
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ steps.candidate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          evidence=test-results/stale-fencing-evidence.json
+          jq -e '.schema_version == 1' "$evidence"
+          jq -e '.production_evidence == false' "$evidence"
+          jq -e '.passed == true' "$evidence"
+          jq -e --arg commit "$EXPECTED_COMMIT" '.source_commit == $commit' "$evidence"
+          jq -e '.tokens.holder_a < .tokens.holder_b and .tokens.holder_b < .tokens.holder_c and .tokens.holder_c < .tokens.holder_d' "$evidence"
+          jq -e '[.downstream_history[] | select(.accepted == false)] | length >= 3' "$evidence"
+          jq -e '[.leader_events[].event] | sort == ["crash", "restart"]' "$evidence"
+          if grep -Eiq '(ghp_|cfat_|lin_api_|secret_access_key|authorization:[[:space:]]*bearer)' "$evidence"; then
+            echo 'synthetic evidence contains credential-shaped material' >&2
+            exit 1
+          fi
+          {
+            echo '## DEN-1391 stale-fencing proof using the test-org harness'
+            echo
+            echo "- Node candidate: \`$EXPECTED_COMMIT\`"
+            echo "- Test harness: \`$TEST_HARNESS_COMMIT\`"
+            echo "- Assertions: \`$(jq '.assertions | length' "$evidence")\`"
+            echo "- Stale downstream writes rejected: \`$(jq '[.downstream_history[] | select(.accepted == false)] | length' "$evidence")\`"
+            echo '- Evidence tier: synthetic process automation; single Actions runner'
+          } >>"$GITHUB_STEP_SUMMARY"
