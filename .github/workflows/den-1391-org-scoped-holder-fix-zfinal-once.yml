@@ -1,0 +1,336 @@
+name: Finalize DEN-1391 org-scoped holder recovery directly once
+
+on:
+  push:
+    branches:
+      - fix/den-1391-org-scoped-snapshot-holders
+    paths:
+      - .github/workflows/den-1391-org-scoped-holder-fix-zfinal-once.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: den-1391-org-scoped-holder-fix-zfinal-once
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Check out the exact product branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/den-1391-org-scoped-snapshot-holders
+          fetch-depth: 0
+          persist-credentials: true
+          show-progress: false
+
+      - name: Apply canonical component-wise stored-holder validation
+        run: |
+          set -euo pipefail
+          pin_base='0b502f211ada5188772cde74deb6f830c2460935'
+          unexpected="$(git diff --name-only "$pin_base"...HEAD | grep -Ev '^\.github/workflows/den-1391-org-scoped-holder-fix-(once|retry-once|retry2-once|zfinal-once)\.yml$' || true)"
+          if [[ -n "$unexpected" ]]; then
+            printf 'unexpected pre-transform product paths:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} drifted: expected one match, found {count}')
+              return text.replace(old, new, 1)
+
+          org_path = Path('src/org_scope.rs')
+          org = org_path.read_text(encoding='utf-8')
+          valid_org = '''fn valid_org(value: &str) -> bool {
+              !value.is_empty()
+                  && value.len() <= MAX_ORG_BYTES
+                  && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+          }
+          '''
+          stored_holder_validation = valid_org + '''
+          fn valid_unscoped_holder(value: &str) -> bool {
+              !value.is_empty()
+                  && value.len() <= crate::validate::MAX_HOLDER_BYTES
+                  && !value.trim().is_empty()
+                  && !value.chars().any(char::is_control)
+          }
+
+          /// Validate the holder representation stored in replicated state.
+          ///
+          /// The HTTP layer first validates the caller's holder, then stores it
+          /// as `SOH + org + SOH + holder`. Those two trusted SOH bytes are
+          /// structural namespace delimiters, not caller-controlled controls.
+          /// Validate the org and holder components independently so the maximum
+          /// valid component sizes remain restorable while malformed prefixes,
+          /// empty components, extra delimiters, and raw controls still fail.
+          pub(crate) fn valid_stored_holder(value: &str) -> bool {
+              let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+              let Some(scoped) = value.strip_prefix(delimiter) else {
+                  return valid_unscoped_holder(value);
+              };
+              let Some((org, holder)) = scoped.split_once(delimiter) else {
+                  return false;
+              };
+              valid_org(org) && valid_unscoped_holder(holder)
+          }
+          '''
+          org = replace_once(
+              org,
+              valid_org,
+              stored_holder_validation,
+              'stored holder validator insertion',
+          )
+
+          org_test_anchor = '''    #[test]
+              fn org_validation() {
+          '''
+          org_test = '''    #[test]
+              fn stored_holder_validation_accepts_only_canonical_scoped_or_legacy_values() {
+                  assert!(valid_stored_holder("legacy-worker"));
+                  assert!(!valid_stored_holder("   "));
+
+                  let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+                  let scoped = OrgScope("org-a".into()).scope("worker-a");
+                  assert!(valid_stored_holder(&scoped));
+
+                  let max_org = "o".repeat(MAX_ORG_BYTES);
+                  let max_holder = "h".repeat(crate::validate::MAX_HOLDER_BYTES);
+                  let max_scoped = OrgScope(max_org).scope(&max_holder);
+                  assert!(max_scoped.len() > crate::validate::MAX_HOLDER_BYTES);
+                  assert!(valid_stored_holder(&max_scoped));
+
+                  let malformed = [
+                      format!("{delimiter}org-only"),
+                      format!("{delimiter}{delimiter}worker"),
+                      format!("{delimiter}org{delimiter}"),
+                      format!("{delimiter}org with space{delimiter}worker"),
+                      format!("{delimiter}org{delimiter}worker{delimiter}extra"),
+                      format!(
+                          "{delimiter}org{delimiter}{}",
+                          "h".repeat(crate::validate::MAX_HOLDER_BYTES + 1)
+                      ),
+                  ];
+                  for value in malformed {
+                      assert!(!valid_stored_holder(&value), "{value:?}");
+                  }
+              }
+
+          '''
+          org = replace_once(
+              org,
+              org_test_anchor,
+              org_test + org_test_anchor,
+              'stored holder validator tests',
+          )
+          org_path.write_text(org, encoding='utf-8')
+
+          state_path = Path('src/state.rs')
+          state = state_path.read_text(encoding='utf-8')
+          state = replace_once(
+              state,
+              '''            if grant.holder.trim().is_empty()
+                          || grant.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                          || grant.holder.chars().any(char::is_control)
+                      {
+          ''',
+              '''            if !crate::org_scope::valid_stored_holder(&grant.holder) {
+          ''',
+              'lock grant holder validation',
+          )
+          state = replace_once(
+              state,
+              '''            if queued.holder.trim().is_empty()
+                          || queued.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                          || queued.holder.chars().any(char::is_control)
+                          || queued.keys.is_empty()
+          ''',
+              '''            if !crate::org_scope::valid_stored_holder(&queued.holder)
+                          || queued.keys.is_empty()
+          ''',
+              'lock queue holder validation',
+          )
+          state = replace_once(
+              state,
+              '''                if slot.holder.trim().is_empty()
+                              || slot.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                              || slot.holder.chars().any(char::is_control)
+                              || slot.fencing_token == 0
+          ''',
+              '''                if !crate::org_scope::valid_stored_holder(&slot.holder)
+                              || slot.fencing_token == 0
+          ''',
+              'semaphore grant holder validation',
+          )
+          state = replace_once(
+              state,
+              '''                if indexed_holder != &queued.holder
+                              || queued.holder.trim().is_empty()
+                              || queued.holder.len() > crate::validate::MAX_HOLDER_BYTES
+                              || queued.holder.chars().any(char::is_control)
+                              || holders.contains(queued.holder.as_str())
+          ''',
+              '''                if indexed_holder != &queued.holder
+                              || !crate::org_scope::valid_stored_holder(&queued.holder)
+                              || holders.contains(queued.holder.as_str())
+          ''',
+              'semaphore queue holder validation',
+          )
+
+          restore_anchor = '''    #[test]
+              fn restore_rejects_a_ghost_held_key_missing_from_the_grant() {
+          '''
+          restore_test = '''    #[test]
+              fn org_scoped_lock_and_semaphore_holders_survive_snapshot_restore() {
+                  let org = crate::org_scope::OrgScope("tenant-a".into());
+                  let lock_key = org.scope("orders-writer");
+                  let lock_holder = org.scope("lock-holder");
+                  let lock_waiter = org.scope("lock-waiter");
+                  let semaphore_key = org.scope("worker-pool");
+                  let permit_holder = org.scope("permit-holder");
+                  let permit_waiter = org.scope("permit-waiter");
+
+                  let sm = StateMachine::new();
+                  sm.apply(Command::LockAcquireV2 {
+                      keys: vec![lock_key.clone()],
+                      holder: lock_holder.clone(),
+                      ttl_ms: 30_000,
+                      wait: false,
+                      wait_timeout_ms: None,
+                  });
+                  sm.apply(Command::LockAcquireV2 {
+                      keys: vec![lock_key.clone()],
+                      holder: lock_waiter.clone(),
+                      ttl_ms: 30_000,
+                      wait: true,
+                      wait_timeout_ms: None,
+                  });
+                  sm.apply(Command::SemaphoreAcquireV2 {
+                      key: semaphore_key.clone(),
+                      holder: permit_holder.clone(),
+                      limit: 1,
+                      ttl_ms: 30_000,
+                      wait: false,
+                      wait_timeout_ms: None,
+                  });
+                  sm.apply(Command::SemaphoreAcquireV2 {
+                      key: semaphore_key.clone(),
+                      holder: permit_waiter.clone(),
+                      limit: 1,
+                      ttl_ms: 30_000,
+                      wait: true,
+                      wait_timeout_ms: None,
+                  });
+
+                  let restored = StateMachine::new();
+                  restored
+                      .restore(&sm.snapshot().unwrap())
+                      .expect("canonical org-scoped holders must survive recovery");
+                  let store = restored.store.lock().unwrap();
+                  assert!(store
+                      .locks
+                      .grants
+                      .values()
+                      .any(|grant| grant.holder == lock_holder));
+                  assert!(store
+                      .locks
+                      .queue
+                      .iter()
+                      .any(|(_, queued)| queued.holder == lock_waiter));
+                  let semaphore = &store.semaphores[&semaphore_key];
+                  assert!(semaphore
+                      .holders
+                      .iter()
+                      .any(|slot| slot.holder == permit_holder));
+                  assert!(semaphore
+                      .queue
+                      .iter()
+                      .any(|(_, queued)| queued.holder == permit_waiter));
+              }
+
+          '''
+          state = replace_once(
+              state,
+              restore_anchor,
+              restore_test + restore_anchor,
+              'snapshot restore regression',
+          )
+          state_path.write_text(state, encoding='utf-8')
+          PY
+
+          git diff --check
+          grep -Fq 'valid_stored_holder' src/org_scope.rs
+          grep -Fq 'org_scoped_lock_and_semaphore_holders_survive_snapshot_restore' src/state.rs
+
+      - name: Install the repository Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+
+      - name: Format, lint, and test every target
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets -- --nocapture
+
+      - name: Publish bounded implementation evidence
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          jq -n \
+            --arg schema_version fiducia-org-scoped-holder-recovery.v1 \
+            --arg main_base 3d29536f4c2cce3c2ec094e4277d327c94f75590 \
+            --arg pin_refresh 0b502f211ada5188772cde74deb6f830c2460935 \
+            --arg head_sha "$(git rev-parse HEAD)" \
+            --arg diagnostic_run '31284436996' \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{schema_version:$schema_version,main_base:$main_base,pin_refresh:$pin_refresh,head_sha:$head_sha,diagnostic_run:$diagnostic_run,root_cause:"snapshot validator treated trusted SOH namespace delimiters as caller-controlled holder controls and applied the unscoped length bound to the combined identity",canonical_scoped_holder_validation:true,max_component_boundary_tested:true,malformed_prefixes_rejected:true,lock_grant_and_queue_restore_tested:true,semaphore_grant_and_queue_restore_tested:true,all_rust_targets_green:true,credential_material_present:false,generated_at:$generated_at}' \
+            > artifacts/org-scoped-holder-recovery.json
+
+      - name: Upload redacted implementation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: den-1391-org-scoped-holder-recovery-${{ github.run_id }}
+          path: artifacts/org-scoped-holder-recovery.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Commit and push the product-only fix
+        run: |
+          set -euo pipefail
+          main_base='3d29536f4c2cce3c2ec094e4277d327c94f75590'
+          pin_base='0b502f211ada5188772cde74deb6f830c2460935'
+          rm \
+            .github/workflows/den-1391-org-scoped-holder-fix-once.yml \
+            .github/workflows/den-1391-org-scoped-holder-fix-retry-once.yml \
+            .github/workflows/den-1391-org-scoped-holder-fix-retry2-once.yml \
+            .github/workflows/den-1391-org-scoped-holder-fix-zfinal-once.yml
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'fix(DEN-1391): restore canonical org-scoped lock holders'
+
+          relative_to_pin=$'src/org_scope.rs\nsrc/state.rs'
+          actual="$(git diff --name-only "$pin_base"...HEAD | sort)"
+          if [[ "$actual" != "$relative_to_pin" ]]; then
+            printf 'unexpected product paths relative to pin refresh:\n%s\n' "$actual" >&2
+            exit 1
+          fi
+          expected=$'.github/workflows/test-org-stale-fencing.yml\nsrc/org_scope.rs\nsrc/state.rs'
+          actual="$(git diff --name-only "$main_base"...HEAD | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'unexpected final PR paths:\n%s\n' "$actual" >&2
+            exit 1
+          fi
+          git push origin HEAD:fix/den-1391-org-scoped-snapshot-holders
