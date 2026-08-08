@@ -123,6 +123,28 @@ jobs:
           FIDUCIA_FENCING_EVIDENCE_PATH: ${{ github.workspace }}/test-results/stale-fencing-evidence.json
         run: node harness/scripts/stale-fencing-e2e.mjs
 
+      - name: Print bounded failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=test-results/stale-fencing-evidence.json
+          if [[ -f "$evidence" ]]; then
+            jq '{passed, failure, tokens, leader_events, assertions, node_logs}' "$evidence"
+          else
+            echo 'stale-fencing evidence file was not created' >&2
+          fi
+
+      - name: Upload bounded stale-fencing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stale-fencing-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/stale-fencing-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: false
+
       - name: Validate bounded synthetic evidence
         shell: bash
         env:
