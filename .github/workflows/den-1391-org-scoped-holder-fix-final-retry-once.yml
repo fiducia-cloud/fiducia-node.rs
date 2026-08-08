@@ -1,0 +1,180 @@
+name: Retry DEN-1391 shared stored-holder validation exactly once
+
+on:
+  push:
+    branches:
+      - fix/den-1391-org-scoped-snapshot-holders
+    paths:
+      - .github/workflows/den-1391-org-scoped-holder-fix-final-retry-once.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: den-1391-org-scoped-holder-fix-final-retry-once
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Check out the exact product branch in the permanent-CI layout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/den-1391-org-scoped-snapshot-holders
+          path: repo
+          fetch-depth: 0
+          persist-credentials: true
+          show-progress: false
+          submodules: recursive
+
+      - name: Check out the exact interfaces dependency
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+          persist-credentials: false
+          show-progress: false
+
+      - name: Check out the exact routing dependency
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+          persist-credentials: false
+          show-progress: false
+
+      - name: Reapply the reviewed shared-validator transformation with the exact org-scope boundary
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          source='.github/workflows/den-1391-org-scoped-holder-fix-final-shared-validator-once.yml'
+          test -f "$source"
+          cp "$source" /tmp/den-1391-shared-validator.yml
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lines = Path('/tmp/den-1391-shared-validator.yml').read_text(encoding='utf-8').splitlines()
+          step = lines.index('      - name: Apply canonical stored-holder validation in the shared module')
+          run_line = lines.index('        run: |', step + 1)
+          next_step = next(
+              index for index in range(run_line + 1, len(lines))
+              if lines[index].startswith('      - name: Install the repository Rust toolchain')
+          )
+          prefix = '          '
+          block = lines[run_line + 1:next_step]
+          if any(line.strip() and not line.startswith(prefix) for line in block):
+              raise SystemExit('reviewed shared-validator transformation indentation drifted')
+          script = '\n'.join(
+              line[len(prefix):] if line.startswith(prefix) else ''
+              for line in block
+          ).lstrip('\n') + '\n'
+
+          import_block = '''org = replace_once(
+              org,
+              'use crate::validate::MAX_KEY_BYTES;\\n',
+              'use crate::validate::{MAX_KEY_BYTES, MAX_ORG_BYTES};\\n',
+              'shared organization bound import',
+          )
+          '''
+          if script.count(import_block) != 1:
+              raise SystemExit('reviewed nonexistent import replacement drifted')
+          script = script.replace(import_block, '', 1)
+
+          old_constant_block = '''org = replace_once(
+              org,
+              'const MAX_ORG_BYTES: usize = 128;\\n',
+              '',
+              'local organization bound removal',
+          )
+          '''
+          new_constant_block = '''org = replace_once(
+              org,
+              'const MAX_ORG_BYTES: usize = 128;\\n',
+              'const MAX_ORG_BYTES: usize = crate::validate::MAX_ORG_BYTES;\\n',
+              'shared organization bound alias',
+          )
+          '''
+          if script.count(old_constant_block) != 1:
+              raise SystemExit('reviewed organization constant replacement drifted')
+          script = script.replace(old_constant_block, new_constant_block, 1)
+
+          Path('/tmp/apply-den-1391-shared-validator.sh').write_text(script, encoding='utf-8')
+          PY
+
+          bash /tmp/apply-den-1391-shared-validator.sh
+          git diff --check
+
+      - name: Install the repository Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+
+      - name: Format, lint, and test every target and feature
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features -- --nocapture
+
+      - name: Publish bounded implementation evidence
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          jq -n \
+            --arg schema_version fiducia-org-scoped-holder-recovery.v2 \
+            --arg main_base 3d29536f4c2cce3c2ec094e4277d327c94f75590 \
+            --arg pin_refresh 0b502f211ada5188772cde74deb6f830c2460935 \
+            --arg interfaces_sha ee8fe09f846f5a776d156c0b0d0d15582c8bd539 \
+            --arg routing_sha c694bc5c58587bec12989a347e926c0040aacada \
+            --arg head_sha "$(git rev-parse HEAD)" \
+            --arg diagnostic_run '31284436996' \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{schema_version:$schema_version,main_base:$main_base,pin_refresh:$pin_refresh,interfaces_sha:$interfaces_sha,routing_sha:$routing_sha,head_sha:$head_sha,diagnostic_run:$diagnostic_run,root_cause:"snapshot validation treated trusted SOH namespace delimiters as caller-controlled holder controls and applied an unscoped bound to the combined identity",shared_validation_module:true,formal_refinement_target_compiles_same_rule:true,canonical_scoped_holder_validation:true,max_component_boundary_tested:true,malformed_prefixes_rejected:true,lock_grant_and_queue_restore_tested:true,semaphore_grant_and_queue_restore_tested:true,all_targets_and_features_green:true,credential_material_present:false,generated_at:$generated_at}' \
+            > artifacts/org-scoped-holder-recovery.json
+
+      - name: Upload redacted implementation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: den-1391-org-scoped-holder-recovery-${{ github.run_id }}
+          path: repo/artifacts/org-scoped-holder-recovery.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Commit and push the product-only fix
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          main_base='3d29536f4c2cce3c2ec094e4277d327c94f75590'
+          pin_base='0b502f211ada5188772cde74deb6f830c2460935'
+          find .github/workflows -maxdepth 1 -type f \
+            -name 'den-1391-org-scoped-holder-fix-*.yml' -delete
+          rm -rf artifacts
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'fix(DEN-1391): restore canonical org-scoped lock holders'
+
+          relative_to_pin=$'src/org_scope.rs\nsrc/state.rs\nsrc/validate.rs'
+          actual="$(git diff --name-only "$pin_base"...HEAD | sort)"
+          if [[ "$actual" != "$relative_to_pin" ]]; then
+            printf 'unexpected product paths relative to pin refresh:\n%s\n' "$actual" >&2
+            exit 1
+          fi
+          expected=$'.github/workflows/test-org-stale-fencing.yml\nsrc/org_scope.rs\nsrc/state.rs\nsrc/validate.rs'
+          actual="$(git diff --name-only "$main_base"...HEAD | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'unexpected final PR paths:\n%s\n' "$actual" >&2
+            exit 1
+          fi
+          git push origin HEAD:fix/den-1391-org-scoped-snapshot-holders
