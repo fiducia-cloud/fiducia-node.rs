@@ -24,3 +24,7 @@ Thumbs.db
 *~
 .direnv/
 target/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
