@@ -34,7 +34,7 @@ use crate::consensus::{propose_response, ProposeError, ProposeOutcome};
 pub const ORG_HEADER: &str = "x-fiducia-org-id";
 
 /// Max bytes for an org id (matches the `orgs.slug`/id column bounds).
-const MAX_ORG_BYTES: usize = 128;
+const MAX_ORG_BYTES: usize = crate::validate::MAX_ORG_BYTES;
 
 /// A validated org scope, attached to every state-touching `/v1` request.
 #[derive(Debug, Clone, PartialEq, Eq)]

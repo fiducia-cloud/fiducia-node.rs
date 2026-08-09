@@ -26,9 +26,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TEST_HARNESS_COMMIT: 6d528be1e6563f4cb23cbab428830e49f3d64dd9
+  TEST_HARNESS_COMMIT: 5d41689dd0f7f0edfafb8cca191f3907f34962ec
   ROUTING_COMMIT: c694bc5c58587bec12989a347e926c0040aacada
-  INTERFACES_COMMIT: ee8fe689e93d104ecfca14e3999eaf6a17e4a804
+  INTERFACES_COMMIT: 15950fffabdf97334c2c7daa4ebc15730587a823
 
 jobs:
   three-node-stale-fencing:
@@ -90,6 +90,12 @@ jobs:
           test "$(git -C harness rev-parse HEAD)" = "$TEST_HARNESS_COMMIT"
           test "$(git -C source/fiducia-routing.rs rev-parse HEAD)" = "$ROUTING_COMMIT"
           test "$(git -C source/fiducia-interfaces rev-parse HEAD)" = "$INTERFACES_COMMIT"
+          test "$(jq -r '.sources[] | select(.name == "fiducia-routing.rs") | .commit' harness/source-pins.json)" = "$ROUTING_COMMIT"
+          test "$(jq -r '.sources[] | select(.name == "fiducia-interfaces") | .commit' harness/source-pins.json)" = "$INTERFACES_COMMIT"
+          jq -e '.schema_version == 3' harness/source-pins.json
+          jq -e '.access_boundary.test_org_checks_out_private_production_source == false' harness/source-pins.json
+          jq -e '.access_boundary.test_org_receives_cross_org_pat == false' harness/source-pins.json
+          jq -e '.security.productionEvidence == false' harness/test-plan.json
           node --check harness/scripts/stale-fencing-e2e.mjs
           node harness/scripts/validate-plan.mjs
 
@@ -116,6 +122,28 @@ jobs:
           FIDUCIA_NODE_SOURCE_COMMIT: ${{ steps.candidate.outputs.commit }}
           FIDUCIA_FENCING_EVIDENCE_PATH: ${{ github.workspace }}/test-results/stale-fencing-evidence.json
         run: node harness/scripts/stale-fencing-e2e.mjs
+
+      - name: Print bounded failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=test-results/stale-fencing-evidence.json
+          if [[ -f "$evidence" ]]; then
+            jq '{passed, failure, tokens, leader_events, assertions, node_logs}' "$evidence"
+          else
+            echo 'stale-fencing evidence file was not created' >&2
+          fi
+
+      - name: Upload bounded stale-fencing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stale-fencing-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/stale-fencing-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: false
 
       - name: Validate bounded synthetic evidence
         shell: bash
