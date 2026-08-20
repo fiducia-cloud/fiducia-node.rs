@@ -46,7 +46,7 @@ jobs:
         run: python3 formal/check_lease_fencing_sentinel.py
 
       - name: Install Nix
-        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
 
       - name: Validate the locked repository contract
         run: nix develop -c agent-check preflight
