@@ -30,6 +30,8 @@ pub const MAX_LOCK_KEYS: usize = 256;
 pub const MAX_KEY_BYTES: usize = 1024;
 /// Max bytes for a holder / candidate / instance identifier.
 pub const MAX_HOLDER_BYTES: usize = 512;
+/// Max bytes for one organization component in a scoped identity.
+pub(crate) const MAX_ORG_BYTES: usize = 128;
 /// Max bytes for one client-generated logical acquisition attempt id.
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 /// Max bytes for an election or service *name*.
@@ -125,6 +127,39 @@ fn check_holder(value: &str) -> Result<(), Rejection> {
         ));
     }
     Ok(())
+}
+
+/// Validate a holder exactly as it is stored in replicated state.
+///
+/// HTTP validation bounds the caller-supplied holder before the routing
+/// layer stores it as `SOH + org + SOH + holder`. The two SOH bytes are
+/// trusted structural delimiters, not caller-controlled characters.
+/// Validate the organization and holder components independently so a
+/// maximum-size valid pair remains restorable while malformed prefixes,
+/// empty components, extra delimiters, whitespace in the organization,
+/// and raw controls still fail closed. Legacy unscoped snapshots remain
+/// accepted under the original holder contract.
+pub(crate) fn valid_stored_holder(value: &str) -> bool {
+    fn valid_holder_component(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= MAX_HOLDER_BYTES
+            && !value.trim().is_empty()
+            && !value.chars().any(char::is_control)
+    }
+
+    let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+    let Some(scoped) = value.strip_prefix(delimiter) else {
+        return valid_holder_component(value);
+    };
+    let Some((org, holder)) = scoped.split_once(delimiter) else {
+        return false;
+    };
+    !org.is_empty()
+        && org.len() <= MAX_ORG_BYTES
+        && !org
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        && valid_holder_component(holder)
 }
 
 /// Validate the optional identity that binds acquire retries to cancellation.
@@ -601,6 +636,43 @@ mod tests {
 
     fn big(n: usize) -> String {
         "x".repeat(n)
+    }
+
+    #[test]
+    fn stored_holder_validation_accepts_only_canonical_scoped_or_legacy_values() {
+        assert!(valid_stored_holder("legacy-worker"));
+        assert!(!valid_stored_holder("   "));
+        assert!(!valid_stored_holder("raw\u{1}control"));
+
+        let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+        assert!(valid_stored_holder(&format!(
+            "{delimiter}org-a{delimiter}worker-a"
+        )));
+
+        let max_org = "o".repeat(MAX_ORG_BYTES);
+        let max_holder = "h".repeat(MAX_HOLDER_BYTES);
+        let max_scoped = format!("{delimiter}{max_org}{delimiter}{max_holder}");
+        assert!(max_scoped.len() > MAX_HOLDER_BYTES);
+        assert!(valid_stored_holder(&max_scoped));
+
+        let malformed = [
+            format!("{delimiter}org-only"),
+            format!("{delimiter}{delimiter}worker"),
+            format!("{delimiter}org{delimiter}"),
+            format!("{delimiter}org with space{delimiter}worker"),
+            format!("{delimiter}org{delimiter}worker{delimiter}extra"),
+            format!(
+                "{delimiter}org{delimiter}{}",
+                "h".repeat(MAX_HOLDER_BYTES + 1)
+            ),
+            format!(
+                "{delimiter}{}{delimiter}worker",
+                "o".repeat(MAX_ORG_BYTES + 1)
+            ),
+        ];
+        for value in malformed {
+            assert!(!valid_stored_holder(&value), "{value:?}");
+        }
     }
 
     #[test]

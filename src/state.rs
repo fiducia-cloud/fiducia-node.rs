@@ -3197,10 +3197,7 @@ impl Store {
                     grant.fencing_token
                 ));
             }
-            if grant.holder.trim().is_empty()
-                || grant.holder.len() > crate::validate::MAX_HOLDER_BYTES
-                || grant.holder.chars().any(char::is_control)
-            {
+            if !crate::validate::valid_stored_holder(&grant.holder) {
                 return Err(format!("lock grant {token} carries an invalid holder"));
             }
             if grant.keys.is_empty()
@@ -3235,9 +3232,7 @@ impl Store {
             {
                 return Err("lock queue index does not match its queued request".to_string());
             }
-            if queued.holder.trim().is_empty()
-                || queued.holder.len() > crate::validate::MAX_HOLDER_BYTES
-                || queued.holder.chars().any(char::is_control)
+            if !crate::validate::valid_stored_holder(&queued.holder)
                 || queued.keys.is_empty()
                 || queued.keys.len() > crate::validate::MAX_LOCK_KEYS
                 || canonical_keys(&queued.keys).as_slice() != queued.keys.as_slice()
@@ -3282,9 +3277,7 @@ impl Store {
             let mut holders = std::collections::HashSet::<&str>::new();
             let mut tokens = std::collections::HashSet::<u64>::new();
             for slot in &semaphore.holders {
-                if slot.holder.trim().is_empty()
-                    || slot.holder.len() > crate::validate::MAX_HOLDER_BYTES
-                    || slot.holder.chars().any(char::is_control)
+                if !crate::validate::valid_stored_holder(&slot.holder)
                     || slot.fencing_token == 0
                     || !holders.insert(slot.holder.as_str())
                     || !tokens.insert(slot.fencing_token)
@@ -3300,9 +3293,7 @@ impl Store {
 
             for (indexed_holder, queued) in semaphore.queue.iter() {
                 if indexed_holder != &queued.holder
-                    || queued.holder.trim().is_empty()
-                    || queued.holder.len() > crate::validate::MAX_HOLDER_BYTES
-                    || queued.holder.chars().any(char::is_control)
+                    || !crate::validate::valid_stored_holder(&queued.holder)
                     || holders.contains(queued.holder.as_str())
                     || queued.ttl_ms == 0
                     || queued.ttl_ms > crate::validate::MAX_TTL_MS
@@ -5813,6 +5804,49 @@ mod tests {
             wait_timeout_ms: None,
         })
         .output
+    }
+
+    #[test]
+    fn org_scoped_lock_and_semaphore_holders_survive_snapshot_restore() {
+        let delimiter = fiducia_routing::ORG_SCOPE_DELIM;
+        let scoped = |value: &str| format!("{delimiter}tenant-a{delimiter}{value}");
+        let lock_key = scoped("orders-writer");
+        let lock_holder = scoped("lock-holder");
+        let lock_waiter = scoped("lock-waiter");
+        let semaphore_key = scoped("worker-pool");
+        let permit_holder = scoped("permit-holder");
+        let permit_waiter = scoped("permit-waiter");
+
+        let sm = StateMachine::new();
+        acquire(&sm, &[&lock_key], &lock_holder, false);
+        acquire(&sm, &[&lock_key], &lock_waiter, true);
+        semaphore_acquire(&sm, &semaphore_key, &permit_holder, 1, false);
+        semaphore_acquire(&sm, &semaphore_key, &permit_waiter, 1, true);
+
+        let restored = StateMachine::new();
+        restored
+            .restore(&sm.snapshot().unwrap())
+            .expect("canonical org-scoped holders must survive recovery");
+        let store = restored.store.lock().unwrap();
+        assert!(store
+            .locks
+            .grants
+            .values()
+            .any(|grant| grant.holder == lock_holder));
+        assert!(store
+            .locks
+            .queue
+            .iter()
+            .any(|(_, queued)| queued.holder == lock_waiter));
+        let semaphore = &store.semaphores[&semaphore_key];
+        assert!(semaphore
+            .holders
+            .iter()
+            .any(|slot| slot.holder == permit_holder));
+        assert!(semaphore
+            .queue
+            .iter()
+            .any(|(_, queued)| queued.holder == permit_waiter));
     }
 
     #[test]

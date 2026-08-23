@@ -48,7 +48,7 @@ seed = "56620260729"
 [adapters.rust]
 strategy = "bounded-independent-reference-and-itf-replay"
 target = "tests/formal_union_lock_refinement.rs"
-status = "planned"
+status = "active"
 issue = "DEN-566"
 
 [adapters.typescript]
