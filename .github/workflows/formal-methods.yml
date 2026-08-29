@@ -8,6 +8,10 @@ on:
       - 'flake.lock'
       - 'flake.nix'
       - 'formal/**'
+      - 'src/consensus.rs'
+      - 'src/persist.rs'
+      - 'src/raft_api.rs'
+      - 'src/state.rs'
       - 'docs/FORMAL_METHODS.md'
       - 'tests/formal_union_lock_refinement.rs'
   push:
@@ -18,6 +22,10 @@ on:
       - 'flake.lock'
       - 'flake.nix'
       - 'formal/**'
+      - 'src/consensus.rs'
+      - 'src/persist.rs'
+      - 'src/raft_api.rs'
+      - 'src/state.rs'
       - 'docs/FORMAL_METHODS.md'
       - 'tests/formal_union_lock_refinement.rs'
   schedule:

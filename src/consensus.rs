@@ -3531,6 +3531,22 @@ mod tests {
         }
     }
 
+    fn mutate_snapshot_json(
+        snapshot: &[u8],
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> Vec<u8> {
+        let json_start = snapshot
+            .iter()
+            .position(|byte| *byte == b'{')
+            .expect("state-machine snapshot JSON object");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&snapshot[json_start..]).expect("decode state-machine snapshot");
+        mutate(&mut value);
+        let mut output = snapshot[..json_start].to_vec();
+        output.extend(serde_json::to_vec(&value).expect("encode state-machine snapshot"));
+        output
+    }
+
     #[test]
     fn append_batches_respect_count_and_wire_size_without_dropping_an_entry() {
         let entries: Vec<_> = (1..=4)
@@ -5117,6 +5133,56 @@ mod tests {
         assert_eq!(actor.snapshot_index, 0);
         assert_eq!(actor.commit_index, 0);
         assert!(actor.storage_fault.is_some());
+    }
+
+    #[test]
+    fn invalid_installed_snapshot_is_rejected_without_replacing_live_authority() {
+        let mut actor = follower_actor();
+        let live_command = Command::LockAcquireV2 {
+            keys: vec!["live-authority".to_string()],
+            holder: "current-holder".to_string(),
+            ttl_ms: 300_000,
+            wait: false,
+            wait_timeout_ms: None,
+        };
+        let acquired = actor.state.apply_at(live_command.clone(), 10_000);
+        assert_eq!(acquired.output["fencing_token"], 1);
+        actor.log.push(LogEntry {
+            term: actor.current_term,
+            index: 1,
+            proposed_at_ms: 10_000,
+            command: Some(live_command),
+        });
+        actor.commit_index = 1;
+        actor.last_applied = 1;
+
+        let live_state_before = actor.state.snapshot().unwrap();
+        let snapshot_state_before = actor.snapshot_state.clone();
+        let invalid_snapshot = mutate_snapshot_json(&live_state_before, |value| {
+            value["next_fencing_token"] = serde_json::json!(0);
+        });
+
+        let response = actor.handle_install_snapshot(InstallSnapshotReq {
+            term: actor.current_term,
+            leader_id: "b".to_string(),
+            last_included_index: 5,
+            last_included_term: actor.current_term,
+            state: invalid_snapshot,
+        });
+
+        assert!(!response.success);
+        assert_eq!(response.match_index, 1);
+        assert_eq!(actor.snapshot_index, 0);
+        assert_eq!(actor.snapshot_term, 0);
+        assert_eq!(actor.snapshot_state, snapshot_state_before);
+        assert_eq!(actor.commit_index, 1);
+        assert_eq!(actor.last_applied, 1);
+        assert_eq!(
+            actor.state.snapshot().unwrap(),
+            live_state_before,
+            "an invariant-invalid snapshot must not replace live grants or fencing authority"
+        );
+        assert!(actor.storage_fault.is_none());
     }
 
     #[test]

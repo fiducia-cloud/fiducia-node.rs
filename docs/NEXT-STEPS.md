@@ -47,8 +47,9 @@ GC, and misconfig edges.
 - P3-1: in-flight proposal drain on leadership loss (`fail_pending` resolves exactly once as
   `NotLeader`) — `consensus.rs:1267`.
 - P3-2: fencing-token monotonicity after snapshot→restore (existing test asserts structure only).
-- P3-3: InstallSnapshot / boot **rejection** of an invariant-violating snapshot (unit validator
-  is tested; the integration wiring — `success==false`, live state untouched — is not) — `consensus.rs:1645`.
+- P3-3: InstallSnapshot / boot **rejection** of an invariant-violating snapshot is covered at
+  the integration boundary: `success==false`, snapshot/apply indices stay fixed, and live grants
+  plus fencing authority remain byte-for-byte unchanged.
 
 Persistence (`persist.rs`) is already reference-quality; the one open item is adding a
 length+checksum header to persisted files (M5, shared with brain).

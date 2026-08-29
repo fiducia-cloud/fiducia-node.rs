@@ -16,7 +16,7 @@ it does not replace it.
 | bounded checking | Apalache through `agent-check formal-verify*` | exhaustive counterexample search within reviewed bounds |
 | deterministic traces | `agent-check formal-test` / `formal-simulate` | named critical histories and invariant reachability |
 | model-based traces | `agent-check formal-mbt` | generate implementation-facing transition histories |
-| production refinement | `tests/formal_union_lock_refinement.rs` and ITF replay | show Rust behavior refines model transitions |
+| production refinement | `tests/formal_union_lock_refinement.rs`, consensus/state white-box tests, and ITF replay | show Rust behavior refines model transitions and rejects invalid recovery inputs |
 | independent sentinel | `formal/check_lease_fencing_sentinel.py` | dependency-free cross-check of lease/fence fundamentals |
 | provenance | `agent-check formal-provenance` | record tools, inputs, bounds, and artifacts used by CI |
 
