@@ -545,8 +545,8 @@ async fn watch(
         tx,
         initial_instances,
     ));
-    let stream = ReceiverStream::new(outgoing)
-        .map(|message| Ok::<Event, Infallible>(message.into_sse()));
+    let stream =
+        ReceiverStream::new(outgoing).map(|message| Ok::<Event, Infallible>(message.into_sse()));
     let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response();
@@ -672,13 +672,7 @@ mod tests {
 
     #[test]
     fn snapshot_messages_are_explicitly_authoritative() {
-        let message = snapshot_message(
-            "api",
-            "lagged",
-            None,
-            Some(17),
-            vec![instance("a-1", [])],
-        );
+        let message = snapshot_message("api", "lagged", None, Some(17), vec![instance("a-1", [])]);
 
         assert_eq!(message.event, "snapshot");
         assert_eq!(message.id, None);
@@ -770,10 +764,7 @@ mod tests {
         assert_eq!(register_snapshot.event, "snapshot");
         assert_eq!(register_snapshot.id, Some(register_revision));
         assert_eq!(register_snapshot.data["reason"], "change");
-        assert_eq!(
-            register_snapshot.data["instances"][0]["instance_id"],
-            "a-1"
-        );
+        assert_eq!(register_snapshot.data["instances"][0]["instance_id"], "a-1");
 
         node.propose(Command::ServiceHeartbeat {
             service: org.scope("api"),
@@ -789,7 +780,13 @@ mod tests {
         let heartbeat_snapshot = next_message(&mut outgoing).await;
         assert_eq!(heartbeat_snapshot.event, "snapshot");
         assert_eq!(heartbeat_snapshot.id, Some(heartbeat_revision));
-        assert_eq!(heartbeat_snapshot.data["instances"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            heartbeat_snapshot.data["instances"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         node.propose(Command::ServiceDeregister {
             service: org.scope("api"),
@@ -804,12 +801,10 @@ mod tests {
         let deregister_snapshot = next_message(&mut outgoing).await;
         assert_eq!(deregister_snapshot.event, "snapshot");
         assert_eq!(deregister_snapshot.id, Some(deregister_revision));
-        assert!(
-            deregister_snapshot.data["instances"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(deregister_snapshot.data["instances"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -827,10 +822,7 @@ mod tests {
         let matching = next_message(&mut outgoing).await;
         assert_eq!(matching.event, "register");
         assert_eq!(matching.data["key"], "api");
-        assert_eq!(
-            matching.data["detail"]["instance"]["instance_id"],
-            "a-1"
-        );
+        assert_eq!(matching.data["detail"]["instance"]["instance_id"], "a-1");
         let snapshot = next_message(&mut outgoing).await;
         assert_eq!(snapshot.data["instances"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot.data["instances"][0]["instance_id"], "a-1");
@@ -867,12 +859,10 @@ mod tests {
         ));
 
         let intentionally_stale_initial = next_message(&mut outgoing).await;
-        assert!(
-            intentionally_stale_initial.data["instances"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(intentionally_stale_initial.data["instances"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let resync = next_message(&mut outgoing).await;
         assert_eq!(resync.event, "snapshot");
         assert_eq!(resync.data["reason"], "lagged");
