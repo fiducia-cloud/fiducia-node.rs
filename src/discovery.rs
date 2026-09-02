@@ -659,7 +659,7 @@ mod tests {
             kind: "register",
             key: org.scope("api"),
             revision: 42,
-            detail: Some(json!({ "instance": instance("a-1", []) })),
+            detail: Some(json!(instance("a-1", []))),
         };
 
         let message = change_message(&event, &org).expect("change message");
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(message.id, Some(42));
         assert_eq!(message.data["key"], "api");
         assert_eq!(message.data["revision"], 42);
-        assert_eq!(message.data["detail"]["instance"]["instance_id"], "a-1");
+        assert_eq!(message.data["detail"]["instance_id"], "a-1");
     }
 
     #[test]
@@ -822,7 +822,7 @@ mod tests {
         let matching = next_message(&mut outgoing).await;
         assert_eq!(matching.event, "register");
         assert_eq!(matching.data["key"], "api");
-        assert_eq!(matching.data["detail"]["instance"]["instance_id"], "a-1");
+        assert_eq!(matching.data["detail"]["instance_id"], "a-1");
         let snapshot = next_message(&mut outgoing).await;
         assert_eq!(snapshot.data["instances"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot.data["instances"][0]["instance_id"], "a-1");
