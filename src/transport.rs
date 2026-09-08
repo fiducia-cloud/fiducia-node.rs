@@ -24,6 +24,14 @@ use tokio::sync::{mpsc, oneshot};
 use crate::consensus::{LogEntry, ShardMsg};
 use fiducia_routing::ShardId;
 
+#[path = "raft_reply.rs"]
+mod raft_reply;
+use self::raft_reply::{admit_replication_reply, ReplyAdmission};
+
+#[cfg(test)]
+#[path = "transport_replication_tests.rs"]
+mod replication_tests;
+
 fn legacy_command_protocol() -> u16 {
     crate::state::LEGACY_COMMAND_PROTOCOL
 }
@@ -62,8 +70,9 @@ pub struct AppendEntriesResp {
     pub term: u64,
     /// Whether the consistency check passed and the entries were stored.
     pub success: bool,
-    /// Follower's last log index afterward — lets the leader set `match_index`
-    /// on success and fast-rewind `next_index` on failure.
+    /// On success, the prefix acknowledged by this RPC; on failure, a retry
+    /// hint. A leader may credit only the prefix it actually sent, never an
+    /// unrelated follower suffix. Snapshot replies may report a newer prefix.
     pub match_index: u64,
     /// Highest command protocol this follower binary can parse. Leaders must
     /// observe V2 from every configured peer before appending the activation
@@ -171,9 +180,9 @@ impl LoopbackRegistry {
 // Transport: the outbound side a leader/candidate uses to reach peers.
 // ---------------------------------------------------------------------------
 
-/// Outbound peer RPC. `None` from a send means "couldn't reach the peer this
-/// time" — Raft tolerates dropped messages, so callers simply retry on the next
-/// tick.
+/// Outbound peer RPC. `None` means unreachable or inadmissible response evidence.
+/// Raft tolerates dropped messages, so callers retry on the next tick. Replication
+/// replies are checked against their originating request in BOTH backings.
 pub enum Transport {
     /// In-process delivery to another node's shard inbox (the test harness).
     #[allow(dead_code)]
@@ -219,7 +228,11 @@ impl Transport {
         shard: ShardId,
         req: AppendEntriesReq,
     ) -> Option<AppendEntriesResp> {
-        match self {
+        let request_term = req.term;
+        let requested_index = req
+            .prev_log_index
+            .checked_add(u64::try_from(req.entries.len()).ok()?)?;
+        let mut response: AppendEntriesResp = match self {
             Transport::Loopback(reg) => {
                 let inbox = reg.sender(peer, shard)?;
                 let (resp, rx) = oneshot::channel();
@@ -240,6 +253,27 @@ impl Transport {
                     .await;
                 decode_peer_response("append", peer, shard, response).await
             }
+        }?;
+        match admit_replication_reply(
+            request_term,
+            requested_index,
+            response.term,
+            response.success,
+            response.match_index,
+        ) {
+            ReplyAdmission::Ignore => {
+                tracing::warn!(peer, shard, "discarded uncorrelated Raft append response");
+                None
+            }
+            ReplyAdmission::ObserveHigherTerm => {
+                // The actor must observe this term even for an otherwise invalid
+                // response, but an old request cannot prove replication or parser
+                // capability in a newer leadership term.
+                response.success = false;
+                response.command_protocol = legacy_command_protocol();
+                Some(response)
+            }
+            ReplyAdmission::Deliver => Some(response),
         }
     }
 
@@ -276,7 +310,9 @@ impl Transport {
         shard: ShardId,
         req: InstallSnapshotReq,
     ) -> Option<InstallSnapshotResp> {
-        match self {
+        let request_term = req.term;
+        let requested_index = req.last_included_index;
+        let mut response: InstallSnapshotResp = match self {
             Transport::Loopback(reg) => {
                 let inbox = reg.sender(peer, shard)?;
                 let (resp, rx) = oneshot::channel();
@@ -297,6 +333,23 @@ impl Transport {
                     .await;
                 decode_peer_response("snapshot", peer, shard, response).await
             }
+        }?;
+        match admit_replication_reply(
+            request_term,
+            requested_index,
+            response.term,
+            response.success,
+            response.match_index,
+        ) {
+            ReplyAdmission::Ignore => {
+                tracing::warn!(peer, shard, "discarded uncorrelated Raft snapshot response");
+                None
+            }
+            ReplyAdmission::ObserveHigherTerm => {
+                response.success = false;
+                Some(response)
+            }
+            ReplyAdmission::Deliver => Some(response),
         }
     }
 }
