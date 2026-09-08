@@ -73,10 +73,9 @@ async fn delayed_append_cannot_resurrect_lease() {
         actor.leader.as_ref().unwrap().last_contact["b"],
         request.sent_at
     );
-    assert!(matches!(
-        actor.handle_query(ReadRequest::Kv { key: "x".into() }),
-        Err(_)
-    ));
+    assert!(actor
+        .handle_query(ReadRequest::Kv { key: "x".into() })
+        .is_err());
 }
 
 #[tokio::test]
