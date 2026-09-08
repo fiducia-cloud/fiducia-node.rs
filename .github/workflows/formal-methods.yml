@@ -12,8 +12,16 @@ on:
       - 'src/persist.rs'
       - 'src/raft_api.rs'
       - 'src/state.rs'
+      - 'src/transport.rs'
+      - 'src/raft_reply.rs'
+      - 'src/transport_replication_tests.rs'
+      - 'src/indexed_queue.rs'
+      - 'src/cron.rs'
+      - 'src/validate.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'docs/FORMAL_METHODS.md'
-      - 'tests/formal_union_lock_refinement.rs'
+      - 'tests/formal_*.rs'
   push:
     branches: [main]
     paths:
@@ -26,8 +34,16 @@ on:
       - 'src/persist.rs'
       - 'src/raft_api.rs'
       - 'src/state.rs'
+      - 'src/transport.rs'
+      - 'src/raft_reply.rs'
+      - 'src/transport_replication_tests.rs'
+      - 'src/indexed_queue.rs'
+      - 'src/cron.rs'
+      - 'src/validate.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'docs/FORMAL_METHODS.md'
-      - 'tests/formal_union_lock_refinement.rs'
+      - 'tests/formal_*.rs'
   schedule:
     - cron: '23 6 * * 1'
   workflow_dispatch:
@@ -40,6 +56,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  raft-reply:
+    name: Raft replication evidence model
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact source head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install repository-pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # pinned action
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Exhaustively check production reply admission and negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .formal-artifacts
+          git rev-parse HEAD > .formal-artifacts/raft-reply-source.txt
+          rustc --version --verbose >> .formal-artifacts/raft-reply-source.txt
+          sha256sum src/raft_reply.rs src/transport.rs src/transport_replication_tests.rs \
+            tests/formal_raft_reply_refinement.rs formal/RAFT_REPLY_MODEL.md \
+            > .formal-artifacts/raft-reply-inputs.sha256
+          rustc --edition=2021 --deny warnings --test tests/formal_raft_reply_refinement.rs \
+            -o "$RUNNER_TEMP/fiducia-raft-reply-model"
+          "$RUNNER_TEMP/fiducia-raft-reply-model" --nocapture 2>&1 \
+            | tee .formal-artifacts/raft-reply-model.log
+          rustfmt --edition 2021 --check src/raft_reply.rs tests/formal_raft_reply_refinement.rs
+
+      - name: Upload exact-head bounded evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fiducia-raft-reply-evidence
+          path: .formal-artifacts/raft-reply-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
   union-lock:
     name: Quint union-lock model
     runs-on: ubuntu-latest
