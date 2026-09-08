@@ -207,7 +207,8 @@ fn exhaustive_guard_truth_table_and_integer_extremes() {
                     for success in [false, true] {
                         let expected = if response_term > request_term {
                             ReplyAdmission::ObserveHigherTerm
-                        } else if response_term < request_term || (success && reported < requested) {
+                        } else if response_term < request_term || (success && reported < requested)
+                        {
                             ReplyAdmission::Ignore
                         } else {
                             ReplyAdmission::Deliver

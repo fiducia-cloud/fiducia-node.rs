@@ -113,14 +113,18 @@ async fn loopback_replication_replies_require_request_evidence() {
         let transport = Transport::loopback(registry);
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             assert_append(
-                transport.append_entries("follower", 0, append_request()).await,
+                transport
+                    .append_entries("follower", 0, append_request())
+                    .await,
                 term,
                 success,
                 index,
                 delivered,
             );
             assert_snapshot(
-                transport.install_snapshot("follower", 0, snapshot_request()).await,
+                transport
+                    .install_snapshot("follower", 0, snapshot_request())
+                    .await,
                 term,
                 success,
                 index,
@@ -155,14 +159,18 @@ async fn http_replication_replies_use_the_same_admission_guard() {
         let transport = Transport::Http(reqwest::Client::new());
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             assert_append(
-                transport.append_entries(&address, 0, append_request()).await,
+                transport
+                    .append_entries(&address, 0, append_request())
+                    .await,
                 term,
                 success,
                 index,
                 delivered,
             );
             assert_snapshot(
-                transport.install_snapshot(&address, 0, snapshot_request()).await,
+                transport
+                    .install_snapshot(&address, 0, snapshot_request())
+                    .await,
                 term,
                 success,
                 index,
@@ -190,9 +198,9 @@ async fn append_index_overflow_is_rejected_before_sending() {
         command: None,
     });
     let transport = Transport::loopback(registry);
-    assert!(transport
-        .append_entries("follower", 0, req)
-        .await
-        .is_none());
-    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert!(transport.append_entries("follower", 0, req).await.is_none());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
