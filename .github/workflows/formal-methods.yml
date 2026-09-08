@@ -14,6 +14,8 @@ on:
       - 'src/state.rs'
       - 'src/transport.rs'
       - 'src/raft_reply.rs'
+      - 'src/raft_callback.rs'
+      - 'src/replication_callback_tests.rs'
       - 'src/transport_replication_tests.rs'
       - 'src/indexed_queue.rs'
       - 'src/cron.rs'
@@ -36,6 +38,8 @@ on:
       - 'src/state.rs'
       - 'src/transport.rs'
       - 'src/raft_reply.rs'
+      - 'src/raft_callback.rs'
+      - 'src/replication_callback_tests.rs'
       - 'src/transport_replication_tests.rs'
       - 'src/indexed_queue.rs'
       - 'src/cron.rs'
@@ -88,6 +92,14 @@ jobs:
           "$RUNNER_TEMP/fiducia-raft-reply-model" --nocapture 2>&1 \
             | tee .formal-artifacts/raft-reply-model.log
           rustfmt --edition 2021 --check src/raft_reply.rs tests/formal_raft_reply_refinement.rs
+          sha256sum src/raft_callback.rs src/consensus.rs src/replication_callback_tests.rs \
+            tests/formal_raft_callback_refinement.rs formal/RAFT_CALLBACK_MODEL.md \
+            > .formal-artifacts/raft-reply-callback-inputs.sha256
+          rustc --edition=2021 --deny warnings --test tests/formal_raft_callback_refinement.rs \
+            -o "$RUNNER_TEMP/fiducia-raft-callback-model"
+          "$RUNNER_TEMP/fiducia-raft-callback-model" --nocapture 2>&1 \
+            | tee .formal-artifacts/raft-reply-callback-model.log
+          rustfmt --edition 2021 --check src/raft_callback.rs tests/formal_raft_callback_refinement.rs
 
       - name: Upload exact-head bounded evidence
         if: always()
