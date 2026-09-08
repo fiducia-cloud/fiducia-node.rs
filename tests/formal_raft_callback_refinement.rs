@@ -5,8 +5,8 @@
 mod raft_callback;
 
 use raft_callback::{
-    acknowledged_prefix, advance_contact, classify_callback, contact_is_fresh,
-    CallbackAdmission, RequestStamp,
+    acknowledged_prefix, advance_contact, classify_callback, contact_is_fresh, CallbackAdmission,
+    RequestStamp,
 };
 use std::time::Duration;
 
@@ -16,7 +16,11 @@ fn exhaustive_callback_ownership_and_higher_term_transitions() {
     for term in 1..=3 {
         for sequence in 0..=2 {
             for sent_at in 0u64..=3 {
-                requests.push(RequestStamp { term, sequence, sent_at });
+                requests.push(RequestStamp {
+                    term,
+                    sequence,
+                    sent_at,
+                });
             }
         }
     }
@@ -33,7 +37,8 @@ fn exhaustive_callback_ownership_and_higher_term_transitions() {
                 for response in responses {
                     for now in 0..=4 {
                         transitions += 1;
-                        let decision = classify_callback(current, *outstanding, *request, response, now);
+                        let decision =
+                            classify_callback(current, *outstanding, *request, response, now);
                         if response.is_some_and(|term| term > current) {
                             assert_eq!(decision, CallbackAdmission::HigherTerm(response.unwrap()));
                             higher_terms += 1;
@@ -52,8 +57,11 @@ fn exhaustive_callback_ownership_and_higher_term_transitions() {
                                 admitted += 1;
                             }
                             CallbackAdmission::Ignore => {
-                                assert!(outstanding != &Some(*request)
-                                    || request.term != current || request.sent_at > now);
+                                assert!(
+                                    outstanding != &Some(*request)
+                                        || request.term != current
+                                        || request.sent_at > now
+                                );
                             }
                             CallbackAdmission::HigherTerm(_) => panic!("invented higher term"),
                         }
@@ -63,7 +71,9 @@ fn exhaustive_callback_ownership_and_higher_term_transitions() {
         }
     }
     assert!(admitted > 0 && higher_terms > 0, "non-vacuity");
-    println!("callback transitions={transitions}; admitted={admitted}; higher_terms={higher_terms}");
+    println!(
+        "callback transitions={transitions}; admitted={admitted}; higher_terms={higher_terms}"
+    );
 }
 
 #[test]
@@ -110,27 +120,53 @@ fn exhaustive_contact_and_progress_bounds() {
 
 #[test]
 fn healthy_path_reaches_quorum_without_resurrecting_expired_evidence() {
-    let request = RequestStamp { term: 2, sequence: 1, sent_at: 1u64 };
+    let request = RequestStamp {
+        term: 2,
+        sequence: 1,
+        sent_at: 1u64,
+    };
     let decision = classify_callback(2, Some(request), request, Some(2), 2);
     assert_eq!(decision, CallbackAdmission::Current);
     let contact = advance_contact(None, request.sent_at);
     // Three fixed members: self plus one fresh follower is a quorum.
-    let fresh = contact_is_fresh(Some(Duration::from_millis(2 - contact)), Duration::from_millis(2));
+    let fresh = contact_is_fresh(
+        Some(Duration::from_millis(2 - contact)),
+        Duration::from_millis(2),
+    );
     assert!(1 + usize::from(fresh) >= 2);
-    let expired = contact_is_fresh(Some(Duration::from_millis(3 - contact)), Duration::from_millis(2));
-    assert!(!expired, "an admitted but delayed response is not fresh evidence");
+    let expired = contact_is_fresh(
+        Some(Duration::from_millis(3 - contact)),
+        Duration::from_millis(2),
+    );
+    assert!(
+        !expired,
+        "an admitted but delayed response is not fresh evidence"
+    );
     assert_eq!(acknowledged_prefix(0, 2, 2), Some((2, 3)));
 }
 
 #[test]
 fn negative_controls_exhibit_generation_and_arrival_time_counterexamples() {
-    let old = RequestStamp { term: 2, sequence: 1, sent_at: 0u64 };
-    let active = RequestStamp { term: 2, sequence: 2, sent_at: 1u64 };
-    assert_eq!(classify_callback(2, Some(active), old, Some(2), 3), CallbackAdmission::Ignore);
+    let old = RequestStamp {
+        term: 2,
+        sequence: 1,
+        sent_at: 0u64,
+    };
+    let active = RequestStamp {
+        term: 2,
+        sequence: 2,
+        sent_at: 1u64,
+    };
+    assert_eq!(
+        classify_callback(2, Some(active), old, Some(2), 3),
+        CallbackAdmission::Ignore
+    );
     // Mutant: term-only admission clears an unrelated newer outstanding RPC.
     let mutant_consumes = old.term == 2;
     assert!(mutant_consumes && Some(active) != Some(old));
-    println!("counterexample: send seq=1; consume; send seq=2; duplicate seq=1 must not clear seq=2");
+    println!(
+        "counterexample: send seq=1; consume; send seq=2; duplicate seq=1 must not clear seq=2"
+    );
 
     let window = Duration::from_millis(2);
     let real_age = Duration::from_millis(3 - advance_contact(None, old.sent_at));
