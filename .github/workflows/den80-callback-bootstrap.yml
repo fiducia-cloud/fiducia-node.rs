@@ -1,0 +1,53 @@
+name: DEN-80 one-shot callback source assembly
+on:
+  push:
+    branches: ['fix/DEN-80-raft-callback-freshness-20260908']
+    paths: ['scripts/den80-callback-bootstrap.py', '.github/workflows/den80-callback-bootstrap.yml']
+permissions:
+  contents: read
+jobs:
+  assemble:
+    if: github.repository == 'fiducia-cloud/fiducia-node.rs' && github.ref == 'refs/heads/fix/DEN-80-raft-callback-freshness-20260908'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 20
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - name: Apply exact-base edit and check standalone model
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          python3 scripts/den80-callback-bootstrap.py
+          rustfmt --edition 2021 src/consensus.rs src/raft_callback.rs src/replication_callback_tests.rs tests/formal_raft_callback_refinement.rs
+          rustc --edition=2021 --deny warnings --test tests/formal_raft_callback_refinement.rs -o "$RUNNER_TEMP/callback-model"
+          "$RUNNER_TEMP/callback-model" --nocapture
+          git diff --check
+      - name: Publish source commit only to this feature branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.sha }}
+          TARGET_BRANCH: fix/DEN-80-raft-callback-freshness-20260908
+        run: |
+          set -euo pipefail
+          gh auth setup-git --hostname github.com
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$remote_head" = "$EXPECTED_HEAD"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/consensus.rs src/raft_callback.rs src/replication_callback_tests.rs tests/formal_raft_callback_refinement.rs formal/RAFT_CALLBACK_MODEL.md
+          git diff --cached --check
+          git commit -m 'fix(DEN-80): bind Raft callbacks and lease evidence to request dispatch'
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          git rev-parse HEAD
+          echo 'Formal workflow integration and removal of bootstrap files remain for the authenticated GitHub editor before PR review.'
