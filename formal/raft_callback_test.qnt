@@ -75,7 +75,7 @@ module raft_callback_test {
   run peerTailCannotInflateAcknowledgedPrefixTest =
     init
       .then(dispatch(1))
-      .then(deliver_success(mk_request(1, 1, 0, 1), 3))
+      .then(deliver_success(mk_request(1, 1, 0, 1), 2))
       .expect(and {
         s.matched_index == 1,
         raft_callback_safety,
@@ -84,7 +84,7 @@ module raft_callback_test {
   run oldRequestedPrefixCannotRegressProgressTest =
     init
       .then(dispatch(2))
-      .then(deliver_success(mk_request(1, 1, 0, 2), 3))
+      .then(deliver_success(mk_request(1, 1, 0, 2), 2))
       .then(dispatch(1))
       .then(deliver_success(mk_request(1, 2, 0, 1), 1))
       .expect(and {
