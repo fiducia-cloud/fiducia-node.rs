@@ -1,0 +1,152 @@
+name: Raft callback reachable-state model
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/raft-callback-model.yml'
+      - 'formal/raft_callback.qnt'
+      - 'formal/raft_callback_test.qnt'
+      - 'formal/RAFT_CALLBACK_MODEL.md'
+      - 'src/raft_callback.rs'
+      - 'src/raft_reply.rs'
+      - 'tests/formal_raft_callback_refinement.rs'
+      - 'tests/formal_raft_reply_refinement.rs'
+      - 'flake.lock'
+      - 'flake.nix'
+      - '.nix/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/raft-callback-model.yml'
+      - 'formal/raft_callback.qnt'
+      - 'formal/raft_callback_test.qnt'
+      - 'formal/RAFT_CALLBACK_MODEL.md'
+      - 'src/raft_callback.rs'
+      - 'src/raft_reply.rs'
+      - 'tests/formal_raft_callback_refinement.rs'
+      - 'tests/formal_raft_reply_refinement.rs'
+      - 'flake.lock'
+      - 'flake.nix'
+      - '.nix/**'
+  schedule:
+    - cron: '41 6 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reachable-state:
+    name: Quint/Apalache stale-callback safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact source head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - name: Validate workflow and locked formal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .formal-artifacts/raft-callback
+          nix develop -c actionlint .github/workflows/raft-callback-model.yml
+          nix develop -c quint --version | tee .formal-artifacts/raft-callback/quint-version.txt
+          git rev-parse HEAD > .formal-artifacts/raft-callback/source-head.txt
+          sha256sum \
+            formal/raft_callback.qnt \
+            formal/raft_callback_test.qnt \
+            src/raft_callback.rs \
+            src/raft_reply.rs \
+            tests/formal_raft_callback_refinement.rs \
+            tests/formal_raft_reply_refinement.rs \
+            > .formal-artifacts/raft-callback/inputs.sha256
+
+      - name: Typecheck model and deterministic traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix develop -c quint typecheck formal/raft_callback.qnt 2>&1 \
+            | tee .formal-artifacts/raft-callback/typecheck-model.log
+          nix develop -c quint typecheck formal/raft_callback_test.qnt 2>&1 \
+            | tee .formal-artifacts/raft-callback/typecheck-tests.log
+
+      - name: Run deterministic stale-leader traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .formal-artifacts/raft-callback/tests
+          nix develop -c quint test \
+            formal/raft_callback_test.qnt \
+            --main=raft_callback_test \
+            --match='.*Test$' \
+            --out-itf='.formal-artifacts/raft-callback/tests/{test}-{seq}.itf.json' 2>&1 \
+            | tee .formal-artifacts/raft-callback/tests.log
+
+      - name: Simulate invariant and require non-vacuous witnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix develop -c quint run \
+            formal/raft_callback.qnt \
+            --main=raft_callback \
+            --max-samples=10000 \
+            --max-steps=24 \
+            --seed=80080120260911 \
+            --invariant=raft_callback_safety \
+            --witnesses \
+            active_request_reached \
+            stale_callback_ignored_reached \
+            higher_term_step_down_reached \
+            fresh_read_reached \
+            leadership_transfer_reached \
+            expired_contact_reached 2>&1 \
+            | tee .formal-artifacts/raft-callback/simulation.log
+
+      - name: Exhaustively verify pull-request bound with Apalache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .formal-artifacts/raft-callback/verify-fast
+          nix develop -c quint verify \
+            formal/raft_callback.qnt \
+            --main=raft_callback \
+            --max-steps=5 \
+            --invariant=raft_callback_safety \
+            --out-itf='.formal-artifacts/raft-callback/verify-fast/counterexample-{seq}.itf.json' \
+            --verbosity=1 2>&1 \
+            | tee .formal-artifacts/raft-callback/verify-fast.log
+
+      - name: Exhaustively verify wider scheduled bound
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .formal-artifacts/raft-callback/verify-deep
+          nix develop -c quint verify \
+            formal/raft_callback.qnt \
+            --main=raft_callback \
+            --max-steps=7 \
+            --invariant=raft_callback_safety \
+            --out-itf='.formal-artifacts/raft-callback/verify-deep/counterexample-{seq}.itf.json' \
+            --verbosity=1 2>&1 \
+            | tee .formal-artifacts/raft-callback/verify-deep.log
+
+      - name: Upload exact-head formal evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fiducia-raft-callback-formal-evidence
+          path: .formal-artifacts/raft-callback
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
