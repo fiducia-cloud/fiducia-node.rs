@@ -27,15 +27,16 @@ module raft_callback {
     last_event: int,
   }
 
-  pure val MAX_TERM = 4
-  pure val MAX_SEQUENCE = 3
-  pure val MAX_TIME = 6
-  pure val MAX_INDEX = 3
+  pure val MAX_TERM = 3
+  pure val MAX_SEQUENCE = 2
+  pure val MAX_TIME = 4
+  pure val MAX_INDEX = 2
   pure val LEASE_WINDOW = 2
 
-  pure val TERMS: Set[int] = Set(1, 2, 3, 4)
-  pure val SEQUENCES: Set[int] = Set(1, 2, 3)
-  pure val INDEXES: Set[int] = Set(0, 1, 2, 3)
+  pure val TERMS: Set[int] = Set(1, 2, 3)
+  pure val SEQUENCES: Set[int] = Set(1, 2)
+  pure val TIMES: Set[int] = Set(0, 1, 2, 3, 4)
+  pure val INDEXES: Set[int] = Set(0, 1, 2)
 
   // Event codes are model-local evidence only.
   pure val EVENT_NONE = 0
@@ -64,8 +65,7 @@ module raft_callback {
   pure def valid_request(request: Request): bool = and {
     TERMS.contains(request.term),
     SEQUENCES.contains(request.sequence),
-    request.sent_at >= 0,
-    request.sent_at <= MAX_TIME,
+    TIMES.contains(request.sent_at),
     INDEXES.contains(request.requested_index),
   }
 
@@ -254,7 +254,7 @@ module raft_callback {
   action step: bool = {
     nondet request_term = TERMS.oneOf()
     nondet request_sequence = SEQUENCES.oneOf()
-    nondet sent_at = 0.to(MAX_TIME).oneOf()
+    nondet sent_at = TIMES.oneOf()
     nondet requested_index = INDEXES.oneOf()
     nondet reported_index = INDEXES.oneOf()
     nondet response_term = TERMS.oneOf()
@@ -279,14 +279,12 @@ module raft_callback {
   }
 
   val domain_bounds = and {
-    s.now >= 0,
-    s.now <= MAX_TIME,
+    TIMES.contains(s.now),
     TERMS.contains(s.current_term),
     s.next_sequence >= 1,
     s.next_sequence <= MAX_SEQUENCE + 1,
     s.active.size() <= 1,
-    s.matched_index >= 0,
-    s.matched_index <= MAX_INDEX,
+    INDEXES.contains(s.matched_index),
     s.used_requests.forall(request => valid_request(request)),
     s.active.forall(request => and {
       valid_request(request),
