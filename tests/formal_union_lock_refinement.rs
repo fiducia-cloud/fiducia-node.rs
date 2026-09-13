@@ -1499,7 +1499,7 @@ fn fencing_token_exhaustion_fails_closed_without_dropping_waiters() {
     assert_eq!(queued.output["queued"], true);
 
     let exhausted_snapshot = mutate_snapshot(&machine.snapshot().expect("snapshot"), |value| {
-        value["next_fencing_token"] = Value::from(u64::MAX);
+        value["next_fencing_token"] = Value::from(validate::MAX_FENCING_TOKEN);
     });
     let exhausted = StateMachine::new();
     exhausted
@@ -1519,12 +1519,12 @@ fn fencing_token_exhaustion_fails_closed_without_dropping_waiters() {
     assert!(projection.grants.is_empty());
     assert_eq!(projection.queue.len(), 1, "waiter must remain durable");
     assert_eq!(projection.queue[0].attempt, waiter);
-    assert_eq!(projection.last_token, u64::MAX);
+    assert_eq!(projection.last_token, validate::MAX_FENCING_TOKEN);
 
     let empty = StateMachine::new();
     let exhausted_empty_snapshot =
         mutate_snapshot(&empty.snapshot().expect("empty snapshot"), |value| {
-            value["next_fencing_token"] = Value::from(u64::MAX)
+            value["next_fencing_token"] = Value::from(validate::MAX_FENCING_TOKEN)
         });
     empty
         .restore(&exhausted_empty_snapshot)
@@ -1549,7 +1549,7 @@ fn fencing_token_exhaustion_fails_closed_without_dropping_waiters() {
     let projection = Projection::from_machine(&empty);
     assert!(projection.grants.is_empty());
     assert!(projection.queue.is_empty());
-    assert_eq!(projection.last_token, u64::MAX);
+    assert_eq!(projection.last_token, validate::MAX_FENCING_TOKEN);
 }
 
 fn execute_production(machine: &StateMachine, model: &Model, action: &Action) -> Outcome {
