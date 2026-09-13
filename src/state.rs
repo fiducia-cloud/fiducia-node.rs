@@ -3100,11 +3100,16 @@ impl Store {
     /// Mint the next fencing token, or `None` once the counter is exhausted.
     ///
     /// Fail-closed on purpose: a saturating counter would hand every subsequent
-    /// caller the *same* `u64::MAX`, and two holders with equal tokens is exactly
-    /// the split-brain fencing exists to prevent. Refusing the acquisition keeps
-    /// tokens strictly increasing; callers surface it as a failed operation.
+    /// caller the *same* ceiling, and two holders with equal tokens is exactly the
+    /// split-brain fencing exists to prevent. Refusing the acquisition keeps
+    /// tokens strictly increasing and exactly representable by JSON clients;
+    /// callers surface it as a failed operation.
     fn next_token(&mut self) -> Option<u64> {
-        self.next_fencing_token = self.next_fencing_token.checked_add(1)?;
+        let next = self.next_fencing_token.checked_add(1)?;
+        if next > crate::validate::MAX_FENCING_TOKEN {
+            return None;
+        }
+        self.next_fencing_token = next;
         Some(self.next_fencing_token)
     }
 
@@ -3114,7 +3119,11 @@ impl Store {
     /// when that token was minted on a different shard's counter. `None` when the
     /// counter is exhausted (see [`Store::next_token`]).
     fn mint_token_above(&mut self, floor: u64) -> Option<u64> {
-        self.next_fencing_token = self.next_fencing_token.max(floor).checked_add(1)?;
+        let next = self.next_fencing_token.max(floor).checked_add(1)?;
+        if next > crate::validate::MAX_FENCING_TOKEN {
+            return None;
+        }
+        self.next_fencing_token = next;
         Some(self.next_fencing_token)
     }
 
@@ -3170,7 +3179,21 @@ impl Store {
                 self.command_protocol
             ));
         }
+        if self.next_fencing_token > crate::validate::MAX_FENCING_TOKEN {
+            return Err(format!(
+                "next_fencing_token {} exceeds the public JSON-safe ceiling {}",
+                self.next_fencing_token,
+                crate::validate::MAX_FENCING_TOKEN
+            ));
+        }
         let floor = self.max_referenced_fencing_token();
+        if floor > crate::validate::MAX_FENCING_TOKEN {
+            return Err(format!(
+                "referenced fencing token {} exceeds the public JSON-safe ceiling {}",
+                floor,
+                crate::validate::MAX_FENCING_TOKEN
+            ));
+        }
         if self.next_fencing_token < floor {
             return Err(format!(
                 "next_fencing_token {} is below the highest referenced fencing token {}; \
@@ -9222,6 +9245,64 @@ mod tests {
         value.as_object_mut().unwrap().remove("next_fencing_token");
         let missing = serde_json::to_vec(&value).unwrap();
         assert!(StateMachine::new().restore(&missing).is_err());
+    }
+
+    #[test]
+    fn fencing_tokens_stop_at_the_public_json_safe_ceiling() {
+        let mut store = Store {
+            next_fencing_token: crate::validate::MAX_FENCING_TOKEN - 1,
+            ..Store::default()
+        };
+        assert_eq!(store.next_token(), Some(crate::validate::MAX_FENCING_TOKEN));
+        assert_eq!(store.next_token(), None);
+        assert_eq!(
+            store.next_fencing_token,
+            crate::validate::MAX_FENCING_TOKEN,
+            "a failed mint must not advance the counter"
+        );
+
+        let mut empty = Store::default();
+        assert_eq!(
+            empty.mint_token_above(crate::validate::MAX_FENCING_TOKEN),
+            None
+        );
+        assert_eq!(empty.next_fencing_token, 0);
+    }
+
+    #[test]
+    fn restore_rejects_fencing_tokens_outside_the_public_json_domain() {
+        let mut over_counter = serde_json::to_value(Store::default()).unwrap();
+        over_counter["next_fencing_token"] =
+            serde_json::json!(crate::validate::MAX_FENCING_TOKEN + 1);
+        let counter_error = StateMachine::new()
+            .restore(&serde_json::to_vec(&over_counter).unwrap())
+            .unwrap_err();
+        assert!(counter_error
+            .to_string()
+            .contains("public JSON-safe ceiling"));
+
+        let over_reference = Store {
+            next_fencing_token: crate::validate::MAX_FENCING_TOKEN,
+            ..Store::default()
+        };
+        let mut over_reference = serde_json::to_value(over_reference).unwrap();
+        over_reference["locks"]["grants"] = serde_json::json!({
+            (crate::validate::MAX_FENCING_TOKEN + 1).to_string(): {
+                "holder": "owner",
+                "keys": ["reference"],
+                "fencing_token": crate::validate::MAX_FENCING_TOKEN + 1,
+                "lease_expires_ms": 10_000
+            }
+        });
+        over_reference["locks"]["held"] = serde_json::json!({
+            "reference": crate::validate::MAX_FENCING_TOKEN + 1
+        });
+        let reference_error = StateMachine::new()
+            .restore(&serde_json::to_vec(&over_reference).unwrap())
+            .unwrap_err();
+        assert!(reference_error
+            .to_string()
+            .contains("public JSON-safe ceiling"));
     }
 
     #[test]

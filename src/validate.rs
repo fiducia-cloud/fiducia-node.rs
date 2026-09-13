@@ -74,6 +74,10 @@ pub const MAX_RATE_LIMIT_SEGMENT_BYTES: usize = 256;
 pub const MAX_RATE_LIMIT_LIMIT: u32 = 1_000_000;
 /// Sanity ceiling on one request's quota cost (see [`MAX_RATE_LIMIT_LIMIT`]).
 pub const MAX_RATE_LIMIT_COST: u32 = 1_000_000;
+/// Highest fencing token representable exactly by the public JSON/JavaScript
+/// contract. Keep this equal to the interface-level safe-integer ceiling so a
+/// token cannot be minted by the node and then silently rounded by a client.
+pub const MAX_FENCING_TOKEN: u64 = 9_007_199_254_740_991;
 
 /// A rejected write. Renders as `400 Bad Request` with a stable machine code and
 /// a human-readable detail, matching the node's other error bodies.
@@ -258,6 +262,12 @@ pub fn validate_fencing_token(fencing_token: u64) -> Result<(), Rejection> {
         return Err(Rejection::new(
             "invalid_fencing_token",
             "fencing_token must be greater than zero",
+        ));
+    }
+    if fencing_token > MAX_FENCING_TOKEN {
+        return Err(Rejection::new(
+            "invalid_fencing_token",
+            format!("fencing_token exceeds the public JSON-safe ceiling {MAX_FENCING_TOKEN}"),
         ));
     }
     Ok(())
@@ -807,6 +817,11 @@ mod tests {
             validate_fencing_token(0).unwrap_err().code,
             "invalid_fencing_token"
         );
+        assert!(validate_fencing_token(MAX_FENCING_TOKEN - 1).is_ok());
+        assert!(validate_fencing_token(MAX_FENCING_TOKEN).is_ok());
+        let too_large = validate_fencing_token(MAX_FENCING_TOKEN + 1).unwrap_err();
+        assert_eq!(too_large.code, "invalid_fencing_token");
+        assert!(too_large.detail.contains("JSON-safe ceiling"));
     }
 
     #[test]
