@@ -1,3 +1,4 @@
+# Temporary evidence lane; remove after Cargo.lock is committed.
 name: tmp-den566-lock-refresh
 on:
   pull_request:
