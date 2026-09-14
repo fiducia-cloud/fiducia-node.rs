@@ -20,26 +20,28 @@ jobs:
         with:
           persist-credentials: true
           fetch-depth: 0
+          path: repo
       - name: Check out pinned fiducia-interfaces sibling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
           ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
-          path: ../fiducia-interfaces
+          path: fiducia-interfaces
       - name: Check out pinned fiducia-routing sibling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-routing.rs
           ref: c694bc5c58587bec12989a347e926c0040aacada
-          path: ../fiducia-routing.rs
+          path: fiducia-routing.rs
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: '1.95.0'
           components: rustfmt
       - name: Repair stale formal exhaustion fixtures
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
@@ -55,6 +57,7 @@ jobs:
           PY
           rustfmt --edition 2021 tests/formal_union_lock_refinement.rs
       - name: Run exact fencing refinement checks
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
@@ -62,6 +65,7 @@ jobs:
           cargo test --locked --test formal_union_lock_refinement -- --nocapture
           cargo test --locked fencing_token -- --nocapture
       - name: Commit tested repair and remove helper
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
