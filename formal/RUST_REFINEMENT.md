@@ -64,6 +64,13 @@ bounded ITF projection into the exhausted state. It must never manufacture
 correctly rejected during restore. This keeps the executable refinement aligned
 with the public contract, snapshot admission, and mint-point implementation.
 
+The exact-head dependency audit is part of the same fail-closed acceptance
+boundary. During this refinement update, `Cargo.lock` was refreshed from
+`rustls 0.23.42` to the patched `0.23.45` floor required by `RUSTSEC-2026-0285`;
+the advisory was fixed in the lock graph rather than suppressed. A formal-model
+change is not merge-ready when the pinned production dependency graph is known
+to violate the repository security gate.
+
 ## Deliberate bounds and claim strength
 
 The breadth-first exploration is capped at depth 5, 25,000 unique abstract
