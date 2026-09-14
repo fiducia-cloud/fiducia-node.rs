@@ -1,0 +1,37 @@
+name: tmp-den566-lock-refresh
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/tmp-den566-lock-refresh.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.zpkg.toml'
+permissions:
+  contents: read
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Assert exact head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Generate exact lock graph
+        run: |
+          set -euo pipefail
+          cargo generate-lockfile
+          cargo metadata --locked --no-deps >/dev/null
+      - name: Retain generated Cargo lock
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: den566-cargo-lock-${{ github.event.pull_request.head.sha }}
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
