@@ -74,6 +74,12 @@ pub const MAX_RATE_LIMIT_SEGMENT_BYTES: usize = 256;
 pub const MAX_RATE_LIMIT_LIMIT: u32 = 1_000_000;
 /// Sanity ceiling on one request's quota cost (see [`MAX_RATE_LIMIT_LIMIT`]).
 pub const MAX_RATE_LIMIT_COST: u32 = 1_000_000;
+/// Highest fencing token exactly representable by JSON/JavaScript.
+///
+/// Fiducia authority is consumed by TypeScript/browser clients. Minting past
+/// `Number.MAX_SAFE_INTEGER` would make distinct integer tokens compare as the
+/// same rounded number at a consumer boundary, weakening stale-owner fencing.
+pub const MAX_FENCING_TOKEN: u64 = 9_007_199_254_740_991;
 
 /// A rejected write. Renders as `400 Bad Request` with a stable machine code and
 /// a human-readable detail, matching the node's other error bodies.
@@ -254,10 +260,10 @@ fn check_required_holder(holder: &Option<String>) -> Result<(), Rejection> {
 
 /// Validate client-supplied fencing authority before proposing a mutation.
 pub fn validate_fencing_token(fencing_token: u64) -> Result<(), Rejection> {
-    if fencing_token == 0 {
+    if fencing_token == 0 || fencing_token > MAX_FENCING_TOKEN {
         return Err(Rejection::new(
             "invalid_fencing_token",
-            "fencing_token must be greater than zero",
+            format!("fencing_token must be between 1 and {MAX_FENCING_TOKEN} inclusive"),
         ));
     }
     Ok(())
@@ -790,6 +796,22 @@ mod tests {
                 .unwrap_err()
                 .code,
             "field_too_long"
+        );
+    }
+
+    #[test]
+    fn fencing_token_bounds_match_the_public_json_safe_domain() {
+        assert_eq!(
+            validate_fencing_token(0).unwrap_err().code,
+            "invalid_fencing_token"
+        );
+        assert!(validate_fencing_token(MAX_FENCING_TOKEN - 1).is_ok());
+        assert!(validate_fencing_token(MAX_FENCING_TOKEN).is_ok());
+        assert_eq!(
+            validate_fencing_token(MAX_FENCING_TOKEN + 1)
+                .unwrap_err()
+                .code,
+            "invalid_fencing_token"
         );
     }
 

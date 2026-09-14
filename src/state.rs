@@ -3104,8 +3104,12 @@ impl Store {
     /// the split-brain fencing exists to prevent. Refusing the acquisition keeps
     /// tokens strictly increasing; callers surface it as a failed operation.
     fn next_token(&mut self) -> Option<u64> {
-        self.next_fencing_token = self.next_fencing_token.checked_add(1)?;
-        Some(self.next_fencing_token)
+        let next = self.next_fencing_token.checked_add(1)?;
+        if next > crate::validate::MAX_FENCING_TOKEN {
+            return None;
+        }
+        self.next_fencing_token = next;
+        Some(next)
     }
 
     /// Mint a fencing token strictly greater than `floor`, advancing this shard's
@@ -3114,8 +3118,15 @@ impl Store {
     /// when that token was minted on a different shard's counter. `None` when the
     /// counter is exhausted (see [`Store::next_token`]).
     fn mint_token_above(&mut self, floor: u64) -> Option<u64> {
-        self.next_fencing_token = self.next_fencing_token.max(floor).checked_add(1)?;
-        Some(self.next_fencing_token)
+        if floor >= crate::validate::MAX_FENCING_TOKEN {
+            return None;
+        }
+        let next = self.next_fencing_token.max(floor).checked_add(1)?;
+        if next > crate::validate::MAX_FENCING_TOKEN {
+            return None;
+        }
+        self.next_fencing_token = next;
+        Some(next)
     }
 
     /// The highest fencing token referenced anywhere in this state — the floor
@@ -3171,6 +3182,19 @@ impl Store {
             ));
         }
         let floor = self.max_referenced_fencing_token();
+        if floor > crate::validate::MAX_FENCING_TOKEN {
+            return Err(format!(
+                "highest referenced fencing token {floor} exceeds the supported maximum {}",
+                crate::validate::MAX_FENCING_TOKEN
+            ));
+        }
+        if self.next_fencing_token > crate::validate::MAX_FENCING_TOKEN {
+            return Err(format!(
+                "next_fencing_token {} exceeds the supported maximum {}",
+                self.next_fencing_token,
+                crate::validate::MAX_FENCING_TOKEN
+            ));
+        }
         if self.next_fencing_token < floor {
             return Err(format!(
                 "next_fencing_token {} is below the highest referenced fencing token {}; \
@@ -9151,6 +9175,80 @@ mod tests {
             StateMachine::new().restore(raw_v2).is_err(),
             "a V2 state claiming no compatibility envelope is corrupt"
         );
+    }
+
+    #[test]
+    fn fencing_token_minting_fails_closed_at_the_json_safe_ceiling() {
+        let max = crate::validate::MAX_FENCING_TOKEN;
+        let mut store = Store {
+            next_fencing_token: max - 2,
+            ..Store::default()
+        };
+
+        assert_eq!(store.next_token(), Some(max - 1));
+        assert_eq!(store.next_token(), Some(max));
+        assert_eq!(store.next_token(), None);
+        assert_eq!(
+            store.next_fencing_token, max,
+            "an exhausted mint must preserve the last valid watermark"
+        );
+    }
+
+    #[test]
+    fn handoff_mint_above_fails_closed_at_the_json_safe_ceiling() {
+        let max = crate::validate::MAX_FENCING_TOKEN;
+        let mut store = Store {
+            next_fencing_token: max - 2,
+            ..Store::default()
+        };
+
+        assert_eq!(store.mint_token_above(max - 2), Some(max - 1));
+        assert_eq!(store.mint_token_above(max - 1), Some(max));
+        assert_eq!(store.mint_token_above(max), None);
+        assert_eq!(store.next_fencing_token, max);
+    }
+
+    #[test]
+    fn restore_rejects_fencing_authority_outside_the_json_safe_domain() {
+        let max = crate::validate::MAX_FENCING_TOKEN;
+
+        let too_wide_counter = Store {
+            next_fencing_token: max + 1,
+            ..Store::default()
+        };
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&too_wide_counter).unwrap())
+            .expect_err("an out-of-domain watermark must never become authoritative");
+        assert!(error.to_string().contains("supported maximum"));
+
+        let mut too_wide_reference = Store {
+            next_fencing_token: max,
+            ..Store::default()
+        };
+        too_wide_reference.tasks.insert(
+            "out-of-domain".to_string(),
+            TaskRecord {
+                task_type: "test".to_string(),
+                payload: Value::Null,
+                status: TaskStatus::Claimed,
+                owner: Some("worker".to_string()),
+                fencing_token: max + 1,
+                lease_ttl_ms: 1,
+                lease_expires_ms: Some(2),
+                progress: 0,
+                checkpoint: Value::Null,
+                result: None,
+                deadline_ms: None,
+                generation: 1,
+            },
+        );
+        let error = StateMachine::new()
+            .restore(&serde_json::to_vec(&too_wide_reference).unwrap())
+            .expect_err("referenced authority outside the public domain must fail closed");
+        assert!(error
+            .to_string()
+            .contains("highest referenced fencing token"));
+        assert!(error.to_string().contains("supported maximum"));
     }
 
     #[test]
