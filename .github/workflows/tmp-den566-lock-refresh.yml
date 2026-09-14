@@ -18,13 +18,29 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          path: repo
           submodules: recursive
           persist-credentials: false
       - name: Assert exact head
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+        run: test "$(git -C repo rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Check out immutable fiducia interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+          persist-credentials: false
+      - name: Check out immutable fiducia routing
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+          persist-credentials: false
       - name: Generate exact lock graph
+        working-directory: repo
         run: |
           set -euo pipefail
           cargo generate-lockfile
@@ -32,7 +48,7 @@ jobs:
       - name: Retain generated Cargo lock
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: den566-cargo-lock-${{ github.event.pull_request.head.sha }}
-          path: Cargo.lock
+          name: den566-node-cargo-lock-${{ github.event.pull_request.head.sha }}
+          path: repo/Cargo.lock
           if-no-files-found: error
           retention-days: 1
