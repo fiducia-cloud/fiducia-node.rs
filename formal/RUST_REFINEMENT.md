@@ -47,6 +47,23 @@ compares the canonical authority-bearing projection after each transition.
 Production eagerly promotes all grantable waiters; the adapter therefore closes
 the corresponding explicit model promotion steps before comparison.
 
+## Public fencing-ceiling refinement
+
+The bounded model deliberately uses a tiny token domain, but exhaustion is not
+allowed to float independently of production. `formal/check_lease_fencing_sentinel.py`
+reads `src/validate.rs`, requires `MAX_FENCING_TOKEN` to equal the exact
+JSON/JavaScript safe-integer ceiling (`9_007_199_254_740_991`), and maps the
+bounded model's upper tail monotonically onto that production boundary. The
+model's `MAX_TOKEN` therefore corresponds exactly to the final mintable
+production token, while the would-be next transition corresponds to
+`MAX_FENCING_TOKEN + 1` and must not exist.
+
+The Rust refinement harness uses the same production constant when forcing its
+bounded ITF projection into the exhausted state. It must never manufacture
+`u64::MAX` authority, because snapshots above the public fencing domain are now
+correctly rejected during restore. This keeps the executable refinement aligned
+with the public contract, snapshot admission, and mint-point implementation.
+
 ## Deliberate bounds and claim strength
 
 The breadth-first exploration is capped at depth 5, 25,000 unique abstract
@@ -62,6 +79,7 @@ separate models and integration layers under DEN-80.
 ## Run locally
 
 ```bash
+python3 formal/check_lease_fencing_sentinel.py
 nix develop -c agent-check formal-refinement
 ```
 
