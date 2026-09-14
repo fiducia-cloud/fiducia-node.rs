@@ -1,30 +1,27 @@
-# Temporary evidence lane; remove after Cargo.lock is committed.
-name: tmp-den566-lock-refresh
+# Temporary trusted-branch promotion lane; remove after Cargo.lock is committed.
+name: tmp-den566-lock-promote
 on:
-  pull_request:
+  push:
+    branches: [den-566-external-locks-adoption]
     paths:
       - '.github/workflows/tmp-den566-lock-refresh.yml'
       - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.zpkg.toml'
 permissions:
-  contents: read
+  contents: write
 jobs:
-  refresh:
+  promote:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Check out exact PR head
+      - name: Check out trusted branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: den-566-external-locks-adoption
           path: repo
           submodules: recursive
-          persist-credentials: false
-      - name: Assert exact head
-        env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: test "$(git -C repo rev-parse HEAD)" = "$EXPECTED_HEAD"
+          persist-credentials: true
+      - name: Assert trusted branch
+        run: test "$(git -C repo branch --show-current)" = "den-566-external-locks-adoption"
       - name: Check out immutable fiducia interfaces
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -39,16 +36,24 @@ jobs:
           ref: c694bc5c58587bec12989a347e926c0040aacada
           path: fiducia-routing.rs
           persist-credentials: false
-      - name: Generate exact lock graph
+      - name: Generate and validate exact lock graph
         working-directory: repo
         run: |
           set -euo pipefail
           cargo generate-lockfile
           cargo metadata --locked --no-deps >/dev/null
-      - name: Retain generated Cargo lock
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: den566-node-cargo-lock-${{ github.event.pull_request.head.sha }}
-          path: repo/Cargo.lock
-          if-no-files-found: error
-          retention-days: 1
+          test -z "$(git diff --name-only -- . ':!Cargo.lock')"
+      - name: Commit only Cargo.lock
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git add Cargo.lock
+          if git diff --cached --quiet; then
+            echo "Cargo.lock already current"
+            exit 0
+          fi
+          test "$(git diff --cached --name-only)" = "Cargo.lock"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'DEN-566 refresh Cargo.lock for external locks'
+          git push origin HEAD:den-566-external-locks-adoption
