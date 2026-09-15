@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "fiducia-lib-core"
 version = "0.2.0"
-source = "git+https://github.com/fiducia-cloud/fiducia-lib-core.git?rev=b63725cc13f0d5d8b020f8e291239c161e53daf5#b63725cc13f0d5d8b020f8e291239c161e53daf5"
+source = "git+https://github.com/fiducia-cloud/fiducia-lib-core.git?rev=47d637ba92db3fc35b04bafe9bf66ff5b0223216#47d637ba92db3fc35b04bafe9bf66ff5b0223216"
 dependencies = [
  "ores-locks-and-leases",
 ]
