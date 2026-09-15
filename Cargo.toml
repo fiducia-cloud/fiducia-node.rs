@@ -32,4 +32,4 @@ fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 # ores-locks-and-leases with its Fiducia feature disabled, so a Fiducia node can
 # coordinate bootstrap/migration/maintenance via Cloudflare DO or another
 # authority without recursively requiring the Fiducia service it is starting.
-fiducia-lib-core = { git = "https://github.com/fiducia-cloud/fiducia-lib-core.git", rev = "b63725cc13f0d5d8b020f8e291239c161e53daf5", default-features = false }
+fiducia-lib-core = { git = "https://github.com/fiducia-cloud/fiducia-lib-core.git", rev = "47d637ba92db3fc35b04bafe9bf66ff5b0223216", default-features = false }
