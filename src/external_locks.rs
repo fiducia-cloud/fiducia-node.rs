@@ -5,7 +5,7 @@
 //! maintenance that may be backed by Cloudflare Durable Objects so recovery of
 //! Fiducia never requires Fiducia to already be healthy.
 
-use ores_locks_and_leases::LockKey;
+use fiducia_lib_core::locks::LockKey;
 
 pub fn shard_bootstrap(shard_id: u32) -> LockKey {
     fiducia_lib_core::locks::shard_bootstrap(&shard_id.to_string())
