@@ -12,35 +12,24 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# KV encryption-at-rest (default on when FIDUCIA_KV_ENCRYPTION_KEY is set):
-# AES-256-GCM with a deterministic per-(key,revision) nonce so every replica
-# produces byte-identical ciphertext and the Raft state machine stays
-# deterministic. See KvCipher in src/state.rs.
 aes-gcm = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 tower-http = { version = "0.5", features = ["trace", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# These versions must stay aligned with fiducia-telemetry so spans, propagation,
-# and the process-global metric provider use one OpenTelemetry type generation.
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
 
-# Peer transport: the HTTP client a leader uses to send AppendEntries/RequestVote
-# to its shard peers. Intra-cluster plain HTTP, so no TLS backend is pulled in.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1" }
-
-# Shared key→shard routing — single source of truth (see fiducia-routing.rs).
-# Local dev uses a path dep; in CI/deployment switch to a git dep, e.g.:
-#   fiducia-routing = { git = "https://github.com/fiducia-cloud/fiducia-routing.rs", tag = "v0.1.0" }
 fiducia-routing = { path = "../fiducia-routing.rs" }
-
-# Shared API payload/error contract (generated from fiducia-interfaces schemas).
-# The node's wire types (ProposeOutcome / ProposeError redirect, KvEntry, …) must
-# stay compatible with these; see the contract tests in src/consensus.rs.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
+
+# Shared external-orchestration lock identities. This facade deliberately uses
+# ores-locks-and-leases with its Fiducia feature disabled, so a Fiducia node can
+# coordinate bootstrap/migration/maintenance via Cloudflare DO or another
+# authority without recursively requiring the Fiducia service it is starting.
+fiducia-lib-core = { git = "https://github.com/fiducia-cloud/fiducia-lib-core.git", rev = "47d637ba92db3fc35b04bafe9bf66ff5b0223216", default-features = false }
