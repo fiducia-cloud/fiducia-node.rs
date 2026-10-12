@@ -9267,6 +9267,29 @@ mod tests {
             None
         );
         assert_eq!(empty.next_fencing_token, 0);
+
+        // Cross-shard handoffs must never mint an unrepresentable token,
+        // including when a foreign floor, rather than the local counter,
+        // is close to exhaustion. Rejected attempts are state-preserving.
+        let mut handoff = Store::default();
+        assert_eq!(
+            handoff.mint_token_above(crate::validate::MAX_FENCING_TOKEN - 1),
+            Some(crate::validate::MAX_FENCING_TOKEN)
+        );
+        for floor in [
+            crate::validate::MAX_FENCING_TOKEN - 1,
+            crate::validate::MAX_FENCING_TOKEN,
+            crate::validate::MAX_FENCING_TOKEN + 1,
+            u64::MAX,
+        ] {
+            assert_eq!(handoff.mint_token_above(floor), None);
+            assert_eq!(handoff.next_fencing_token, crate::validate::MAX_FENCING_TOKEN);
+        }
+        let mut untouched = Store::default();
+        for floor in [crate::validate::MAX_FENCING_TOKEN, u64::MAX] {
+            assert_eq!(untouched.mint_token_above(floor), None);
+            assert_eq!(untouched.next_fencing_token, 0);
+        }
     }
 
     #[test]
