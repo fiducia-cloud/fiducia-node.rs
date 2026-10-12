@@ -1151,9 +1151,9 @@ mod kv_watch_tests {
         drop(tx);
         let output = encoded_sse(single_key_events(rx, org.scope("flags/one"), org)).await;
         assert!(output.contains("event: resync_required"));
-        assert!(output.contains("\\"reason\\":\\"lagged\\""));
-        assert!(output.contains("\\"skipped\\":6"));
-        assert!(output.contains("\\"reason\\":\\"source_closed\\""));
+        assert!(output.contains("\"reason\":\"lagged\""));
+        assert!(output.contains("\"skipped\":6"));
+        assert!(output.contains("\"reason\":\"source_closed\""));
         assert!(output.contains("flags/one"));
         assert!(!output.contains("tenant-test"));
     }
@@ -1173,8 +1173,8 @@ mod kv_watch_tests {
             vec![failed_rx, live_rx], org.scope("flags/"), org,
         )).await;
         assert!(output.contains("flags/live"));
-        assert!(output.contains("\\"skipped\\":5"));
-        assert!(output.matches("\\"reason\\":\\"source_closed\\"").count() >= 2);
+        assert!(output.contains("\"skipped\":5"));
+        assert!(output.matches("\"reason\":\"source_closed\"").count() >= 2);
         assert!(!output.contains("secret-tenant"));
     }
 }
