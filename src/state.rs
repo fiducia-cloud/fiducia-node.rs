@@ -9206,6 +9206,20 @@ mod tests {
         assert_eq!(store.mint_token_above(max - 1), Some(max));
         assert_eq!(store.mint_token_above(max), None);
         assert_eq!(store.next_fencing_token, max);
+        // An exhausted shard must not advance on stale, equal, oversized,
+        // or overflowing cross-shard handoff floors.
+        for floor in [max - 1, max, max + 1, u64::MAX] {
+            assert_eq!(store.mint_token_above(floor), None);
+            assert_eq!(store.next_fencing_token, max);
+        }
+        // An unexhausted shard may receive an out-of-domain foreign floor;
+        // rejection must not poison its next valid minted token.
+        let mut pristine = Store::default();
+        for floor in [max, max + 1, u64::MAX] {
+            assert_eq!(pristine.mint_token_above(floor), None);
+            assert_eq!(pristine.next_fencing_token, 0);
+        }
+        assert_eq!(pristine.next_token(), Some(1));
     }
 
     #[test]
