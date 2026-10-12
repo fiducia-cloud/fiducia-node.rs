@@ -1219,7 +1219,7 @@ mod kv_watch_tests {
             let text = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
             assert!(!text.contains("private-org"), "control leaks tenant scope");
             if text.contains("event: resync_required")
-                && text.contains("\\"reason\\":\\"source_closed\\"")
+                && text.contains("\"reason\":\"source_closed\"")
             {
                 saw_closed = true;
                 break;
@@ -1253,7 +1253,7 @@ mod kv_watch_tests {
         .expect("single SSE lag marker");
         let text = String::from_utf8(bytes.to_vec()).expect("UTF-8");
         assert!(text.contains("event: resync_required"));
-        assert!(text.contains("\\"skipped\\":10"));
+        assert!(text.contains("\"skipped\":10"));
         assert!(!text.contains("private-org"));
         drop(sender);
     }
