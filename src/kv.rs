@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
@@ -45,7 +47,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
-    StreamExt, StreamMap,
+    Stream, StreamExt, StreamMap,
 };
 
 use crate::consensus::ChangeEvent;
@@ -1001,36 +1003,79 @@ fn resync_required_event(reason: &'static str, skipped: Option<u64>) -> Event {
         .data(data.to_string())
 }
 
-/// BroadcastStream yields lag errors; its end is only visible as a final None.
-/// Chain a terminal control event so closure can never appear as clean EOF.
+/// No events may be emitted after resync_required: a subscriber which has
+/// missed an update cannot safely resume from a partial, unordered history.
+/// Stopping the aggregate prefix stream also drops all live shard receivers.
+struct StopOnResync<S> {
+    source: Pin<Box<S>>,
+    terminal: bool,
+}
+
+impl<S> Stream for StopOnResync<S>
+where
+    S: Stream<Item = (Event, bool)>,
+{
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.terminal {
+            return Poll::Ready(None);
+        }
+        match this.source.as_mut().poll_next(cx) {
+            Poll::Ready(Some((event, terminal))) => {
+                this.terminal = terminal;
+                Poll::Ready(Some(Ok(event)))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn stop_on_resync<S>(source: S) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = (Event, bool)>,
+{
+    StopOnResync {
+        source: Box::pin(source),
+        terminal: false,
+    }
+}
+
+/// Any lag ends the current watch immediately after a single recovery marker.
+/// A clean source closure emits the same terminal marker. The caller must
+/// snapshot current state and establish a new watch before resuming.
 fn single_key_events(
     receiver: broadcast::Receiver<ChangeEvent>,
     key: String,
     org: OrgScope,
-) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
-    BroadcastStream::new(receiver)
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let stream = BroadcastStream::new(receiver)
         .filter_map(move |item| match item {
             Ok(change) if change.scope == "kv" && change.key == key => {
-                Some(Ok(unscoped_change_event(&change, &org)))
+                Some((unscoped_change_event(&change, &org), false))
             }
             Ok(_) => None,
             Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                Some(Ok(resync_required_event("lagged", Some(skipped))))
+                Some((resync_required_event("lagged", Some(skipped)), true))
             }
         })
-        .chain(tokio_stream::once(Ok(resync_required_event(
-            "source_closed",
-            None,
-        ))))
+        .chain(tokio_stream::once((
+            resync_required_event("source_closed", None),
+            true,
+        )));
+    stop_on_resync(stream)
 }
 
-/// Keep a terminal marker in each per-shard stream *before* StreamMap merges
-/// them. Otherwise a closed shard vanishes while other shards remain live.
+/// A prefix watch is only complete if *every* shard remains reliable.
+/// As soon as any shard lags or closes, emit one control event and terminate
+/// all the other shard subscriptions. Never continue a partially valid feed.
 fn prefix_events(
     receivers: Vec<broadcast::Receiver<ChangeEvent>>,
     prefix: String,
     org: OrgScope,
-) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+) -> impl Stream<Item = Result<Event, Infallible>> {
     let mut streams = StreamMap::new();
     for (idx, receiver) in receivers.into_iter().enumerate() {
         let prefix = prefix.clone();
@@ -1042,20 +1087,20 @@ fn prefix_events(
                         && is_kv_change(change.kind)
                         && change.key.starts_with(&prefix) =>
                 {
-                    Some(Ok(unscoped_change_event(&change, &org)))
+                    Some((unscoped_change_event(&change, &org), false))
                 }
                 Ok(_) => None,
                 Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    Some(Ok(resync_required_event("lagged", Some(skipped))))
+                    Some((resync_required_event("lagged", Some(skipped)), true))
                 }
             })
-            .chain(tokio_stream::once(Ok(resync_required_event(
-                "source_closed",
-                None,
-            ))));
+            .chain(tokio_stream::once((
+                resync_required_event("source_closed", None),
+                true,
+            )));
         streams.insert(idx, rendered);
     }
-    streams.map(|(_, event)| event)
+    stop_on_resync(streams.map(|(_, event)| event))
 }
 
 /// Emit a KV change event with its key un-namespaced back to the caller-facing
