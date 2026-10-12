@@ -1187,6 +1187,77 @@ mod kv_watch_tests {
         assert!(output.matches("\"reason\":\"source_closed\"").count() >= 2);
         assert!(!output.contains("secret-tenant"));
     }
+
+    // Unlike the original finite-stream matrix, hold an unrelated shard open:
+    // its liveness must never mask a closed peer's resync control event.
+    #[tokio::test]
+    async fn prefix_closed_shard_reports_resync_while_other_shard_stays_open() {
+        use tokio::time::{timeout, Duration};
+        let org = OrgScope("private-org".to_owned());
+        let (closed_tx, closed_rx) = broadcast::channel(2);
+        let (live_tx, live_rx) = broadcast::channel(2);
+        closed_tx.send(change(&org, "flags/a", 1)).unwrap();
+        live_tx.send(change(&org, "flags/b", 2)).unwrap();
+        drop(closed_tx); // one source dies, live_tx intentionally remains open
+        let stream = prefix_events(vec![closed_rx, live_rx], org.scope("flags/"), org);
+        let mut stream = Box::pin(stream);
+        let mut saw_closed = false;
+        for _ in 0..4 {
+            let event = timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("a closed shard must not hide behind a live shard")
+                .expect("aggregate prefix stream must produce the control event")
+                .expect("SSE event is infallible");
+            let bytes = axum::body::to_bytes(
+                Sse::new(tokio_stream::once(Ok::<Event, Infallible>(event)))
+                    .into_response()
+                    .into_body(),
+                4096,
+            )
+            .await
+            .expect("single SSE event fits bound");
+            let text = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
+            assert!(!text.contains("private-org"), "control leaks tenant scope");
+            if text.contains("event: resync_required")
+                && text.contains("\\"reason\\":\\"source_closed\\"")
+            {
+                saw_closed = true;
+                break;
+            }
+        }
+        assert!(saw_closed, "missing control event for dropped prefix shard");
+        drop(live_tx);
+    }
+
+    #[tokio::test]
+    async fn live_single_key_lag_is_visible_before_source_closure() {
+        use tokio::time::{timeout, Duration};
+        let org = OrgScope("private-org".to_owned());
+        let (sender, receiver) = broadcast::channel(2);
+        for revision in 0..12 {
+            sender.send(change(&org, "flags/a", revision)).unwrap();
+        }
+        let mut stream = Box::pin(single_key_events(receiver, org.scope("flags/a"), org));
+        let event = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("lag notification must not await source closure")
+            .expect("lag notification must be present")
+            .expect("SSE event is infallible");
+        let bytes = axum::body::to_bytes(
+            Sse::new(tokio_stream::once(Ok::<Event, Infallible>(event)))
+                .into_response()
+                .into_body(),
+            4096,
+        )
+        .await
+        .expect("single SSE lag marker");
+        let text = String::from_utf8(bytes.to_vec()).expect("UTF-8");
+        assert!(text.contains("event: resync_required"));
+        assert!(text.contains("\\"skipped\\":10"));
+        assert!(!text.contains("private-org"));
+        drop(sender);
+    }
+
 }
 
 #[cfg(test)]
