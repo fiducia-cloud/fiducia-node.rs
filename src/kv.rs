@@ -996,7 +996,9 @@ fn resync_required_event(reason: &'static str, skipped: Option<u64>) -> Event {
     if let Some(skipped) = skipped {
         data["skipped"] = json!(skipped);
     }
-    Event::default().event("resync_required").data(data.to_string())
+    Event::default()
+        .event("resync_required")
+        .data(data.to_string())
 }
 
 /// BroadcastStream yields lag errors; its end is only visible as a final None.
@@ -1016,7 +1018,10 @@ fn single_key_events(
                 Some(Ok(resync_required_event("lagged", Some(skipped))))
             }
         })
-        .chain(tokio_stream::once(Ok(resync_required_event("source_closed", None))))
+        .chain(tokio_stream::once(Ok(resync_required_event(
+            "source_closed",
+            None,
+        ))))
 }
 
 /// Keep a terminal marker in each per-shard stream *before* StreamMap merges
@@ -1164,14 +1169,19 @@ mod kv_watch_tests {
         let (failed_tx, failed_rx) = broadcast::channel(2);
         let (live_tx, live_rx) = broadcast::channel(2);
         for revision in 0..7 {
-            failed_tx.send(change(&org, "flags/fail", revision)).unwrap();
+            failed_tx
+                .send(change(&org, "flags/fail", revision))
+                .unwrap();
         }
         live_tx.send(change(&org, "flags/live", 10)).unwrap();
         drop(failed_tx);
         drop(live_tx);
         let output = encoded_sse(prefix_events(
-            vec![failed_rx, live_rx], org.scope("flags/"), org,
-        )).await;
+            vec![failed_rx, live_rx],
+            org.scope("flags/"),
+            org,
+        ))
+        .await;
         assert!(output.contains("flags/live"));
         assert!(output.contains("\"skipped\":5"));
         assert!(output.matches("\"reason\":\"source_closed\"").count() >= 2);
