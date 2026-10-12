@@ -1203,13 +1203,14 @@ mod kv_watch_tests {
         assert!(output.contains("event: resync_required"));
         assert!(output.contains("\"reason\":\"lagged\""));
         assert!(output.contains("\"skipped\":6"));
-        assert!(output.contains("\"reason\":\"source_closed\""));
-        assert!(output.contains("flags/one"));
+        assert!(!output.contains("\"reason\":\"source_closed\""));
+        assert!(!output.contains("flags/one"), "post-gap data must never be emitted");
+        assert_eq!(output.matches("event: resync_required").count(), 1);
         assert!(!output.contains("tenant-test"));
     }
 
     #[tokio::test]
-    async fn prefix_reports_failed_shard_without_masking_other_shard_events() {
+    async fn prefix_lag_terminates_all_shards_without_continuing_stale_events() {
         let org = OrgScope("secret-tenant".to_owned());
         let (failed_tx, failed_rx) = broadcast::channel(2);
         let (live_tx, live_rx) = broadcast::channel(2);
@@ -1219,18 +1220,20 @@ mod kv_watch_tests {
                 .unwrap();
         }
         live_tx.send(change(&org, "flags/live", 10)).unwrap();
-        drop(failed_tx);
-        drop(live_tx);
+        // One shard has lagged while the other is still healthy and open.
         let output = encoded_sse(prefix_events(
             vec![failed_rx, live_rx],
             org.scope("flags/"),
             org,
         ))
         .await;
-        assert!(output.contains("flags/live"));
         assert!(output.contains("\"skipped\":5"));
-        assert!(output.matches("\"reason\":\"source_closed\"").count() >= 2);
+        assert_eq!(output.matches("event: resync_required").count(), 1);
+        assert!(!output.contains("\"reason\":\"source_closed\""));
+        assert!(!output.contains("flags/fail"), "invalid backlog must not be emitted");
         assert!(!output.contains("secret-tenant"));
+        drop(failed_tx);
+        drop(live_tx);
     }
 
     // Unlike the original finite-stream matrix, hold an unrelated shard open:
@@ -1271,7 +1274,27 @@ mod kv_watch_tests {
             }
         }
         assert!(saw_closed, "missing control event for dropped prefix shard");
+        assert!(
+            timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("closed shard must end the aggregate stream immediately")
+                .is_none(),
+            "a prefix stream must not outlive its failed shard"
+        );
         drop(live_tx);
+    }
+
+    #[tokio::test]
+    async fn clean_single_key_closure_emits_one_terminal_resync_after_data() {
+        let org = OrgScope("private-org".to_owned());
+        let (sender, receiver) = broadcast::channel(2);
+        sender.send(change(&org, "flags/a", 42)).unwrap();
+        drop(sender);
+        let output = encoded_sse(single_key_events(receiver, org.scope("flags/a"), org)).await;
+        assert!(output.contains("flags/a"));
+        assert!(output.contains("\"reason\":\"source_closed\""));
+        assert_eq!(output.matches("event: resync_required").count(), 1);
+        assert!(!output.contains("private-org"));
     }
 
     #[tokio::test]
@@ -1300,6 +1323,12 @@ mod kv_watch_tests {
         assert!(text.contains("event: resync_required"));
         assert!(text.contains("\"skipped\":10"));
         assert!(!text.contains("private-org"));
+        assert!(
+            timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("lag must terminate even while source stays open")
+                .is_none()
+        );
         drop(sender);
     }
 }
