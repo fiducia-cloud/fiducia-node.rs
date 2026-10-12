@@ -1257,7 +1257,6 @@ mod kv_watch_tests {
         assert!(!text.contains("private-org"));
         drop(sender);
     }
-
 }
 
 #[cfg(test)]
