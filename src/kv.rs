@@ -42,7 +42,13 @@ use base64::Engine;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
+use tokio::sync::broadcast;
+use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
+    StreamExt, StreamMap,
+};
+
+use crate::consensus::ChangeEvent;
 
 use crate::consensus::{read_error_response, Node, ReadRequest, ReadResponse};
 use crate::org_scope::OrgScope;
@@ -961,16 +967,7 @@ async fn watch(node: Arc<Node>, key: String, prefix: bool, org: OrgScope) -> Res
     let Some(rx) = node.watch(&key).await else {
         return Json(json!({ "error": "unavailable", "op": "kv.watch" })).into_response();
     };
-    let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let event = item.ok()?; // drop lag/closed notifications
-        if event.scope != "kv" {
-            return None; // ignore election/service changes on the shared shard stream
-        }
-        if event.key != key {
-            return None;
-        }
-        Some(Ok::<Event, Infallible>(unscoped_change_event(&event, &org)))
-    });
+    let stream = single_key_events(rx, key, org);
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
@@ -982,21 +979,78 @@ async fn watch_prefix(node: Arc<Node>, prefix: String, org: OrgScope) -> Respons
         return Json(json!({ "error": "unavailable", "op": "kv.watch" })).into_response();
     }
 
-    let mut streams = StreamMap::new();
-    for (idx, receiver) in receivers.into_iter().enumerate() {
-        streams.insert(idx, BroadcastStream::new(receiver));
-    }
-    let stream = streams.filter_map(move |(_, item)| {
-        let event = item.ok()?;
-        if !is_kv_change(event.kind) || !event.key.starts_with(&prefix) {
-            return None;
-        }
-        Some(Ok::<Event, Infallible>(unscoped_change_event(&event, &org)))
-    });
+    let stream = prefix_events(receivers, prefix, org);
 
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// Only public recovery instructions are emitted: no internal shard keys or
+/// tenant identifiers appear in a resync control event.
+fn resync_required_event(reason: &'static str, skipped: Option<u64>) -> Event {
+    let mut data = json!({
+        "reason": reason,
+        "action": "snapshot_and_reconnect",
+    });
+    if let Some(skipped) = skipped {
+        data["skipped"] = json!(skipped);
+    }
+    Event::default().event("resync_required").data(data.to_string())
+}
+
+/// BroadcastStream yields lag errors; its end is only visible as a final None.
+/// Chain a terminal control event so closure can never appear as clean EOF.
+fn single_key_events(
+    receiver: broadcast::Receiver<ChangeEvent>,
+    key: String,
+    org: OrgScope,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+    BroadcastStream::new(receiver)
+        .filter_map(move |item| match item {
+            Ok(change) if change.scope == "kv" && change.key == key => {
+                Some(Ok(unscoped_change_event(&change, &org)))
+            }
+            Ok(_) => None,
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                Some(Ok(resync_required_event("lagged", Some(skipped))))
+            }
+        })
+        .chain(tokio_stream::once(Ok(resync_required_event("source_closed", None))))
+}
+
+/// Keep a terminal marker in each per-shard stream *before* StreamMap merges
+/// them. Otherwise a closed shard vanishes while other shards remain live.
+fn prefix_events(
+    receivers: Vec<broadcast::Receiver<ChangeEvent>>,
+    prefix: String,
+    org: OrgScope,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+    let mut streams = StreamMap::new();
+    for (idx, receiver) in receivers.into_iter().enumerate() {
+        let prefix = prefix.clone();
+        let org = org.clone();
+        let rendered = BroadcastStream::new(receiver)
+            .filter_map(move |item| match item {
+                Ok(change)
+                    if change.scope == "kv"
+                        && is_kv_change(change.kind)
+                        && change.key.starts_with(&prefix) =>
+                {
+                    Some(Ok(unscoped_change_event(&change, &org)))
+                }
+                Ok(_) => None,
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    Some(Ok(resync_required_event("lagged", Some(skipped))))
+                }
+            })
+            .chain(tokio_stream::once(Ok(resync_required_event(
+                "source_closed",
+                None,
+            ))));
+        streams.insert(idx, rendered);
+    }
+    streams.map(|(_, event)| event)
 }
 
 /// Emit a KV change event with its key un-namespaced back to the caller-facing
@@ -1060,6 +1114,69 @@ fn crypto_failure(operation: &'static str, error: &KvCryptoError) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod kv_watch_tests {
+    use super::*;
+
+    fn change(org: &OrgScope, key: &str, revision: u64) -> ChangeEvent {
+        ChangeEvent {
+            scope: "kv",
+            kind: "put",
+            key: org.scope(key),
+            revision,
+            detail: None,
+        }
+    }
+
+    async fn encoded_sse<S>(stream: S) -> String
+    where
+        S: tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    {
+        let body = Sse::new(stream).into_response().into_body();
+        let bytes = axum::body::to_bytes(body, 64 * 1024)
+            .await
+            .expect("bounded SSE body");
+        String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE")
+    }
+
+    #[tokio::test]
+    async fn single_key_lag_and_closure_are_fail_visible_without_scoped_keys() {
+        let org = OrgScope("tenant-test".to_owned());
+        let (tx, rx) = broadcast::channel(2);
+        for revision in 0..8 {
+            tx.send(change(&org, "flags/one", revision)).unwrap();
+        }
+        drop(tx);
+        let output = encoded_sse(single_key_events(rx, org.scope("flags/one"), org)).await;
+        assert!(output.contains("event: resync_required"));
+        assert!(output.contains("\\"reason\\":\\"lagged\\""));
+        assert!(output.contains("\\"skipped\\":6"));
+        assert!(output.contains("\\"reason\\":\\"source_closed\\""));
+        assert!(output.contains("flags/one"));
+        assert!(!output.contains("tenant-test"));
+    }
+
+    #[tokio::test]
+    async fn prefix_reports_failed_shard_without_masking_other_shard_events() {
+        let org = OrgScope("secret-tenant".to_owned());
+        let (failed_tx, failed_rx) = broadcast::channel(2);
+        let (live_tx, live_rx) = broadcast::channel(2);
+        for revision in 0..7 {
+            failed_tx.send(change(&org, "flags/fail", revision)).unwrap();
+        }
+        live_tx.send(change(&org, "flags/live", 10)).unwrap();
+        drop(failed_tx);
+        drop(live_tx);
+        let output = encoded_sse(prefix_events(
+            vec![failed_rx, live_rx], org.scope("flags/"), org,
+        )).await;
+        assert!(output.contains("flags/live"));
+        assert!(output.contains("\\"skipped\\":5"));
+        assert!(output.matches("\\"reason\\":\\"source_closed\\"").count() >= 2);
+        assert!(!output.contains("secret-tenant"));
+    }
 }
 
 #[cfg(test)]
