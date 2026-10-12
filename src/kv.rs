@@ -1204,7 +1204,10 @@ mod kv_watch_tests {
         assert!(output.contains("\"reason\":\"lagged\""));
         assert!(output.contains("\"skipped\":6"));
         assert!(!output.contains("\"reason\":\"source_closed\""));
-        assert!(!output.contains("flags/one"), "post-gap data must never be emitted");
+        assert!(
+            !output.contains("flags/one"),
+            "post-gap data must never be emitted"
+        );
         assert_eq!(output.matches("event: resync_required").count(), 1);
         assert!(!output.contains("tenant-test"));
     }
@@ -1230,7 +1233,10 @@ mod kv_watch_tests {
         assert!(output.contains("\"skipped\":5"));
         assert_eq!(output.matches("event: resync_required").count(), 1);
         assert!(!output.contains("\"reason\":\"source_closed\""));
-        assert!(!output.contains("flags/fail"), "invalid backlog must not be emitted");
+        assert!(
+            !output.contains("flags/fail"),
+            "invalid backlog must not be emitted"
+        );
         assert!(!output.contains("secret-tenant"));
         drop(failed_tx);
         drop(live_tx);
@@ -1323,12 +1329,10 @@ mod kv_watch_tests {
         assert!(text.contains("event: resync_required"));
         assert!(text.contains("\"skipped\":10"));
         assert!(!text.contains("private-org"));
-        assert!(
-            timeout(Duration::from_secs(2), stream.next())
-                .await
-                .expect("lag must terminate even while source stays open")
-                .is_none()
-        );
+        assert!(timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("lag must terminate even while source stays open")
+            .is_none());
         drop(sender);
     }
 }
