@@ -36,6 +36,15 @@ pub const ORG_HEADER: &str = "x-fiducia-org-id";
 /// Max bytes for an org id (matches the `orgs.slug`/id column bounds).
 const MAX_ORG_BYTES: usize = crate::validate::MAX_ORG_BYTES;
 
+/// Largest fencing token that can cross the public JSON boundary exactly in
+/// JavaScript/TypeScript. `fiducia-interfaces` publishes this same ceiling.
+///
+/// The replicated state machine still has its own fail-closed exhaustion logic;
+/// this boundary check is defense in depth and, critically, prevents an unsafe
+/// token from ever being serialized to a browser/JSON consumer if internal state
+/// or a future command path violates the public contract.
+pub const MAX_SAFE_FENCING_TOKEN: u64 = 9_007_199_254_740_991;
+
 /// A validated org scope, attached to every state-touching `/v1` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgScope(pub String);
@@ -71,6 +80,9 @@ impl OrgScope {
     }
 
     pub fn response(&self, mut value: Value) -> Response {
+        if !wire_fencing_tokens_safe(&value) {
+            return fencing_wire_violation();
+        }
         if self.unscope_value(&mut value) {
             Json(value).into_response()
         } else {
@@ -85,6 +97,9 @@ impl OrgScope {
     ) -> Response {
         match result {
             Ok(mut outcome) => {
+                if !wire_fencing_tokens_safe(&outcome.output) {
+                    return fencing_wire_violation();
+                }
                 if !self.unscope_value(&mut outcome.output) {
                     return scope_violation();
                 }
@@ -119,6 +134,27 @@ const OPAQUE_FIELDS: &[&str] = &[
     "target",
 ];
 
+/// Validate only Fiducia-owned response fields. Opaque application payloads may
+/// legitimately contain a property named `fencing_token` and must never be
+/// interpreted as coordination authority by this layer.
+fn wire_fencing_tokens_safe(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().all(wire_fencing_tokens_safe),
+        Value::Object(fields) => fields.iter().all(|(field, child)| {
+            if OPAQUE_FIELDS.contains(&field.as_str()) {
+                return true;
+            }
+            if field == "fencing_token" {
+                return child
+                    .as_u64()
+                    .is_some_and(|token| token > 0 && token <= MAX_SAFE_FENCING_TOKEN);
+            }
+            wire_fencing_tokens_safe(child)
+        }),
+        _ => true,
+    }
+}
+
 fn unscope_value(org: &OrgScope, value: &mut Value, identity: bool) -> bool {
     match value {
         Value::String(text) if identity => {
@@ -150,6 +186,17 @@ fn scope_violation() -> Response {
         Json(json!({
             "error": "org_scope_violation",
             "detail": "a response contained an identity outside the caller org"
+        })),
+    )
+        .into_response()
+}
+
+fn fencing_wire_violation() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "fencing_token_wire_violation",
+            "detail": "a response contained a fencing token outside the exact JSON integer domain"
         })),
     )
         .into_response()
@@ -273,6 +320,27 @@ mod tests {
         assert!(!valid_org("has space"));
         assert!(!valid_org("ctrl\u{1}char"));
         assert!(!valid_org(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn wire_fencing_tokens_are_positive_and_json_exact() {
+        assert!(wire_fencing_tokens_safe(&json!({ "fencing_token": 1 })));
+        assert!(wire_fencing_tokens_safe(&json!({
+            "nested": { "fencing_token": MAX_SAFE_FENCING_TOKEN }
+        })));
+        assert!(!wire_fencing_tokens_safe(&json!({ "fencing_token": 0 })));
+        assert!(!wire_fencing_tokens_safe(&json!({
+            "fencing_token": MAX_SAFE_FENCING_TOKEN + 1
+        })));
+        assert!(!wire_fencing_tokens_safe(&json!({ "fencing_token": "1" })));
+    }
+
+    #[test]
+    fn wire_fencing_guard_does_not_inspect_opaque_application_payloads() {
+        assert!(wire_fencing_tokens_safe(&json!({
+            "payload": { "fencing_token": u64::MAX },
+            "result": { "fencing_token": "application-defined" }
+        })));
     }
 
     #[test]
